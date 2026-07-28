@@ -69,6 +69,7 @@ def create_app(
     model: str,
     *,
     agent=None,
+    request_agent_factory=None,
     bus=None,
     engine_name: str = "",
     agent_name: str = "",
@@ -98,6 +99,9 @@ def create_app(
         Default model name.
     agent:
         Optional agent instance for agent-mode completions.
+    request_agent_factory:
+        Callable that returns a fresh ``RequestAgentScope`` for an
+        authenticated API principal. External requests never reuse ``agent``.
     bus:
         Optional event bus for telemetry.
     channel_bridge:
@@ -146,6 +150,7 @@ def create_app(
     app.state.engine = engine
     app.state.model = model
     app.state.agent = agent
+    app.state.request_agent_factory = request_agent_factory
     app.state.bus = bus
     app.state.engine_name = engine_name
     # Do not promote a class-level agent label into an authorization

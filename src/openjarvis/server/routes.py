@@ -27,6 +27,7 @@ from openjarvis.server.models import (
     StreamChoice,
     UsageInfo,
 )
+from openjarvis.server.request_agent import RequestAgentScope
 
 router = APIRouter()
 
@@ -202,18 +203,49 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     _reject_disabled_cloud_model(request, model)
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
+    agent_bus = getattr(request.app.state, "bus", None)
     external_principal = getattr(request.state, "api_principal", "").strip()
     if external_principal and agent is not None and not request_body.tools:
-        # The app-level agent is a shared mutable object already bound to its
-        # service identity. Reusing it for an API principal would be a
-        # confused-deputy capability escalation and a cross-request race.
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Agent-mode API execution is disabled until per-request "
-                "agent isolation is available."
-            ),
+        # The app-level agent and bus are shared mutable service objects.
+        # Authenticated callers receive a fresh pair bound to their principal,
+        # preventing both confused-deputy execution and cross-request event
+        # leakage.
+        request_agent_factory = getattr(
+            request.app.state,
+            "request_agent_factory",
+            None,
         )
+        if not callable(request_agent_factory):
+            raise HTTPException(
+                status_code=503,
+                detail="Request-scoped agent execution is unavailable.",
+            )
+        try:
+            scope = request_agent_factory(external_principal)
+        except Exception:
+            logging.getLogger("openjarvis.server").exception(
+                "Request-scoped agent construction failed"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Request-scoped agent execution is unavailable.",
+            ) from None
+        if (
+            not isinstance(scope, RequestAgentScope)
+            or scope.agent is None
+            or scope.agent is agent
+            or scope.bus is None
+            or scope.bus is agent_bus
+        ):
+            logging.getLogger("openjarvis.server").error(
+                "Request-scoped agent factory returned a shared or invalid scope"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Request-scoped agent execution is unavailable.",
+            )
+        agent = scope.agent
+        agent_bus = scope.bus
 
     memory_read_allowed = _request_capability_allowed(
         request,
@@ -345,6 +377,15 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                     else None
                 ),
             )
+        if external_principal and agent is not None:
+            from openjarvis.server.stream_bridge import create_agent_stream
+
+            return await create_agent_stream(
+                agent,
+                agent_bus,
+                model,
+                request_body,
+            )
         return await _handle_stream(
             engine,
             model,
@@ -392,7 +433,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             request_body,
             complexity_info,
             trace_store=getattr(request.app.state, "trace_store", None),
-            bus=getattr(request.app.state, "bus", None),
+            bus=agent_bus,
         )
     else:
         bus = getattr(request.app.state, "bus", None)

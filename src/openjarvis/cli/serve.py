@@ -268,6 +268,7 @@ def serve(
 
     # Resolve agent
     agent = None
+    request_agent_factory = None
     agent_key = agent_name or config.server.agent
     # Tool instances resolved for the primary agent are reused below to build
     # the scheduler's ToolExecutor — avoiding a second full SystemBuilder.build()
@@ -287,6 +288,8 @@ def serve(
                 # this block — initialise here so the reference is valid
                 # even when accepts_tools is False (#461).
                 mcp_clients: list = []
+                request_tool_factories: list = []
+                request_tool_blockers: list[str] = []
 
                 # Load tools for agents that support them
                 if getattr(agent_cls, "accepts_tools", False):
@@ -318,9 +321,16 @@ def serve(
                         if isinstance(tool_cls, type) and issubclass(
                             tool_cls, BaseTool
                         ):
-                            tools.append(tool_cls())
+                            tool = tool_cls()
+                            tools.append(tool)
+                            request_tool_factories.append((tool, tool_cls))
                         elif isinstance(tool_cls, BaseTool):
                             tools.append(tool_cls)
+                            # A pre-built registry value may carry mutable,
+                            # caller-specific state that cannot be reproduced
+                            # safely. Keep it available to the service agent,
+                            # but fail closed for authenticated API requests.
+                            request_tool_blockers.append(name)
 
                     # MCP server tools from config.tools.mcp.servers
                     # (#461 — these were silently dropped).
@@ -338,6 +348,10 @@ def serve(
                                     f"Duplicate tool name rejected: {t.spec.name}"
                                 )
                             tools.append(t)
+                            # MCPClient transports are sessionful and are not
+                            # concurrency-isolated. A request-scoped agent must
+                            # never share one across principals/requests.
+                            request_tool_blockers.append(t.spec.name)
                             existing.add(t.spec.name)
 
                     if tools:
@@ -369,6 +383,78 @@ def serve(
                 # connections don't close mid-request (#461).
                 if mcp_clients:
                     agent._mcp_clients = mcp_clients
+
+                # External API requests must never mutate or rebind the
+                # service-level agent above. Construct a fresh agent,
+                # ToolExecutor, EventBus, and built-in tool set for every
+                # authenticated principal.
+                _request_agent_kwargs = {
+                    key: value
+                    for key, value in agent_kwargs.items()
+                    if key not in {"bus", "tools"}
+                }
+                _request_tool_factories = tuple(request_tool_factories)
+                _request_tool_blockers = tuple(request_tool_blockers)
+                _request_needs_security = needs_security
+
+                def _build_request_agent_scope(principal: str):
+                    from openjarvis.server.request_agent import RequestAgentScope
+                    from openjarvis.tools._stubs import BaseTool
+
+                    request_principal = (
+                        principal.strip() if isinstance(principal, str) else ""
+                    )
+                    if not request_principal:
+                        raise RuntimeError(
+                            "Authenticated request principal is required"
+                        )
+                    if _request_tool_blockers:
+                        raise RuntimeError(
+                            "Request-scoped execution is unavailable for "
+                            "shared tool registrations"
+                        )
+                    request_bus = EventBus()
+                    request_kwargs = dict(_request_agent_kwargs)
+                    if _request_tool_factories:
+                        request_tools = []
+                        for service_tool, tool_factory in _request_tool_factories:
+                            request_tool = tool_factory()
+                            if (
+                                not isinstance(request_tool, BaseTool)
+                                or request_tool is service_tool
+                            ):
+                                raise RuntimeError(
+                                    "Tool factory did not return a fresh tool"
+                                )
+                            request_tools.append(request_tool)
+                        request_kwargs["tools"] = request_tools
+                    request_kwargs["bus"] = request_bus
+                    request_agent = agent_cls(
+                        engine,
+                        model_name,
+                        **request_kwargs,
+                    )
+                    if _request_needs_security:
+                        bind_request_security = getattr(
+                            request_agent,
+                            "bind_security",
+                            None,
+                        )
+                        if not callable(bind_request_security):
+                            raise RuntimeError(
+                                f"Agent '{agent_key}' cannot bind request security"
+                            )
+                        bind_request_security(
+                            sec.capability_policy,
+                            request_principal,
+                            sec.boundary_guard,
+                        )
+                    return RequestAgentScope(
+                        agent=request_agent,
+                        bus=request_bus,
+                    )
+
+                request_agent_factory = _build_request_agent_scope
         except Exception as exc:
             import traceback
 
@@ -750,6 +836,7 @@ def serve(
         engine,
         model_name,
         agent=agent,
+        request_agent_factory=request_agent_factory,
         bus=bus,
         engine_name=engine_name,
         agent_name=agent_key or "",

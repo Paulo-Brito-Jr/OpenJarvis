@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from openjarvis.core.events import EventBus, EventType  # noqa: E402
 from openjarvis.server.app import create_app  # noqa: E402
+from openjarvis.server.request_agent import RequestAgentScope  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -392,7 +393,7 @@ class TestChatCompletions:
         data = resp.json()
         assert data["choices"][0]["message"]["content"] == "Hello from agent"
 
-    def test_external_principal_cannot_reuse_shared_agent(self):
+    def test_external_principal_cannot_reuse_shared_agent_without_factory(self):
         from openjarvis.security.capabilities import CapabilityPolicy
 
         engine = _make_engine()
@@ -421,8 +422,153 @@ class TestChatCompletions:
         )
 
         assert response.status_code == 503
-        assert "per-request agent isolation" in response.json()["detail"]
+        assert "Request-scoped agent execution" in response.json()["detail"]
         agent.run.assert_not_called()
+
+    def test_external_principal_uses_fresh_request_agent(self):
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        engine = _make_engine()
+        shared_agent = _make_agent(content="shared must not execute")
+        request_agent = _make_agent(content="isolated response")
+        request_bus = EventBus()
+        factory = MagicMock(
+            return_value=RequestAgentScope(
+                agent=request_agent,
+                bus=request_bus,
+            )
+        )
+        policy = CapabilityPolicy()
+        policy.grant("api:test", "tool:invoke", "/v1/chat/completions")
+        app = create_app(
+            engine,
+            "test-model",
+            agent=shared_agent,
+            request_agent_factory=factory,
+            bus=EventBus(),
+            capability_policy=policy,
+            api_key="test-key",
+            api_principal="api:test",
+            api_principal_allowlist={"api:test"},
+            config=_test_config(),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "run isolated agent"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == (
+            "isolated response"
+        )
+        factory.assert_called_once_with("api:test")
+        request_agent.run.assert_called_once()
+        shared_agent.run.assert_not_called()
+
+    @pytest.mark.parametrize("reuse", ["agent", "bus"])
+    def test_external_principal_rejects_shared_request_scope(self, reuse):
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        engine = _make_engine()
+        shared_agent = _make_agent(content="shared must not execute")
+        shared_bus = EventBus()
+        request_agent = (
+            shared_agent if reuse == "agent" else _make_agent(content="isolated")
+        )
+        request_bus = shared_bus if reuse == "bus" else EventBus()
+        policy = CapabilityPolicy()
+        policy.grant("api:test", "tool:invoke", "/v1/chat/completions")
+        app = create_app(
+            engine,
+            "test-model",
+            agent=shared_agent,
+            request_agent_factory=lambda _principal: RequestAgentScope(
+                agent=request_agent,
+                bus=request_bus,
+            ),
+            bus=shared_bus,
+            capability_policy=policy,
+            api_key="test-key",
+            api_principal="api:test",
+            api_principal_allowlist={"api:test"},
+            config=_test_config(),
+        )
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "do not share"}],
+            },
+        )
+
+        assert response.status_code == 503
+        shared_agent.run.assert_not_called()
+        if request_agent is not shared_agent:
+            request_agent.run.assert_not_called()
+
+    def test_external_stream_uses_isolated_agent_result_without_reinference(self):
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        engine = _make_engine()
+        engine.stream_full = MagicMock()
+        shared_agent = _make_agent(content="shared must not execute")
+        request_agent = _make_agent(
+            content="exact isolated result  with preserved  spacing"
+        )
+        policy = CapabilityPolicy()
+        policy.grant("api:test", "tool:invoke", "/v1/chat/completions")
+        factory = MagicMock(
+            return_value=RequestAgentScope(
+                agent=request_agent,
+                bus=EventBus(),
+            )
+        )
+        app = create_app(
+            engine,
+            "test-model",
+            agent=shared_agent,
+            request_agent_factory=factory,
+            bus=EventBus(),
+            capability_policy=policy,
+            api_key="test-key",
+            api_principal="api:test",
+            api_principal_allowlist={"api:test"},
+            config=_test_config(),
+        )
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "stream safely"}],
+                "stream": True,
+            },
+        )
+
+        content = ""
+        for line in response.text.splitlines():
+            if not line.startswith("data:") or "[DONE]" in line:
+                continue
+            payload = json.loads(line[5:].strip())
+            content += (
+                payload.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                or ""
+            )
+        assert response.status_code == 200
+        assert content == "exact isolated result  with preserved  spacing"
+        factory.assert_called_once_with("api:test")
+        request_agent.run.assert_called_once()
+        shared_agent.run.assert_not_called()
+        engine.stream_full.assert_not_called()
 
     def test_chat_request_limits_fail_before_engine(self):
         engine = _make_engine()
