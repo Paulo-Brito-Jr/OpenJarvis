@@ -64,6 +64,8 @@ from openjarvis.agents.hybrid._base import (
     OPENAI_WEB_SEARCH_COST_PER_CALL,
     WEB_SEARCH_COST_PER_CALL,
     LocalCloudAgent,
+    _guard_provider_text,
+    _require_action_authorized,
     tavily_search_context,
 )
 from openjarvis.agents.hybrid._prices import (
@@ -369,6 +371,8 @@ def _paper_expert_for(
 def _call_tavily_search(
     query: str,
     max_results: int = 5,
+    *,
+    action_authorizer: Any = None,
 ) -> Tuple[str, int, int, float, int]:
     """One-shot Tavily search. Returns (text, p_tok=0, c_tok=0, cost, uses).
 
@@ -376,14 +380,23 @@ def _call_tavily_search(
     accounting layer separately tallies tool-call counts. Falls back to
     DuckDuckGo if Tavily is unreachable (see ``WebSearchTool``).
     """
-    res = tavily_search_context(query, max_results=max_results)
+    res = tavily_search_context(
+        query,
+        max_results=max_results,
+        action_authorizer=action_authorizer,
+    )
     return res["text"], 0, 0, float(res["cost_usd"]), int(res["n_searches"])
 
 
 _MODAL_APP_NAME = "openjarvis-toolorchestra-sandbox"
 
 
-def _call_modal_python(code: str, timeout_s: int = 60) -> Tuple[str, int]:
+def _call_modal_python(
+    code: str,
+    timeout_s: int = 60,
+    *,
+    action_authorizer: Any = None,
+) -> Tuple[str, int]:
     """Execute a single Python snippet in a fresh Modal Sandbox.
 
     Returns ``(combined_stdout_stderr, returncode)``. Logs are capped at 8 KiB.
@@ -391,6 +404,18 @@ def _call_modal_python(code: str, timeout_s: int = 60) -> Tuple[str, int]:
     the returned string with a non-zero rc — we never raise back to the
     orchestrator loop. The sandbox is torn down at the end via ``terminate()``.
     """
+    destination = "https://api.modal.com"
+    _require_action_authorized(
+        action_authorizer,
+        destination,
+        ["network:fetch", "code:execute"],
+        tool_name="modal_python",
+    )
+    code = _guard_provider_text(
+        action_authorizer,
+        code,
+        destination,
+    ) or ""
     try:
         import modal
 
@@ -946,7 +971,11 @@ def _resolve_worker_pool(
 
 
 def _call_worker(
-    worker: Dict[str, Any], prompt: str, cfg: Dict[str, Any]
+    worker: Dict[str, Any],
+    prompt: str,
+    cfg: Dict[str, Any],
+    *,
+    action_authorizer: Any = None,
 ) -> Tuple[str, int, int, bool, float, int]:
     """Returns (text, p_tok, c_tok, is_local, extra_cost, n_web_searches)."""
     wtype = worker.get("type", "openai")
@@ -961,6 +990,7 @@ def _call_worker(
             max_tokens=max_tok,
             temperature=temp,
             enable_thinking=False,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, True, 0.0, 0
     if wtype == "openai":
@@ -976,6 +1006,7 @@ def _call_worker(
             user=prompt,
             max_tokens=eff_max_tok,
             temperature=eff_temp,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, 0.0, 0
     if wtype == "gemini":
@@ -984,6 +1015,7 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=temp,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, 0.0, 0
     if wtype == "anthropic":
@@ -993,6 +1025,7 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=eff_temp,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, 0.0, 0
     if wtype == "anthropic-web-search":
@@ -1004,6 +1037,7 @@ def _call_worker(
             temperature=eff_temp,
             tools=[ANTHROPIC_WEB_SEARCH_TOOL],
             tool_choice={"type": "any"},
+            action_authorizer=action_authorizer,
         )
         extra = n_searches * WEB_SEARCH_COST_PER_CALL
         return text, p, c, False, extra, n_searches
@@ -1016,6 +1050,7 @@ def _call_worker(
             if is_gpt5_family(worker["model"])
             else max_tok,
             temperature=eff_temp,
+            action_authorizer=action_authorizer,
         )
         extra = n_searches * OPENAI_WEB_SEARCH_COST_PER_CALL
         return text, p, c, False, extra, n_searches
@@ -1025,6 +1060,7 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=temp,
+            action_authorizer=action_authorizer,
         )
         extra = n_searches * GEMINI_SEARCH_COST_PER_CALL
         return text, p, c, False, extra, n_searches
@@ -1033,6 +1069,7 @@ def _call_worker(
         text, p, c, extra, n_searches = _call_tavily_search(
             str(prompt),
             max_results=max_results,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, extra, n_searches
     if wtype == "openrouter":
@@ -1041,12 +1078,17 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=temp,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, 0.0, 0
     if wtype == "modal-python":
         # `prompt` is the python code string to exec.
         timeout_s = int(cfg.get("modal_python_timeout_s", 60))
-        out, _rc = _call_modal_python(str(prompt), timeout_s=timeout_s)
+        out, _rc = _call_modal_python(
+            str(prompt),
+            timeout_s=timeout_s,
+            action_authorizer=action_authorizer,
+        )
         # No LLM tokens consumed; report 0 in/out. Cost is whatever Modal
         # charges per sandbox-second — not tracked here.
         return out, 0, 0, False, 0.0, 0
@@ -1060,6 +1102,8 @@ def _swe_call_worker(
     task: Dict[str, Any],
     workdir: Path,
     turn: int,
+    *,
+    action_authorizer: Any = None,
 ) -> Tuple[str, int, int, bool, float, int, int]:
     """SWE-bench worker dispatch: route solver workers through
     run_swe_agent_loop on a shared workdir. Web-search workers fall back
@@ -1071,7 +1115,12 @@ def _swe_call_worker(
     wtype = worker.get("type", "openai")
     if wtype in _TOOLORCH_SEARCH_TYPES:
         # Search workers stay one-shot.
-        text, p, c, is_local, extra, n_searches = _call_worker(worker, prompt, cfg)
+        text, p, c, is_local, extra, n_searches = _call_worker(
+            worker,
+            prompt,
+            cfg,
+            action_authorizer=action_authorizer,
+        )
         return text, p, c, is_local, extra, n_searches, 0
     if wtype == "vllm":
         backbone = "local"
@@ -1083,7 +1132,12 @@ def _swe_call_worker(
         loop_cloud_endpoint = wtype
     else:
         # Unknown type — one-shot fallback.
-        text, p, c, is_local, extra, n_searches = _call_worker(worker, prompt, cfg)
+        text, p, c, is_local, extra, n_searches = _call_worker(
+            worker,
+            prompt,
+            cfg,
+            action_authorizer=action_authorizer,
+        )
         return text, p, c, is_local, extra, n_searches, 0
     out = run_swe_agent_loop(
         task,
@@ -1304,11 +1358,17 @@ class ToolOrchestraAgent(LocalCloudAgent):
                             task_meta,
                             shared_workdir,
                             turn,
+                            action_authorizer=self._action_authorizer,
                         )
                         tool_calls += bash_turns
                     else:
                         w_text, w_in, w_out, is_local, extra_cost, n_searches = (
-                            _call_worker(worker, str(w_input), cfg)
+                            _call_worker(
+                                worker,
+                                str(w_input),
+                                cfg,
+                                action_authorizer=self._action_authorizer,
+                            )
                         )
                     if is_local:
                         tokens_local += w_in + w_out
@@ -1356,12 +1416,16 @@ class ToolOrchestraAgent(LocalCloudAgent):
                             task_meta,
                             shared_workdir,
                             max_turns + 1,
+                            action_authorizer=self._action_authorizer,
                         )
                     )
                     tool_calls += bash_turns
                 else:
                     ans, w_in, w_out, is_local, extra_cost, _ = _call_worker(
-                        worker, question, cfg
+                        worker,
+                        question,
+                        cfg,
+                        action_authorizer=self._action_authorizer,
                     )
                 if is_local:
                     tokens_local += w_in + w_out
@@ -1702,10 +1766,16 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         task_meta,
                         shared_workdir,
                         turn,
+                        action_authorizer=self._action_authorizer,
                     )
                 else:
                     w_text, w_in, w_out, is_local, extra_cost, n_searches = (
-                        _call_worker(worker, w_input, cfg)
+                        _call_worker(
+                            worker,
+                            w_input,
+                            cfg,
+                            action_authorizer=self._action_authorizer,
+                        )
                     )
                 if is_local:
                     tokens_local += w_in + w_out
@@ -1731,6 +1801,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         modal_exec_output, modal_exec_rc = _call_modal_python(
                             code,
                             timeout_s=timeout_s,
+                            action_authorizer=self._action_authorizer,
                         )
                         tool_calls += 1
                         w_text = (
@@ -1793,12 +1864,16 @@ class ToolOrchestraAgent(LocalCloudAgent):
                             task_meta,
                             shared_workdir,
                             max_turns + 1,
+                            action_authorizer=self._action_authorizer,
                         )
                     )
                     tool_calls += fb_bash_turns
                 else:
                     ans, w_in, w_out, is_local, extra_cost, _ = _call_worker(
-                        worker, question, cfg
+                        worker,
+                        question,
+                        cfg,
+                        action_authorizer=self._action_authorizer,
                     )
                 if is_local:
                     tokens_local += w_in + w_out

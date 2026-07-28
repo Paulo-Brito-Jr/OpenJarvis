@@ -4,7 +4,35 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from openjarvis.server.middleware import SECURITY_HEADERS, create_security_middleware
+from openjarvis.server.middleware import (
+    SECURITY_HEADERS,
+    RequestBodyLimitMiddleware,
+    create_security_middleware,
+)
+
+
+class TestRequestBodyLimit:
+    def test_rejects_oversized_content_length_before_endpoint(self) -> None:
+        import pytest
+
+        fastapi = pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        app = fastapi.FastAPI()
+        called = False
+
+        @app.post("/upload")
+        async def upload() -> dict:
+            nonlocal called
+            called = True
+            return {"ok": True}
+
+        app.add_middleware(RequestBodyLimitMiddleware, max_bytes=16)
+        response = TestClient(app).post("/upload", content=b"x" * 17)
+
+        assert response.status_code == 413
+        assert response.json() == {"detail": "Request body too large"}
+        assert called is False
 
 
 class TestSecurityHeaders:

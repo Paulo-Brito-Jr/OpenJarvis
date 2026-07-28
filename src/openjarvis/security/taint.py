@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, FrozenSet, Optional, Set
+from typing import Any, Dict, FrozenSet, Mapping, Optional, Set
 
 
 class TaintLabel(str, Enum):
@@ -42,12 +42,62 @@ class TaintSet:
         """Create from one or more labels."""
         return cls(labels=frozenset(labels))
 
+    def to_json(self) -> Dict[str, list[str]]:
+        """Return a stable JSON-safe representation.
+
+        Taint metadata crosses process, MCP, HTTP and trace boundaries.  A
+        dataclass instance is not JSON serialisable and used to be silently
+        discarded by event/trace code, so labels are encoded explicitly.
+        """
+        return {
+            "labels": sorted(label.value for label in self.labels),
+        }
+
+    @classmethod
+    def from_json(cls, value: Any) -> TaintSet:
+        """Parse taint metadata without accepting ambiguous shapes.
+
+        ``TaintSet`` instances are accepted for in-process callers.  Across a
+        JSON boundary the only accepted object is ``{"labels": [...]}``;
+        callers may also pass the labels sequence directly.  Unknown labels,
+        extra keys and scalar strings fail closed.
+        """
+        if isinstance(value, cls):
+            return value
+        raw_labels: Any
+        if isinstance(value, Mapping):
+            if set(value) != {"labels"}:
+                raise ValueError("Taint object must contain only 'labels'.")
+            raw_labels = value["labels"]
+        else:
+            raw_labels = value
+        if not isinstance(raw_labels, (list, tuple, set, frozenset)):
+            raise ValueError("Taint labels must be a JSON array.")
+
+        labels: set[TaintLabel] = set()
+        for raw_label in raw_labels:
+            if isinstance(raw_label, TaintLabel):
+                labels.add(raw_label)
+                continue
+            if not isinstance(raw_label, str) or not raw_label:
+                raise ValueError("Taint labels must be non-empty strings.")
+            try:
+                labels.add(TaintLabel(raw_label))
+            except ValueError as exc:
+                raise ValueError(f"Unknown taint label: {raw_label!r}.") from exc
+        return cls(labels=frozenset(labels))
+
 
 # Sink policy: which taint labels are forbidden for each tool
 # If a tool appears here, data with any of the listed labels MUST NOT
 # be passed to that tool.
 SINK_POLICY: Dict[str, Set[TaintLabel]] = {
     "web_search": {TaintLabel.PII, TaintLabel.SECRET},
+    "http_request": {TaintLabel.PII, TaintLabel.SECRET},
+    "browser": {TaintLabel.PII, TaintLabel.SECRET},
+    "browser_navigate": {TaintLabel.PII, TaintLabel.SECRET},
+    "browser_extract": {TaintLabel.SECRET},
+    "mcp_adapter": {TaintLabel.PII, TaintLabel.SECRET},
     "channel_send": {TaintLabel.SECRET},
     "code_interpreter": {TaintLabel.SECRET},
 }
@@ -68,6 +118,55 @@ _SECRET_PATTERNS = [
         r"(?:bearer|token|password|secret|key)\s*[=:]\s*\S{8,}",
         re.IGNORECASE,
     ),  # Generic secrets
+]
+
+_REDACTION_PATTERNS = [
+    (
+        re.compile(
+            r"\b(?:sk(?:-ant)?|pk|api)[_-][a-zA-Z0-9_-]{20,}\b",
+            re.IGNORECASE,
+        ),
+        "[REDACTED:secret]",
+    ),
+    (
+        re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b"),
+        "[REDACTED:secret]",
+    ),
+    (
+        re.compile(
+            r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b",
+            re.IGNORECASE,
+        ),
+        "Bearer [REDACTED:token]",
+    ),
+    (
+        re.compile(
+            r"((?:api[_-]?key|auth[_-]?token|access[_-]?token|"
+            r"refresh[_-]?token|password|passwd|secret|token)\s*[=:]\s*)"
+            r"([\"']?)[^,\s}\"']{4,}\2",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:secret]",
+    ),
+    (
+        re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+        "[REDACTED:email]",
+    ),
+    (
+        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+        "[REDACTED:ssn]",
+    ),
+    (
+        re.compile(r"\b(?:\d{4}[\s-]?){3}\d{4}\b"),
+        "[REDACTED:card]",
+    ),
+    (
+        re.compile(
+            r"\b(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?"
+            r"\d{3}[-.\s]?\d{4}\b"
+        ),
+        "[REDACTED:phone]",
+    ),
 ]
 
 
@@ -117,6 +216,40 @@ def auto_detect_taint(text: str) -> TaintSet:
     return TaintSet(labels=frozenset(labels))
 
 
+def external_taint(source: str = "external") -> Dict[str, Any]:
+    """Return JSON-safe taint/provenance metadata for untrusted output."""
+    safe_source = (
+        source
+        if isinstance(source, str)
+        and source
+        and len(source) <= 128
+        and all(ch.isalnum() or ch in "._:-/" for ch in source)
+        else "external"
+    )
+    return {
+        "_taint": TaintSet.from_labels(TaintLabel.EXTERNAL).to_json(),
+        "provenance": {
+            "trust": "external",
+            "source": safe_source,
+        },
+    }
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Redact common secrets and PII with a pure-Python fail-safe.
+
+    This helper intentionally has no optional/Rust dependency so audit and
+    trace persistence remain safe even when the accelerated scanners cannot
+    load.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    redacted = text
+    for pattern, replacement in _REDACTION_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
 def propagate_taint(
     input_taint: TaintSet,
     output_text: str,
@@ -133,5 +266,7 @@ __all__ = [
     "auto_detect_taint",
     "check_taint",
     "declassify",
+    "external_taint",
     "propagate_taint",
+    "redact_sensitive_text",
 ]

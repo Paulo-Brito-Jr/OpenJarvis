@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from openjarvis.connectors._stubs import Document
 from openjarvis.core.registry import ConnectorRegistry, ToolRegistry
 from openjarvis.core.types import ToolResult
+from openjarvis.security.taint import external_taint
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -424,7 +425,7 @@ class DigestCollectTool(BaseTool):
     """Collect recent data from multiple connectors for digest synthesis."""
 
     tool_id = "digest_collect"
-    is_local = True
+    is_local = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -468,7 +469,22 @@ class DigestCollectTool(BaseTool):
             },
             category="data",
             timeout_seconds=60.0,
+            required_capabilities=["memory:read", "network:fetch"],
         )
+
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        raw_sources = params.get("sources")
+        if isinstance(raw_sources, list):
+            sources = sorted(
+                {
+                    source.strip()
+                    for source in raw_sources
+                    if isinstance(source, str) and source.strip()
+                }
+            )
+            if sources:
+                return "connectors:" + ",".join(sources)
+        return "connectors:unknown"
 
     def execute(self, **params: Any) -> ToolResult:
         # Ensure connectors are registered
@@ -579,5 +595,6 @@ class DigestCollectTool(BaseTool):
                 "sources_ok": list(collected_docs.keys()),
                 "sources_failed": errors,
                 "total_items": sum(len(v) for v in collected_docs.values()),
+                **external_taint("connectors:digest"),
             },
         )

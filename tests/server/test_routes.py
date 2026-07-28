@@ -143,6 +143,70 @@ class TestMemoryServiceWiring:
         assert resp.status_code == 200
         assert spy.submissions == [("remember this", "agent reply")]
 
+    def test_external_principal_without_memory_write_is_not_persisted(self):
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        engine = _make_engine(content="not persisted")
+        spy = _SpyMemoryService()
+        policy = CapabilityPolicy()
+        policy.grant("api:test", "tool:invoke", "/v1/chat/completions")
+        app = create_app(
+            engine,
+            "test-model",
+            memory_service=spy,
+            capability_policy=policy,
+            api_key="test-key",
+            api_principal="api:test",
+            api_principal_allowlist={"api:test"},
+            config=_test_config(),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "private exchange"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert spy.submissions == []
+
+    def test_external_principal_without_memory_read_gets_no_context(self):
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        engine = _make_engine()
+        backend = MagicMock()
+        config = _test_config()
+        config.agent.context_from_memory = True
+        policy = CapabilityPolicy()
+        policy.grant("api:test", "tool:invoke", "/v1/chat/completions")
+        app = create_app(
+            engine,
+            "test-model",
+            memory_backend=backend,
+            capability_policy=policy,
+            api_key="test-key",
+            api_principal="api:test",
+            api_principal_allowlist={"api:test"},
+            config=config,
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "private query"}],
+            },
+        )
+
+        assert response.status_code == 200
+        backend.retrieve.assert_not_called()
+
     def test_non_streaming_completion_publishes_completed_exchange(self):
         bus = EventBus(record_history=True)
         engine = _make_engine(content="event reply")
@@ -327,6 +391,76 @@ class TestChatCompletions:
         assert resp.status_code == 200
         data = resp.json()
         assert data["choices"][0]["message"]["content"] == "Hello from agent"
+
+    def test_external_principal_cannot_reuse_shared_agent(self):
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        engine = _make_engine()
+        agent = _make_agent(content="must not execute")
+        policy = CapabilityPolicy()
+        policy.grant("api:test", "tool:invoke", "/v1/chat/completions")
+        app = create_app(
+            engine,
+            "test-model",
+            agent=agent,
+            capability_policy=policy,
+            api_key="test-key",
+            api_principal="api:test",
+            api_principal_allowlist={"api:test"},
+            config=_test_config(),
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "run agent"}],
+            },
+        )
+
+        assert response.status_code == 503
+        assert "per-request agent isolation" in response.json()["detail"]
+        agent.run.assert_not_called()
+
+    def test_chat_request_limits_fail_before_engine(self):
+        engine = _make_engine()
+        app = create_app(engine, "test-model", config=_test_config())
+        client = TestClient(app)
+
+        too_many = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "x"}
+                    for _ in range(129)
+                ],
+            },
+        )
+        oversized = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "x" * 65_537}
+                ],
+            },
+        )
+        excessive_tokens = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 32_769,
+            },
+        )
+
+        assert too_many.status_code == 413
+        assert oversized.status_code == 413
+        assert excessive_tokens.status_code == 422
+        engine.generate.assert_not_called()
 
     def test_with_tools_bypasses_agent(self):
         """Regression for #414.

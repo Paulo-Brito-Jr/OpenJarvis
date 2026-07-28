@@ -283,7 +283,9 @@ class TestAskAgentOption:
         )
 
         assert result.exit_code == 0
-        assert "executed!" in result.output
+        assert "executed!" not in result.output
+        assert "Capability 'tool:invoke' denied" in result.output
+        assert "dangerous" in result.output
         agent_setup.engine.generate.assert_not_called()
 
 

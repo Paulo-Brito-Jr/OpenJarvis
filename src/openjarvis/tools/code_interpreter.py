@@ -1,35 +1,26 @@
-"""Code interpreter tool — safe Python code execution in subprocess."""
+"""Code interpreter tool.
+
+The legacy host subprocess implementation is intentionally disabled.  A
+process running as the same user is not an isolation boundary, and string
+blacklists cannot make arbitrary Python safe.
+"""
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from typing import Any
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
-# Dangerous patterns to block
-_BLOCKED_PATTERNS = [
-    "os.system",
-    "os.popen",
-    "subprocess.",
-    "shutil.rmtree",
-    "os.remove",
-    "os.unlink",
-    "os.rmdir",
-    "__import__",
-    "eval(",
-    "exec(",
-    "compile(",
-    "open(",
-]
-
 
 @ToolRegistry.register("code_interpreter")
 class CodeInterpreterTool(BaseTool):
-    """Execute Python code in an isolated subprocess."""
+    """Fail-closed placeholder for isolated Python execution.
+
+    Use ``code_interpreter_docker`` when a verified container sandbox is
+    available.  This tool never falls back to host execution.
+    """
 
     tool_id = "code_interpreter"
 
@@ -42,8 +33,8 @@ class CodeInterpreterTool(BaseTool):
         return ToolSpec(
             name="code_interpreter",
             description=(
-                "Execute Python code and return the output."
-                " Code runs in an isolated subprocess."
+                "Execute Python code only when an isolated sandbox backend "
+                "is configured. Host execution is disabled."
             ),
             parameters={
                 "type": "object",
@@ -56,7 +47,15 @@ class CodeInterpreterTool(BaseTool):
                 "required": ["code"],
             },
             category="code",
+            requires_confirmation=True,
+            required_capabilities=["code:execute"],
+            metadata={"sandbox_required": True, "host_execution": False},
         )
+
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        """Authorize the execution class without exposing source code."""
+        del params
+        return "code:python"
 
     def execute(self, **params: Any) -> ToolResult:
         code = params.get("code", "")
@@ -67,45 +66,19 @@ class CodeInterpreterTool(BaseTool):
                 success=False,
             )
 
-        # Security check
-        for pattern in _BLOCKED_PATTERNS:
-            if pattern in code:
-                return ToolResult(
-                    tool_name="code_interpreter",
-                    content=f"Blocked: code contains prohibited pattern '{pattern}'",
-                    success=False,
-                )
-
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", code],
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-            )
-            output = result.stdout
-            if result.stderr:
-                output += ("\n" if output else "") + result.stderr
-            if len(output) > self._max_output:
-                output = output[: self._max_output] + "\n... (output truncated)"
-            return ToolResult(
-                tool_name="code_interpreter",
-                content=output or "(no output)",
-                success=result.returncode == 0,
-                metadata={"returncode": result.returncode},
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                tool_name="code_interpreter",
-                content=f"Execution timed out after {self._timeout} seconds.",
-                success=False,
-            )
-        except Exception as exc:
-            return ToolResult(
-                tool_name="code_interpreter",
-                content=f"Execution error: {exc}",
-                success=False,
-            )
+        del code
+        return ToolResult(
+            tool_name="code_interpreter",
+            content=(
+                "Python execution disabled: no verified isolated sandbox "
+                "backend is configured. Use code_interpreter_docker."
+            ),
+            success=False,
+            metadata={
+                "security_disabled": True,
+                "reason": "isolated_sandbox_required",
+            },
+        )
 
 
 __all__ = ["CodeInterpreterTool"]

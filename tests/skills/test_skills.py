@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.skills.executor import SkillExecutor
 from openjarvis.skills.types import SkillManifest, SkillStep
 from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
@@ -43,6 +44,17 @@ class UpperTool(BaseTool):
         )
 
 
+def _permitted_tool_executor(tools, *, bus=None) -> ToolExecutor:
+    policy = CapabilityPolicy()
+    policy.grant("skill-test-agent", "tool:invoke")
+    return ToolExecutor(
+        tools,
+        bus=bus,
+        capability_policy=policy,
+        agent_id="skill-test-agent",
+    )
+
+
 class TestSkillManifest:
     def test_create_manifest(self):
         manifest = SkillManifest(
@@ -63,7 +75,7 @@ class TestSkillManifest:
 class TestSkillExecutor:
     def _make_executor(self):
         tools = [EchoTool(), UpperTool()]
-        tool_executor = ToolExecutor(tools)
+        tool_executor = _permitted_tool_executor(tools)
         return SkillExecutor(tool_executor)
 
     def test_single_step(self):
@@ -135,7 +147,7 @@ class TestSkillExecutor:
     def test_events_emitted(self):
         bus = EventBus(record_history=True)
         tools = [EchoTool()]
-        tool_executor = ToolExecutor(tools)
+        tool_executor = _permitted_tool_executor(tools)
         executor = SkillExecutor(tool_executor, bus=bus)
 
         manifest = SkillManifest(
@@ -255,7 +267,7 @@ class TestSkillExecutorSubSkills:
     def test_sub_skill_delegation(self):
         """Executor delegates skill_name steps to a skill resolver."""
         tools = [EchoTool(), UpperTool()]
-        tool_executor = ToolExecutor(tools)
+        tool_executor = _permitted_tool_executor(tools)
         executor = SkillExecutor(tool_executor)
 
         child_manifest = SkillManifest(
@@ -299,7 +311,7 @@ class TestSkillExecutorSubSkills:
 
     def test_sub_skill_failure_stops_pipeline(self):
         tools = [EchoTool()]
-        tool_executor = ToolExecutor(tools)
+        tool_executor = _permitted_tool_executor(tools)
         executor = SkillExecutor(tool_executor)
 
         def resolve_skill(name, context):
@@ -326,7 +338,7 @@ class TestSkillTool:
         from openjarvis.skills.tool_adapter import SkillTool
 
         tools = [EchoTool()]
-        tool_executor = ToolExecutor(tools)
+        tool_executor = _permitted_tool_executor(tools)
         executor = SkillExecutor(tool_executor)
         manifest = SkillManifest(
             name="tool_skill",

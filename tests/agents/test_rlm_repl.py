@@ -2,7 +2,41 @@
 
 from __future__ import annotations
 
+import io
+from contextlib import redirect_stderr, redirect_stdout
+
+import pytest
+
 from openjarvis.agents.rlm_repl import RLMRepl
+
+
+def _isolated_test_executor(code, namespace, max_output_chars):
+    """Test double for a sandbox transport; production never uses host exec."""
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    try:
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            exec(code, namespace)  # noqa: S102
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    output = stdout_buf.getvalue()
+    err_output = stderr_buf.getvalue()
+    if err_output:
+        output += ("\n" if output else "") + err_output
+    if len(output) > max_output_chars:
+        output = output[:max_output_chars] + "\n... (output truncated)"
+    return output
+
+
+@pytest.fixture(autouse=True)
+def _inject_isolated_test_executor(monkeypatch):
+    original = RLMRepl.__init__
+
+    def secured_init(self, *args, **kwargs):
+        kwargs.setdefault("sandbox_executor", _isolated_test_executor)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(RLMRepl, "__init__", secured_init)
 
 
 class TestRLMReplBasics:
@@ -46,6 +80,12 @@ class TestRLMReplBasics:
 
 class TestRLMReplSecurity:
     """Security: blocked patterns and safe modules."""
+
+    def test_missing_isolated_executor_disables_host_execution(self):
+        repl = RLMRepl(sandbox_executor=None)
+        output = repl.execute("answer['ready'] = True")
+        assert "disabled" in output
+        assert not repl.is_terminated
 
     def test_blocked_os_system(self):
         repl = RLMRepl()

@@ -8,6 +8,7 @@ from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.orchestrator import OrchestratorAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,13 @@ def _make_engine_no_tools(content: str = "Final answer.") -> MagicMock:
         "finish_reason": "stop",
     }
     return engine
+
+
+def _allow_test_tools(agent):
+    policy = CapabilityPolicy()
+    policy.grant("orchestrator-test-agent", "*")
+    agent.bind_security(policy, "orchestrator-test-agent")
+    return agent
 
 
 def _make_engine_with_tool_call(
@@ -164,6 +172,7 @@ class TestOrchestratorAgent:
             "test-model",
             tools=[_CalculatorStub()],
         )
+        agent = _allow_test_tools(agent)
         result = agent.run("What is 2+2?")
         assert result.content == "The answer is 4."
         assert result.turns == 2
@@ -296,6 +305,7 @@ class TestOrchestratorAgent:
             tools=[_CalculatorStub()],
             bus=bus,
         )
+        agent = _allow_test_tools(agent)
         agent.run("Calc 2+2")
         event_types = [e.event_type for e in bus.history]
         assert EventType.TOOL_CALL_START in event_types
@@ -402,6 +412,7 @@ class TestOrchestratorAgent:
             "test-model",
             tools=[_CalculatorStub()],
         )
+        agent = _allow_test_tools(agent)
         result = agent.run("Calculate")
         assert result.turns == 3
         assert len(result.tool_results) == 2
@@ -532,6 +543,7 @@ class TestOrchestratorStructuredMode:
             tools=[_CalculatorStub()],
             mode="structured",
         )
+        agent = _allow_test_tools(agent)
         result = agent.run("What is 2+2?")
         assert result.content == "The answer is 4."
         assert result.turns == 2
@@ -628,6 +640,7 @@ class TestOrchestratorParallelTools:
             tools=[_SlowTool()],
             parallel_tools=True,
         )
+        agent = _allow_test_tools(agent)
         t0 = time.time()
         result = agent.run("Do things")
         elapsed = time.time() - t0

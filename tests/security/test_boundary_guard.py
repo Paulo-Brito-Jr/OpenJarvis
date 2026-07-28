@@ -101,6 +101,44 @@ class TestBoundaryGuardScanOutbound:
         result = guard.scan_outbound(text, destination="openai")
         assert result == text
 
+    def test_security_alert_never_persists_detected_content(self) -> None:
+        from openjarvis.core.events import EventBus, EventType
+        from openjarvis.security.boundary import BoundaryGuard
+
+        class _DatabaseUriScanner:
+            def scan(self, text: str) -> _ScanResult:
+                findings = (
+                    [_Finding("db_connection_string", text)]
+                    if "postgres://" in text
+                    else []
+                )
+                return _ScanResult(findings=findings)
+
+            def redact(self, text: str) -> str:
+                return "[REDACTED:db_connection_string]"
+
+        bus = EventBus(record_history=True)
+        guard = BoundaryGuard(
+            mode="redact",
+            bus=bus,
+            scanners=[_DatabaseUriScanner()],
+        )
+        secret = "postgres://db_user:db_password@private-host/app"
+
+        guard.scan_outbound(secret, destination="cloud-model")
+
+        alerts = [
+            event
+            for event in bus.history
+            if event.event_type == EventType.SECURITY_ALERT
+        ]
+        assert len(alerts) == 1
+        serialized = repr(alerts[0].data)
+        assert secret not in serialized
+        assert "db_password" not in serialized
+        assert "content_preview" not in alerts[0].data
+        assert alerts[0].data["content_length"] == len(secret)
+
 
 class TestBoundaryGuardCheckOutbound:
     """check_outbound should redact secrets in tool call arguments."""
@@ -210,6 +248,7 @@ class TestToolExecutorBoundaryIntegration:
     """ToolExecutor should use BoundaryGuard for external tool calls."""
 
     def _make_executor(self, boundary_guard=None):
+        from openjarvis.security.capabilities import CapabilityPolicy
         from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
 
         class FakeExternalTool(BaseTool):
@@ -236,9 +275,13 @@ class TestToolExecutorBoundaryIntegration:
                     success=True,
                 )
 
+        policy = CapabilityPolicy()
+        policy.grant("boundary-test", "tool:invoke")
         return ToolExecutor(
             tools=[FakeExternalTool()],
             boundary_guard=boundary_guard,
+            capability_policy=policy,
+            agent_id="boundary-test",
         )
 
     def test_external_tool_args_scanned(self) -> None:
@@ -255,7 +298,7 @@ class TestToolExecutorBoundaryIntegration:
         result = executor.execute(tc)
         assert "sk-proj-" not in result.content
 
-    def test_no_guard_passes_through(self) -> None:
+    def test_no_guard_denies_external_tool(self) -> None:
         executor = self._make_executor(boundary_guard=None)
         tc = ToolCall(
             id="t2",
@@ -263,4 +306,6 @@ class TestToolExecutorBoundaryIntegration:
             arguments='{"q": "sk-proj-abc123def456ghi789jkl012mno345pqr678stu"}',
         )
         result = executor.execute(tc)
-        assert "sk-proj-" in result.content
+        assert result.success is False
+        assert "boundary guard unavailable" in result.content
+        assert "sk-proj-" not in result.content

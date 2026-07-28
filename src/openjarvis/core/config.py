@@ -1264,7 +1264,8 @@ class ChannelConfig:
 class CapabilitiesConfig:
     """RBAC capability system settings."""
 
-    enabled: bool = False
+    enabled: bool = True
+    default_deny: bool = True
     policy_path: str = ""
 
 
@@ -2140,7 +2141,7 @@ default_agent = "simple"
 
 [security]
 enabled = true
-mode = "warn"
+mode = "redact"
 scan_input = true
 scan_output = true
 secret_scanner = true
@@ -2150,6 +2151,11 @@ ssrf_protection = true
 # rate_limit_enabled = false
 # rate_limit_rpm = 60
 # rate_limit_burst = 10
+
+[security.capabilities]
+enabled = true
+default_deny = true
+# policy_path = "~/.openjarvis/capabilities.json"
 
 # [sandbox]
 # enabled = false

@@ -142,4 +142,9 @@ try:
 except ImportError:
     pass
 
+try:
+    import openjarvis.tools.skynet_home  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]

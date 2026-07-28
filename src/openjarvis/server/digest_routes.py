@@ -64,14 +64,13 @@ def create_digest_router(*, db_path: str = "") -> APIRouter:
     @router.post("/generate")
     async def generate_digest():
         """Force re-generation of the digest."""
-        try:
-            from openjarvis.sdk import Jarvis
-
-            with Jarvis() as j:
-                result = j.ask("Generate my morning digest", agent="morning_digest")
-            return {"status": "ok", "text": result}
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Digest generation is disabled until the authenticated API "
+                "principal is propagated into the agent security context."
+            ),
+        )
 
     @router.get("/history")
     async def get_digest_history():
@@ -102,19 +101,24 @@ def create_digest_router(*, db_path: str = "") -> APIRouter:
         cfg = load_config()
         cron = body.cron if body.cron is not None else cfg.digest.schedule
 
+        # Authenticate/authorize the scheduler mutation before persisting the
+        # matching config flag. The imported helpers fail closed when no
+        # authenticated scheduler context was supplied.
+        try:
+            if body.enabled:
+                _create_scheduler_task(cron)
+            else:
+                _cancel_scheduler_tasks()
+        except PermissionError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
         try:
             _save_digest_schedule(enabled=body.enabled, cron=cron)
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to save config: {exc}",
-            )
-
-        # Sync with the TaskScheduler
-        if body.enabled:
-            _create_scheduler_task(cron)
-        else:
-            _cancel_scheduler_tasks()
+                detail="Failed to save digest schedule config.",
+            ) from exc
 
         return {
             "enabled": body.enabled,

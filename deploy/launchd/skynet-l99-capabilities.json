@@ -1,0 +1,50 @@
+{
+  "agents": [
+    {
+      "agent_id": "orchestrator",
+      "grants": [
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://*"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://*"
+        },
+        {
+          "capability": "skynet:casa:read",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "skynet:agenda:read",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "skynet:frota:read",
+          "pattern": "skynet://frota/*"
+        },
+        {
+          "capability": "skynet:casa:approval:request",
+          "pattern": "skynet://casa/tomada_cozinha_backlight"
+        },
+        {
+          "capability": "skynet:casa:approval:status",
+          "pattern": "skynet://casa/approval/*"
+        },
+        {
+          "capability": "skynet:casa:write",
+          "pattern": "skynet://casa/tomada_cozinha_backlight"
+        }
+      ],
+      "deny": [
+        "code:*",
+        "file:*",
+        "channel:*",
+        "email:*",
+        "message:*",
+        "schedule:*",
+        "system:*"
+      ]
+    }
+  ]
+}

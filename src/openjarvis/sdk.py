@@ -485,9 +485,6 @@ class Jarvis:
             agent_kwargs["tools"] = tool_objects
             agent_kwargs["max_turns"] = self._config.agent.max_turns
 
-        if self._capability_policy is not None:
-            agent_kwargs["capability_policy"] = self._capability_policy
-
         # Inject DigestConfig for morning_digest agent
         if agent_name == "morning_digest" and hasattr(self._config, "digest"):
             dc = self._config.digest
@@ -517,6 +514,18 @@ class Jarvis:
             agent_kwargs["tools"] = digest_tools + list(existing)
 
         agent_obj = agent_cls(self._engine, model_name, **agent_kwargs)
+        needs_security = bool(
+            getattr(agent_cls, "accepts_tools", False)
+            or getattr(agent_cls, "requires_security_context", False)
+        )
+        if needs_security:
+            bind_security = getattr(agent_obj, "bind_security", None)
+            if not callable(bind_security):
+                raise ValueError(
+                    f"Security-bound agent '{agent_name}' does not expose "
+                    "bind_security()"
+                )
+            bind_security(self._capability_policy, agent_name)
         ctx = AgentContext()
 
         # Context injection

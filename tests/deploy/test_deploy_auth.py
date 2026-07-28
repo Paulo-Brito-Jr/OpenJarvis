@@ -8,6 +8,7 @@ these tests guard the static config files that drive it.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,36 @@ def test_launchd_plist_binds_loopback():
     # Personal-device default: loopback, not the network.
     assert "<string>127.0.0.1</string>" in text
     assert "<string>0.0.0.0</string>" not in text
+
+
+def test_skynet_l99_policy_is_narrow_and_default_deny_compatible():
+    policy_path = DEPLOY / "launchd" / "skynet-l99-capabilities.json"
+    policy = json.loads(policy_path.read_text())
+
+    assert set(policy) == {"agents"}
+    assert len(policy["agents"]) == 1
+    agent = policy["agents"][0]
+    assert agent["agent_id"] == "orchestrator"
+    assert set(agent) == {"agent_id", "grants", "deny"}
+
+    grants = {
+        (grant["capability"], grant["pattern"])
+        for grant in agent["grants"]
+    }
+    assert ("tool:invoke", "skynet://*") in grants
+    assert ("network:fetch", "skynet://*") in grants
+    assert (
+        "skynet:casa:write",
+        "skynet://casa/tomada_cozinha_backlight",
+    ) in grants
+    assert not any(
+        capability in {"code:execute", "file:write", "channel:send"}
+        for capability, _ in grants
+    )
+    assert not any(
+        pattern in {"*", "http://*", "https://*"}
+        for _, pattern in grants
+    )
 
 
 @pytest.mark.parametrize(

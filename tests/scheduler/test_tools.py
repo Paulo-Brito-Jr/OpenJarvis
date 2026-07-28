@@ -102,7 +102,7 @@ class TestWithScheduler:
             next_run="2026-01-01T00:00:00",
         )
         tool = ScheduleTaskTool()
-        tool._scheduler = mock_sched
+        tool.bind_scheduler_context(mock_sched, "scheduler-test")
         result = tool.execute(
             prompt="hello", schedule_type="once", schedule_value="2026-01-01T00:00:00"
         )
@@ -118,10 +118,14 @@ class TestWithScheduler:
             ),
         ]
         tool = ListScheduledTasksTool()
-        tool._scheduler = mock_sched
+        tool.bind_scheduler_context(mock_sched, "scheduler-test")
         result = tool.execute()
         assert result.success
         assert "t1" in result.content
+        mock_sched.list_tasks.assert_called_once_with(
+            status=None,
+            operator_id="scheduler-test",
+        )
 
     def test_schedule_task_missing_params(self):
         tool = ScheduleTaskTool()
@@ -136,3 +140,27 @@ class TestWithScheduler:
         result = tool.execute()  # missing task_id
         assert not result.success
         assert "Missing" in result.content
+
+    def test_unbound_operator_fails_closed(self):
+        tool = ListScheduledTasksTool()
+        tool._scheduler = MagicMock()
+
+        result = tool.execute()
+
+        assert not result.success
+        assert result.content == "Failed to list scheduled tasks securely."
+        tool._scheduler.list_tasks.assert_not_called()
+
+    def test_recurring_task_requires_explicit_replay_consent(self):
+        mock_sched = MagicMock()
+        tool = ScheduleTaskTool()
+        tool.bind_scheduler_context(mock_sched, "scheduler-test")
+
+        result = tool.execute(
+            prompt="hello",
+            schedule_type="interval",
+            schedule_value="60",
+        )
+
+        assert not result.success
+        mock_sched.create_task.assert_not_called()

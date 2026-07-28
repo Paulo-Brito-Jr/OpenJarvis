@@ -27,7 +27,7 @@ import threading
 import time
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -378,6 +378,8 @@ def _chunk_synthesis(text: str, window_chars: int = 40) -> list[str]:
 async def _stream_research(
     query: str,
     *,
+    capability_policy: Any,
+    agent_id: str,
     active_engine: InferenceEngine | None = None,
     active_engine_key: str = "",
     active_model: str = "",
@@ -427,13 +429,18 @@ async def _stream_research(
             model=model,
             clarify_handler=lambda question: _WEB_CLARIFY_RESPONSE,
             on_event=on_event,
+            capability_policy=capability_policy,
+            agent_id=agent_id,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("research: setup failed before agent could run: %s", exc)
+        logger.exception(
+            "research setup failed before agent could run: %s",
+            type(exc).__name__,
+        )
         yield _sse(
             {
                 "type": "error",
-                "message": f"Research failed: {type(exc).__name__}: {exc}",
+                "message": "Research setup failed.",
             }
         )
         yield _sse({"type": "done", "usage": {}})
@@ -484,7 +491,7 @@ async def _stream_research(
                 {"type": "_usage", "usage": usage_dict},
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("research agent crashed: %s", exc)
+            logger.exception("research agent crashed: %s", type(exc).__name__)
             # Stop the sampler on failure too so we don't leak the polling thread
             # past the request lifetime.
             try:
@@ -493,7 +500,7 @@ async def _stream_research(
                 pass
             loop.call_soon_threadsafe(
                 queue.put_nowait,
-                {"type": "error", "message": f"{type(exc).__name__}: {exc}"},
+                {"type": "error", "message": "Research execution failed."},
             )
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, _DONE)
@@ -541,11 +548,14 @@ async def _stream_research(
         # Consumer loop crashed unexpectedly (e.g. JSON serialization fault,
         # logic bug). Surface a clean error frame rather than letting the
         # SSE connection die mid-stream.
-        logger.exception("research: stream consumer crashed: %s", exc)
+        logger.exception(
+            "research stream consumer crashed: %s",
+            type(exc).__name__,
+        )
         yield _sse(
             {
                 "type": "error",
-                "message": f"Research failed: {type(exc).__name__}: {exc}",
+                "message": "Research streaming failed.",
             }
         )
         yield _sse({"type": "done", "usage": final_usage, "sources": final_sources})
@@ -575,6 +585,38 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
     terminates the stream so clients can detect end-of-response without
     parsing the underlying ``[DONE]`` sentinel used by OpenAI-style routes.
     """
+    if req.model:
+        logger.info(
+            "research: ignoring client model=%r; using governed planner config",
+            req.model,
+        )
+    if not req.query.strip() or len(req.query) > 10_000:
+        raise HTTPException(
+            status_code=400,
+            detail="Research query must contain 1 to 10000 characters",
+        )
+    principal = getattr(request.state, "api_principal", "").strip()
+    policy = getattr(request.app.state, "capability_policy", None)
+    if not principal or policy is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Research security context is not configured",
+        )
+    try:
+        authorized = policy.check(
+            principal,
+            "tool:invoke",
+            "research:planner",
+        ) and policy.check(
+            principal,
+            "memory:read",
+            "research:corpus:*",
+        )
+    except Exception:
+        authorized = False
+    if not authorized:
+        raise HTTPException(status_code=403, detail="Research is not authorized")
+
     active_engine = getattr(request.app.state, "engine", None)
     active_model = str(getattr(request.app.state, "model", "") or "")
     active_engine_key = str(getattr(request.app.state, "engine_name", "") or "")
@@ -583,10 +625,12 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
     return StreamingResponse(
         _stream_research(
             req.query,
+            capability_policy=policy,
+            agent_id=principal,
             active_engine=active_engine,
             active_engine_key=active_engine_key,
             active_model=active_model,
-            request_model=req.model or "",
+            request_model="",
         ),
         media_type="text/event-stream",
         headers={

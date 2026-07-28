@@ -15,6 +15,24 @@ def test_tts_tool_registered():
     assert ToolRegistry.contains("text_to_speech")
 
 
+def test_tts_requires_scoped_write_network_and_confirmation(tmp_path):
+    from openjarvis.tools.text_to_speech import TextToSpeechTool
+
+    tool = TextToSpeechTool()
+
+    assert tool.spec.requires_confirmation is True
+    assert tool.authorization_capabilities({"backend": "cartesia"}) == [
+        "file:write",
+        "network:fetch",
+    ]
+    assert tool.authorization_capabilities({"backend": "kokoro"}) == [
+        "file:write"
+    ]
+    assert tool.authorization_resource(
+        {"output_dir": str(tmp_path)}
+    ) == str(tmp_path)
+
+
 def test_tts_tool_execute(tmp_path):
     from openjarvis.tools.text_to_speech import TextToSpeechTool
 

@@ -19,6 +19,14 @@ pub enum Capability {
     MemoryWrite,
     #[serde(rename = "channel:send")]
     ChannelSend,
+    #[serde(rename = "email:write")]
+    EmailWrite,
+    #[serde(rename = "calendar:write")]
+    CalendarWrite,
+    #[serde(rename = "message:send")]
+    MessageSend,
+    #[serde(rename = "approval:decide")]
+    ApprovalDecide,
     #[serde(rename = "tool:invoke")]
     ToolInvoke,
     #[serde(rename = "schedule:create")]
@@ -37,6 +45,10 @@ impl Capability {
             Capability::MemoryRead => "memory:read",
             Capability::MemoryWrite => "memory:write",
             Capability::ChannelSend => "channel:send",
+            Capability::EmailWrite => "email:write",
+            Capability::CalendarWrite => "calendar:write",
+            Capability::MessageSend => "message:send",
+            Capability::ApprovalDecide => "approval:decide",
             Capability::ToolInvoke => "tool:invoke",
             Capability::ScheduleCreate => "schedule:create",
             Capability::SystemAdmin => "system:admin",
@@ -58,8 +70,8 @@ struct AgentPolicy {
 
 /// RBAC capability policy for tool dispatch.
 ///
-/// Default policy: if no explicit policy exists for an agent, all
-/// capabilities are granted. Set `default_deny` to flip.
+/// Policies should be deny-by-default. Callers can explicitly construct
+/// `CapabilityPolicy::new(false)` only for legacy compatibility.
 pub struct CapabilityPolicy {
     policies: HashMap<String, AgentPolicy>,
     default_deny: bool,
@@ -102,6 +114,17 @@ impl CapabilityPolicy {
             None => return !self.default_deny,
         };
 
+        // A malformed policy must never become broader merely because one
+        // backend ignores syntax that another backend understands.
+        if policy.deny.iter().any(|pattern| !valid_glob_pattern(pattern))
+            || policy.grants.iter().any(|grant| {
+                !valid_glob_pattern(&grant.capability)
+                    || !valid_glob_pattern(&grant.pattern)
+            })
+        {
+            return false;
+        }
+
         for denied in &policy.deny {
             if glob_match(denied, capability) {
                 return false;
@@ -110,11 +133,10 @@ impl CapabilityPolicy {
 
         for grant in &policy.grants {
             if glob_match(&grant.capability, capability) {
-                if !resource.is_empty() && grant.pattern != "*" {
-                    if glob_match(&grant.pattern, resource) {
-                        return true;
-                    }
-                } else {
+                if grant.pattern == "*" {
+                    return true;
+                }
+                if !resource.is_empty() && glob_match(&grant.pattern, resource) {
                     return true;
                 }
             }
@@ -157,38 +179,50 @@ impl CapabilityPolicy {
 
 impl Default for CapabilityPolicy {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(true)
     }
 }
 
+fn valid_glob_pattern(pattern: &str) -> bool {
+    !pattern.is_empty() && !pattern.chars().any(|ch| matches!(ch, '?' | '[' | ']'))
+}
+
 fn glob_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    if !valid_glob_pattern(pattern) {
+        return false;
     }
-    if pattern == text {
-        return true;
-    }
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
+    if !pattern.contains('*') {
         return pattern == text;
     }
 
-    let mut pos = 0;
-    for (i, part) in parts.iter().enumerate() {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut position = 0;
+
+    let first = parts.first().copied().unwrap_or("");
+    if !first.is_empty() {
+        if !text.starts_with(first) {
+            return false;
+        }
+        position = first.len();
+    }
+
+    for part in parts.iter().skip(1).take(parts.len().saturating_sub(2)) {
         if part.is_empty() {
             continue;
         }
-        if let Some(found) = text[pos..].find(part) {
-            if i == 0 && found != 0 {
-                return false;
-            }
-            pos += found + part.len();
+        if let Some(found) = text[position..].find(part) {
+            position += found + part.len();
         } else {
             return false;
         }
     }
-    if let Some(last) = parts.last() {
-        if !last.is_empty() && !text.ends_with(last) {
+
+    let last = parts.last().copied().unwrap_or("");
+    if !last.is_empty() {
+        let Some(suffix_start) = text.len().checked_sub(last.len()) else {
+            return false;
+        };
+        if suffix_start < position || !text.ends_with(last) {
             return false;
         }
     }
@@ -212,11 +246,26 @@ mod tests {
     }
 
     #[test]
+    fn test_default_trait_is_deny_by_default() {
+        let policy = CapabilityPolicy::default();
+        assert!(!policy.check("agent1", "file:read", ""));
+    }
+
+    #[test]
     fn test_explicit_grant() {
         let mut policy = CapabilityPolicy::new(true);
         policy.grant("agent1", "file:read", "*");
         assert!(policy.check("agent1", "file:read", ""));
         assert!(!policy.check("agent1", "file:write", ""));
+    }
+
+    #[test]
+    fn test_scoped_grant_requires_nonempty_matching_resource() {
+        let mut policy = CapabilityPolicy::new(true);
+        policy.grant("agent1", "file:read", "/safe/*");
+        assert!(policy.check("agent1", "file:read", "/safe/data.txt"));
+        assert!(!policy.check("agent1", "file:read", "/etc/passwd"));
+        assert!(!policy.check("agent1", "file:read", ""));
     }
 
     #[test]
@@ -234,5 +283,21 @@ mod tests {
         assert!(glob_match("file:*", "file:read"));
         assert!(!glob_match("file:read", "file:write"));
         assert!(glob_match("*.txt", "doc.txt"));
+        assert!(glob_match("a*b*c", "a--b--c"));
+        assert!(!glob_match("a*a", "a"));
+        assert!(!glob_match("file:?", "file:r"));
+        assert!(!glob_match("file:[rw]", "file:r"));
+        assert!(!glob_match("", ""));
+    }
+
+    #[test]
+    fn malformed_policy_patterns_deny_entire_policy() {
+        let mut malformed_grant = CapabilityPolicy::new(false);
+        malformed_grant.grant("agent1", "file:?", "*");
+        assert!(!malformed_grant.check("agent1", "file:read", ""));
+
+        let mut malformed_deny = CapabilityPolicy::new(false);
+        malformed_deny.deny("agent1", "code:[a-z]*");
+        assert!(!malformed_deny.check("agent1", "file:read", ""));
     }
 }

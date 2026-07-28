@@ -166,6 +166,8 @@ class TestSecurityConfig:
     def test_security_config_in_default_toml(self) -> None:
         output = generate_default_toml(HardwareInfo())
         assert "[security]" in output
+        assert 'mode = "redact"' in output
+        assert 'mode = "warn"' not in output
 
 
 class TestChannelConfig:

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+from unittest.mock import MagicMock
+
+from openjarvis.core.types import ToolCall
+from openjarvis.security.capabilities import CapabilityPolicy
+from openjarvis.tools._stubs import ToolExecutor
 from openjarvis.tools.templates.loader import ToolTemplate, discover_templates
 
 
@@ -131,6 +137,128 @@ class TestToolTemplate:
             }
         )
         assert template.spec.metadata.get("template") is True
+
+    def test_every_template_requires_code_execute_capability(self):
+        for action in (
+            {"type": "transform", "transform": "upper"},
+            {"type": "python", "expression": "str(input)"},
+            {"type": "shell", "command": "echo {input}"},
+        ):
+            template = ToolTemplate(
+                {
+                    "name": "guarded",
+                    "description": "Guarded template",
+                    "action": action,
+                }
+            )
+            assert template.spec.required_capabilities == ["code:execute"]
+
+    def test_shell_template_denied_before_subprocess_without_capability(
+        self,
+        monkeypatch,
+    ):
+        template = ToolTemplate(
+            {
+                "name": "shell_guard",
+                "description": "Guarded shell",
+                "action": {"type": "shell", "command": "echo {input}"},
+            }
+        )
+        run = MagicMock()
+        monkeypatch.setattr(
+            "openjarvis.tools.templates.loader.subprocess.run",
+            run,
+        )
+        policy = CapabilityPolicy()
+        policy.grant("template-agent", "tool:invoke", "echo {input}")
+        executor = ToolExecutor(
+            [template],
+            capability_policy=policy,
+            agent_id="template-agent",
+        )
+
+        result = executor.execute(
+            ToolCall(
+                id="1",
+                name="shell_guard",
+                arguments='{"input":"hello"}',
+            )
+        )
+
+        assert result.success is False
+        assert "code:execute" in result.content
+        run.assert_not_called()
+
+    def test_shell_template_requires_live_confirmation_with_capability(
+        self,
+        monkeypatch,
+    ):
+        template = ToolTemplate(
+            {
+                "name": "shell_guard",
+                "description": "Guarded shell",
+                "action": {"type": "shell", "command": "echo {input}"},
+            }
+        )
+        run = MagicMock()
+        confirmation = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "openjarvis.tools.templates.loader.subprocess.run",
+            run,
+        )
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+        policy = CapabilityPolicy()
+        policy.grant("template-agent", "tool:invoke", "echo {input}")
+        policy.grant("template-agent", "code:execute", "echo {input}")
+        executor = ToolExecutor(
+            [template],
+            capability_policy=policy,
+            agent_id="template-agent",
+            interactive=True,
+            confirm_callback=confirmation,
+        )
+
+        result = executor.execute(
+            ToolCall(
+                id="1",
+                name="shell_guard",
+                arguments='{"input":"hello"}',
+            )
+        )
+
+        assert result.success is False
+        assert "live TTY" in result.content
+        confirmation.assert_not_called()
+        run.assert_not_called()
+
+    def test_transform_template_runs_with_exact_explicit_grants(self):
+        template = ToolTemplate(
+            {
+                "name": "upper_guard",
+                "description": "Guarded transform",
+                "action": {"type": "transform", "transform": "upper"},
+            }
+        )
+        resource = "template:upper_guard:transform"
+        policy = CapabilityPolicy()
+        policy.grant("template-agent", "tool:invoke", resource)
+        policy.grant("template-agent", "code:execute", resource)
+        executor = ToolExecutor(
+            [template],
+            capability_policy=policy,
+            agent_id="template-agent",
+        )
+
+        result = executor.execute(
+            ToolCall(
+                id="1",
+                name="upper_guard",
+                arguments='{"input":"hello"}',
+            )
+        )
+
+        assert result.success is True
+        assert result.content == "HELLO"
 
 
 class TestDiscoverTemplates:

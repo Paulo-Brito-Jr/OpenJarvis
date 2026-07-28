@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
@@ -124,6 +125,35 @@ def _make_system(
     system.memory_backend = memory_backend
     system.operator_manager = None
     return system
+
+
+def _operator_consent() -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "scope": "recurring",
+        "allow_replay": True,
+        "granted_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=1)).isoformat(),
+    }
+
+
+def _make_authorized_operator_manager(store):
+    from openjarvis.operators.manager import OperatorManager
+    from openjarvis.scheduler.scheduler import TaskScheduler
+    from openjarvis.security.capabilities import CapabilityPolicy
+
+    principal = "operator-admin-test"
+    policy = CapabilityPolicy()
+    policy.grant(principal, "schedule:create", "schedule:*")
+    scheduler = TaskScheduler(store, capability_policy=policy)
+    system = _make_system(scheduler=scheduler)
+    manager = OperatorManager(
+        system,
+        scheduler_operator_id=principal,
+        scheduler_capabilities=["schedule:create"],
+        scheduler_consent=_operator_consent(),
+    )
+    return scheduler, manager
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +335,8 @@ name = "Discovered"
         assert mgr.get_manifest("discovered") is not None
 
     def test_activate_creates_scheduler_task(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(
             id="test_op",
@@ -330,13 +355,8 @@ name = "Discovered"
         assert task_dict["agent"] == "operative"
 
     def test_activate_uses_operative_agent(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="ag_test", name="Agent Test")
         mgr.register(m)
@@ -346,13 +366,8 @@ name = "Discovered"
         assert task_dict["agent"] == "operative"
 
     def test_activate_passes_metadata(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(
             id="meta_test",
@@ -370,13 +385,8 @@ name = "Discovered"
         assert meta["temperature"] == 0.5
 
     def test_deactivate(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="deact", name="Deact")
         mgr.register(m)
@@ -387,13 +397,8 @@ name = "Discovered"
         assert task_dict["status"] == "cancelled"
 
     def test_pause_resume(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="pr_test", name="PR")
         mgr.register(m)
@@ -423,13 +428,8 @@ name = "Discovered"
         assert statuses[0]["status"] == "registered"
 
     def test_activate_idempotent(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="idem", name="Idem")
         mgr.register(m)
@@ -448,6 +448,23 @@ name = "Discovered"
 
         with pytest.raises(RuntimeError, match="TaskScheduler not available"):
             mgr.activate("no_sched")
+
+    def test_activate_without_authenticated_context_fails_before_mutation(self):
+        from openjarvis.operators.manager import OperatorManager
+
+        scheduler = MagicMock()
+        system = _make_system(scheduler=scheduler)
+        mgr = OperatorManager(system)
+        mgr.register(OperatorManifest(id="blocked", name="Blocked"))
+
+        with pytest.raises(
+            PermissionError,
+            match="authenticated scheduler principal",
+        ):
+            mgr.activate("blocked")
+
+        scheduler.list_tasks.assert_not_called()
+        scheduler.create_task.assert_not_called()
 
     def test_run_once(self):
         from openjarvis.operators.manager import OperatorManager
@@ -779,12 +796,20 @@ class TestSchedulerOperatorExecution:
     def test_execute_task_with_operator_metadata(self):
         """Scheduler passes operator metadata through to system.ask()."""
         from openjarvis.scheduler.scheduler import ScheduledTask, TaskScheduler
+        from openjarvis.security.capabilities import CapabilityPolicy
 
         store = FakeSchedulerStore()
         mock_system = MagicMock()
         mock_system.ask = MagicMock(return_value="Tick result")
+        principal = "operator-admin-test"
+        policy = CapabilityPolicy()
+        policy.grant(principal, "schedule:create", "schedule:*")
 
-        scheduler = TaskScheduler(store, system=mock_system)
+        scheduler = TaskScheduler(
+            store,
+            system=mock_system,
+            capability_policy=policy,
+        )
 
         task = ScheduledTask(
             id="operator:test_op",
@@ -798,6 +823,9 @@ class TestSchedulerOperatorExecution:
                 "system_prompt": "You are a test operator.",
                 "temperature": 0.3,
             },
+            operator_id=principal,
+            capabilities=["schedule:create"],
+            consent=_operator_consent(),
         )
         store.save_task(task.to_dict())
 

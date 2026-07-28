@@ -124,6 +124,7 @@ class BaselineCloudAgent(LocalCloudAgent):
                 temperature=0.0,
                 tools=[build_web_search_tool(ws_max_uses)],
                 max_turns=gaia_max_turns,
+                action_authorizer=self._action_authorizer,
             )
             cost = (
                 estimate_cost(self._cloud_model, p_tok, c_tok)

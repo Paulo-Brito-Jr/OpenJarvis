@@ -367,6 +367,7 @@ def _prefetch_context(
     max_uses: int = 8,
     search_backend: str = "provider",
     tavily_max_results: int = 5,
+    action_authorizer: Any = None,
 ) -> Dict[str, Any]:
     """Use Anthropic web_search to fetch real source material the worker can read.
 
@@ -385,7 +386,11 @@ def _prefetch_context(
     }
     if search_backend == "tavily":
         try:
-            res = tavily_search_context(question, max_results=tavily_max_results)
+            res = tavily_search_context(
+                question,
+                max_results=tavily_max_results,
+                action_authorizer=action_authorizer,
+            )
             out.update(
                 text=res["text"],
                 cost_usd=float(res["cost_usd"]),
@@ -396,6 +401,8 @@ def _prefetch_context(
             )
             if res.get("error"):
                 out["error"] = res["error"]
+        except PermissionError:
+            raise
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
         return out
@@ -415,6 +422,7 @@ def _prefetch_context(
             max_tokens=8192,
             tools=[build_web_search_tool(max_uses)],
             tool_choice={"type": "any"},
+            action_authorizer=action_authorizer,
         )
         from openjarvis.agents.hybrid._prices import cost as _cost_usd
 
@@ -425,6 +433,8 @@ def _prefetch_context(
             + n_searches * WEB_SEARCH_COST_PER_CALL,
             n_searches=n_searches,
         )
+    except PermissionError:
+        raise
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
     return out
@@ -596,6 +606,7 @@ class MinionsAgent(LocalCloudAgent):
                 max_uses=ws_max_uses,
                 search_backend=str(cfg.get("search_backend", "provider")).lower(),
                 tavily_max_results=int(cfg.get("tavily_max_results", 5)),
+                action_authorizer=self._action_authorizer,
             )
 
         if prefetch.get("text"):

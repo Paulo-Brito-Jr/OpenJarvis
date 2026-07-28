@@ -231,8 +231,8 @@ class TestGuardrailsEngineStream:
         tokens = [t async for t in ge.stream(messages, model="test")]
         assert tokens == ["Hello", " ", "world"]
 
-    async def test_stream_scans_output_post_hoc(self) -> None:
-        """stream() publishes SECURITY_ALERT after yielding sensitive tokens."""
+    async def test_stream_warn_mode_reports_sensitive_output(self) -> None:
+        """WARN remains observational and publishes a security alert."""
         bus = EventBus(record_history=True)
         mock = _make_mock_engine()
         mock.stream = lambda messages, **kw: _async_token_iter(
@@ -246,7 +246,7 @@ class TestGuardrailsEngineStream:
         alerts = [e for e in bus.history if e.event_type == EventType.SECURITY_ALERT]
         assert len(alerts) >= 1
         assert alerts[0].data["direction"] == "output"
-        assert alerts[0].data["mode"] == "stream_post_hoc"
+        assert alerts[0].data["mode"] == "warn"
 
     async def test_stream_publishes_alert_with_findings(self) -> None:
         """Alert event contains a non-empty findings list with 'pattern' key."""
@@ -295,3 +295,63 @@ class TestGuardrailsEngineStream:
 
         alerts = [e for e in bus.history if e.event_type == EventType.SECURITY_ALERT]
         assert len(alerts) == 0
+
+    async def test_block_mode_emits_no_bytes_before_failure(self) -> None:
+        """A secret split across chunks cannot leak before BLOCK raises."""
+        mock = _make_mock_engine()
+        mock.stream = lambda messages, **kw: _async_token_iter(
+            ["prefix ", "sk-abc123def456ghi789jkl012"],
+        )
+        ge = GuardrailsEngine(mock, mode=RedactionMode.BLOCK)
+
+        emitted = []
+        with pytest.raises(SecurityBlockError):
+            async for token in ge.stream(
+                [Message(role=Role.USER, content="show key")],
+                model="test",
+            ):
+                emitted.append(token)
+        assert emitted == []
+
+    async def test_redact_mode_emits_only_redacted_content(self) -> None:
+        mock = _make_mock_engine()
+        mock.stream = lambda messages, **kw: _async_token_iter(
+            ["prefix ", "sk-abc123def456ghi789jkl012"],
+        )
+        ge = GuardrailsEngine(mock, mode=RedactionMode.REDACT)
+
+        emitted = [
+            token
+            async for token in ge.stream(
+                [Message(role=Role.USER, content="show key")],
+                model="test",
+            )
+        ]
+        combined = "".join(emitted)
+        assert "sk-abc123" not in combined
+        assert "[REDACTED:" in combined
+
+    async def test_stream_scans_input_before_engine_call(self) -> None:
+        captured = {}
+
+        async def _capture(messages, **kwargs):
+            captured["messages"] = messages
+            yield "ok"
+
+        mock = _make_mock_engine()
+        mock.stream = _capture
+        ge = GuardrailsEngine(mock, mode=RedactionMode.REDACT)
+
+        _ = [
+            token
+            async for token in ge.stream(
+                [
+                    Message(
+                        role=Role.USER,
+                        content="key sk-abc123def456ghi789jkl012",
+                    )
+                ],
+                model="test",
+            )
+        ]
+        assert "sk-abc123" not in captured["messages"][0].content

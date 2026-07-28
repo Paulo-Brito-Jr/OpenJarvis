@@ -11,7 +11,57 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+from openjarvis.server.input_limits import (
+    MAX_WS_FRAME_BYTES,
+    MAX_WS_MESSAGE_BYTES,
+    utf8_size_exceeds,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _execute_agent_tool(
+    request: Request,
+    tool: Any,
+    params: Dict[str, Any],
+):
+    """Execute an agent-management tool through the server security boundary."""
+    from openjarvis.core.types import ToolCall
+    from openjarvis.tools._stubs import ToolExecutor
+
+    # Only middleware-authenticated request state is a principal.  App-level
+    # configuration is not proof that this particular request authenticated.
+    principal = getattr(request.state, "api_principal", "").strip()
+    if not principal:
+        raise HTTPException(
+            status_code=503,
+            detail="Authenticated API principal is not configured",
+        )
+    executor = ToolExecutor(
+        [tool],
+        bus=getattr(request.app.state, "bus", None),
+        capability_policy=getattr(
+            request.app.state,
+            "capability_policy",
+            None,
+        ),
+        agent_id=principal,
+        boundary_guard=getattr(
+            request.app.state,
+            "boundary_guard",
+            None,
+        ),
+        # HTTP requests cannot provide contemporaneous TTY confirmation.
+        interactive=False,
+    )
+    return executor.execute(
+        ToolCall(
+            id="server-api",
+            name=tool.spec.name,
+            arguments=json.dumps(params),
+        )
+    )
+
 
 # ---- Request/Response models ----
 
@@ -87,7 +137,15 @@ async def list_agents(request: Request):
     try:
         from openjarvis.tools.agent_tools import _SPAWNED_AGENTS
 
-        running = [{"id": k, **v} for k, v in _SPAWNED_AGENTS.items()]
+        running = [
+            {
+                "id": agent_id,
+                "status": record.get("status", "unknown"),
+                "agent_type": record.get("agent_type", ""),
+            }
+            for agent_id, record in _SPAWNED_AGENTS.items()
+            if isinstance(record, dict)
+        ]
     except ImportError:
         pass
 
@@ -106,7 +164,7 @@ async def create_agent(req: AgentCreateRequest, request: Request):
             params["tools"] = ",".join(req.tools)
         if req.agent_id:
             params["agent_id"] = req.agent_id
-        result = tool.execute(**params)
+        result = _execute_agent_tool(request, tool, params)
         if not result.success:
             raise HTTPException(status_code=400, detail=result.content)
         return {
@@ -125,7 +183,11 @@ async def kill_agent(agent_id: str, request: Request):
         from openjarvis.tools.agent_tools import AgentKillTool
 
         tool = AgentKillTool()
-        result = tool.execute(agent_id=agent_id)
+        result = _execute_agent_tool(
+            request,
+            tool,
+            {"agent_id": agent_id},
+        )
         if not result.success:
             raise HTTPException(status_code=404, detail=result.content)
         return {"status": "stopped", "agent_id": agent_id}
@@ -140,7 +202,11 @@ async def message_agent(agent_id: str, req: AgentMessageRequest, request: Reques
         from openjarvis.tools.agent_tools import AgentSendTool
 
         tool = AgentSendTool()
-        result = tool.execute(agent_id=agent_id, message=req.message)
+        result = _execute_agent_tool(
+            request,
+            tool,
+            {"agent_id": agent_id, "message": req.message},
+        )
         if not result.success:
             raise HTTPException(status_code=404, detail=result.content)
         return {"status": "sent", "content": result.content}
@@ -290,45 +356,90 @@ async def memory_index(req: MemoryIndexRequest, request: Request):
         from pathlib import Path
 
         from openjarvis.security.file_policy import is_sensitive_file
-        from openjarvis.tools.storage.ingest import ingest_path
 
         target = Path(req.path).expanduser().resolve()
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"Path not found: {req.path}")
 
-        # Sandbox: when workspace roots are configured via OPENJARVIS_WORKSPACE
-        # (os.pathsep-separated), only allow indexing inside them. This endpoint
-        # must not become an arbitrary-filesystem read primitive over the API.
+        # A workspace sandbox is mandatory.  Falling back to the entire local
+        # filesystem turns `memory:write` into an arbitrary-file exfiltration
+        # primitive because indexed content can be retrieved later.
         workspace = os.environ.get("OPENJARVIS_WORKSPACE", "").strip()
-        if workspace:
-            roots = [
-                Path(d).expanduser().resolve()
-                for d in workspace.split(os.pathsep)
-                if d.strip()
-            ]
-            if not any(target == root or root in target.parents for root in roots):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Path is outside the allowed workspace directories.",
-                )
+        if not workspace:
+            raise HTTPException(
+                status_code=503,
+                detail="Memory indexing workspace is not configured.",
+            )
+        raw_roots = [
+            Path(value.strip()).expanduser()
+            for value in workspace.split(os.pathsep)
+            if value.strip()
+        ]
+        if not raw_roots or any(not root.is_absolute() for root in raw_roots):
+            raise HTTPException(
+                status_code=503,
+                detail="Memory indexing workspace configuration is invalid.",
+            )
+        roots = [root.resolve() for root in raw_roots]
+        if not any(target == root or root in target.parents for root in roots):
+            raise HTTPException(
+                status_code=403,
+                detail="Path is outside the allowed workspace directories.",
+            )
+        # Do not traverse links whose final target can change between the
+        # workspace check and ingestion.
+        if target.is_dir() and any(child.is_symlink() for child in target.rglob("*")):
+            raise HTTPException(
+                status_code=403,
+                detail="Memory indexing refuses directories containing symlinks.",
+            )
         # Never ingest sensitive files (.env, private keys, credentials, ...).
         if target.is_file() and is_sensitive_file(target):
             raise HTTPException(
                 status_code=403, detail="Refusing to index a sensitive file."
             )
 
+        principal = getattr(request.state, "api_principal", "").strip()
+        if not principal:
+            raise HTTPException(
+                status_code=503,
+                detail="Authenticated API principal is not configured",
+            )
+        policy = getattr(request.app.state, "capability_policy", None)
+        if policy is None or not getattr(policy, "enabled", True):
+            raise HTTPException(
+                status_code=503,
+                detail="Capability policy is not configured",
+            )
+        resource = str(target)
+        for capability in ("tool:invoke", "file:read", "memory:write"):
+            try:
+                allowed = policy.check(principal, capability, resource)
+            except Exception:
+                logger.exception("Memory index capability check failed")
+                allowed = False
+            if allowed is not True:
+                raise HTTPException(
+                    status_code=403,
+                    detail="API principal is not authorized to index this path.",
+                )
+
         backend = _get_memory_backend(request)
         if backend is None:
             raise HTTPException(status_code=503, detail="Memory is not configured")
 
-        chunks = ingest_path(target)
-        stored = 0
-        for chunk in chunks:
-            metadata = {"source": getattr(chunk, "source", str(target))}
-            if hasattr(chunk, "metadata") and chunk.metadata:
-                metadata.update(chunk.metadata)
-            backend.store(chunk.content, metadata=metadata)
-            stored += 1
+        # Execute through the same ToolExecutor boundary as agent tools so
+        # `tool:invoke`, `file:read` and `memory:write` remain additive.
+        from openjarvis.tools.storage_tools import MemoryIndexTool
+
+        result = _execute_agent_tool(
+            request,
+            MemoryIndexTool(backend),
+            {"path": resource},
+        )
+        if not result.success:
+            raise HTTPException(status_code=403, detail=result.content)
+        stored = int(result.metadata.get("chunks_indexed", 0))
 
         result = {"status": "indexed", "chunks_indexed": stored}
         if stored == 0:
@@ -667,10 +778,28 @@ async def websocket_chat_stream(websocket: WebSocket):
         {"type": "done",  "content": "..."}   -- final assembled response
         {"type": "error", "detail": "..."}    -- on failure
     """
-    from openjarvis.server.auth_middleware import websocket_authorized
+    from openjarvis.server.auth_middleware import (
+        websocket_authorized,
+        websocket_capability_authorized,
+    )
 
-    expected_key = getattr(websocket.app.state, "api_key", "")
-    if not websocket_authorized(websocket, expected_key):
+    expected_key = getattr(websocket.app.state, "api_key", None)
+    authenticated = websocket_authorized(
+        websocket,
+        expected_key,
+        principal=getattr(websocket.app.state, "api_principal", ""),
+        allowed_principals=getattr(
+            websocket.app.state,
+            "api_principal_allowlist",
+            (),
+        ),
+    )
+    authorized = authenticated and websocket_capability_authorized(
+        websocket,
+        "tool:invoke",
+        "/v1/chat/stream",
+    )
+    if not authorized:
         # 1008 = policy violation; reject before accepting the connection.
         await websocket.close(code=1008)
         return
@@ -678,6 +807,9 @@ async def websocket_chat_stream(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
+            if utf8_size_exceeds(raw, MAX_WS_FRAME_BYTES):
+                await websocket.close(code=1009)
+                return
             try:
                 data = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
@@ -686,14 +818,30 @@ async def websocket_chat_stream(websocket: WebSocket):
                 )
                 continue
 
+            if not isinstance(data, dict):
+                await websocket.send_json(
+                    {"type": "error", "detail": "JSON object required"},
+                )
+                continue
+
             message = data.get("message")
-            if not message:
+            if not isinstance(message, str) or not message.strip():
                 await websocket.send_json(
                     {"type": "error", "detail": "Missing 'message' field"},
                 )
                 continue
+            if utf8_size_exceeds(message, MAX_WS_MESSAGE_BYTES):
+                await websocket.close(code=1009)
+                return
 
-            model = data.get("model") or getattr(
+            requested_model = data.get("model")
+            if requested_model is not None and (
+                not isinstance(requested_model, str)
+                or utf8_size_exceeds(requested_model, 256)
+            ):
+                await websocket.close(code=1009)
+                return
+            model = requested_model or getattr(
                 websocket.app.state,
                 "model",
                 "default",
@@ -800,8 +948,15 @@ async def websocket_chat_stream(websocket: WebSocket):
             except WebSocketDisconnect:
                 raise
             except Exception as exc:
+                logger.error(
+                    "WebSocket chat inference failed (%s)",
+                    type(exc).__name__,
+                )
                 await websocket.send_json(
-                    {"type": "error", "detail": str(exc)},
+                    {
+                        "type": "error",
+                        "detail": "Inference failed securely",
+                    },
                 )
     except WebSocketDisconnect:
         pass  # Client disconnected — nothing to clean up
@@ -882,6 +1037,11 @@ speech_router = APIRouter(prefix="/v1/speech", tags=["speech"])
 @speech_router.post("/transcribe")
 async def transcribe_speech(request: Request):
     """Transcribe uploaded audio to text."""
+    import io
+    import wave
+
+    max_audio_bytes = 16 * 1024 * 1024
+    max_duration_seconds = 15 * 60
     backend = getattr(request.app.state, "speech_backend", None)
     if backend is None:
         raise HTTPException(status_code=501, detail="Speech backend not configured")
@@ -891,12 +1051,57 @@ async def transcribe_speech(request: Request):
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Missing 'file' field")
 
-    audio_bytes = await audio_file.read()
+    filename = str(getattr(audio_file, "filename", "audio.wav") or "audio.wav")
+    content_type = str(getattr(audio_file, "content_type", "") or "").lower()
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext != "wav" or content_type not in {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/wave",
+    }:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Only WAV audio is accepted until bounded duration probing "
+                "is available for compressed formats."
+            ),
+        )
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await audio_file.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_audio_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="Audio upload exceeds the 16 MiB limit.",
+            )
+        chunks.append(chunk)
+    audio_bytes = b"".join(chunks)
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio upload is empty")
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
+            frame_rate = wav.getframerate()
+            frame_count = wav.getnframes()
+            if frame_rate <= 0:
+                raise ValueError("invalid frame rate")
+            duration_seconds = frame_count / frame_rate
+    except (EOFError, ValueError, wave.Error) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid WAV audio.",
+        ) from exc
+    if duration_seconds > max_duration_seconds:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio duration exceeds the 15 minute limit.",
+        )
     language = form.get("language")
-
-    # Detect format from filename
-    filename = getattr(audio_file, "filename", "audio.wav")
-    ext = filename.rsplit(".", 1)[-1] if "." in filename else "wav"
+    if language is not None and len(str(language)) > 32:
+        raise HTTPException(status_code=422, detail="Language value is too long")
 
     try:
         result = await asyncio.to_thread(

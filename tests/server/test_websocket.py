@@ -11,6 +11,7 @@ fastapi = pytest.importorskip("fastapi")
 from fastapi import FastAPI  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 
+from openjarvis.security.capabilities import CapabilityPolicy  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -25,6 +26,13 @@ def _make_app(engine=None):
         engine = _make_streaming_engine()
     app.state.engine = engine
     app.state.model = "test-model"
+    principal = "api:test"
+    policy = CapabilityPolicy()
+    policy.grant(principal, "tool:invoke", "/v1/chat/stream")
+    app.state.api_key = None
+    app.state.api_principal = principal
+    app.state.api_principal_allowlist = frozenset({principal})
+    app.state.capability_policy = policy
     include_all_routes(app)
     return app
 
@@ -180,7 +188,8 @@ class TestWebSocketStreaming:
             ws.send_text(json.dumps({"message": "boom"}))
             data = ws.receive_json()
             assert data["type"] == "error"
-            assert "Engine exploded" in data["detail"]
+            assert data["detail"] == "Inference failed securely"
+            assert "Engine exploded" not in data["detail"]
 
     def test_multiple_messages_on_same_connection(self):
         """The WebSocket should support multiple request/response cycles."""
@@ -200,6 +209,13 @@ class TestWebSocketStreaming:
         """If app.state has no engine, an error should be returned."""
         app = FastAPI()
         app.state.model = "test-model"
+        principal = "api:test"
+        policy = CapabilityPolicy()
+        policy.grant(principal, "tool:invoke", "/v1/chat/stream")
+        app.state.api_key = None
+        app.state.api_principal = principal
+        app.state.api_principal_allowlist = frozenset({principal})
+        app.state.capability_policy = policy
         # Intentionally do NOT set app.state.engine
         include_all_routes(app)
         client = TestClient(app)

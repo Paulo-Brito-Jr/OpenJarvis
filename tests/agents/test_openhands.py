@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
 from openjarvis.agents._stubs import BaseAgent
 from openjarvis.agents.openhands import OpenHandsAgent
 from openjarvis.core.registry import AgentRegistry
@@ -30,14 +28,21 @@ class TestOpenHandsAgentRegistration:
         assert issubclass(OpenHandsAgent, BaseAgent)
 
 
-class TestOpenHandsAgentImportError:
-    def test_run_without_sdk_raises(self):
-        """Running without openhands-sdk installed raises ImportError."""
+class TestOpenHandsAgentFailClosed:
+    def test_run_returns_security_disabled_without_loading_sdk(self):
         engine = MagicMock()
         engine.engine_id = "mock"
         agent = OpenHandsAgent(engine, "test-model")
-        with pytest.raises(ImportError, match="openhands-sdk"):
-            agent.run("Hello")
+        result = agent.run("Hello")
+
+        assert result.turns == 0
+        assert result.metadata["error"] is True
+        assert result.metadata["security_disabled"] is True
+        assert result.metadata["reason"] == "unverified_external_sandbox"
+        assert "disabled" in result.content.lower()
+
+    def test_declares_security_context_requirement(self):
+        assert OpenHandsAgent.requires_security_context is True
 
 
 class TestOpenHandsAgentConstructor:
@@ -51,7 +56,7 @@ class TestOpenHandsAgentConstructor:
         agent = OpenHandsAgent(engine, "test-model", workspace="/tmp/test")
         assert agent._workspace == "/tmp/test"
 
-    def test_custom_api_key(self):
+    def test_custom_api_key_is_not_retained_while_disabled(self):
         engine = MagicMock()
         agent = OpenHandsAgent(engine, "test-model", api_key="sk-test")
-        assert agent._api_key == "sk-test"
+        assert agent._api_key == ""

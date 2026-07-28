@@ -190,7 +190,7 @@ class TestChatAgents:
         assert spy.stopped is True
         assert spy.submissions == [("hello", "simple ok")]
 
-    def test_tool_agent_uses_legacy_agent_tools_and_prompts_confirmation(self) -> None:
+    def test_tool_agent_non_tty_denies_without_confirmation(self) -> None:
         engine = MagicMock()
         engine.engine_id = "mock"
         config = JarvisConfig()
@@ -213,5 +213,7 @@ class TestChatAgents:
             )
 
         assert result.exit_code == 0
-        assert "Confirm:" in result.output
-        assert "chat executed!" in result.output
+        assert "Confirm:" not in result.output
+        assert "chat executed!" not in result.output
+        assert "Capability 'tool:invoke' denied" in result.output
+        assert "dangerous_chat" in result.output

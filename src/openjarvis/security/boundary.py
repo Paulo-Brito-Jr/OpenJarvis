@@ -91,7 +91,7 @@ class BoundaryGuard:
                     redacted = scanner.redact(redacted)
 
         if has_findings:
-            self._emit_alert(destination, content)
+            self._emit_alert(destination, content_length=len(content))
             if self._mode == "block":
                 raise SecurityBlockError(
                     f"Secrets/PII detected in outbound content to {destination}"
@@ -120,7 +120,7 @@ class BoundaryGuard:
             return replace(tool_call, arguments=redacted_args)
         return tool_call
 
-    def _emit_alert(self, destination: str, content: str) -> None:
+    def _emit_alert(self, destination: str, *, content_length: int) -> None:
         if self._bus is None:
             return
         try:
@@ -132,7 +132,10 @@ class BoundaryGuard:
                     "source": "boundary_guard",
                     "destination": destination,
                     "mode": self._mode,
-                    "content_preview": content[:80],
+                    # Never persist a preview of the content that triggered a
+                    # secret/PII scanner.  Scanner coverage intentionally
+                    # exceeds generic log redaction coverage.
+                    "content_length": max(0, int(content_length)),
                 },
             )
         except Exception:

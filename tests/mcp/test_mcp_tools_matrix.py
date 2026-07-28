@@ -7,6 +7,7 @@ import pytest
 from openjarvis.mcp.client import MCPClient
 from openjarvis.mcp.server import MCPServer
 from openjarvis.mcp.transport import InProcessTransport
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools.calculator import CalculatorTool
 from openjarvis.tools.think import ThinkTool
 
@@ -20,7 +21,13 @@ _TOOL_CONFIGS = {
 def _make_client(tool_classes):
     """Create an MCP client with the given tool instances."""
     tools = [cls() for cls in tool_classes]
-    server = MCPServer(tools)
+    policy = CapabilityPolicy()
+    policy.grant("mcp-matrix-test", "*", "*")
+    server = MCPServer(
+        tools,
+        capability_policy=policy,
+        agent_id="mcp-matrix-test",
+    )
     transport = InProcessTransport(server)
     return MCPClient(transport)
 

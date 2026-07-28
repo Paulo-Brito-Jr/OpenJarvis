@@ -10,13 +10,22 @@ import pytest
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Role
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.system import JarvisSystem
+from openjarvis.system.core import channel_operator_id
 
 
 @pytest.fixture()
 def minimal_system():
     engine = MagicMock()
     engine.generate.return_value = {"content": "ok", "usage": {}}
+    policy = CapabilityPolicy()
+    for sender in ("u1", "u2"):
+        policy.grant(
+            channel_operator_id("telegram", sender),
+            "tool:invoke",
+            "agent:system",
+        )
     return JarvisSystem(
         config=JarvisConfig(),
         bus=EventBus(),
@@ -24,6 +33,7 @@ def minimal_system():
         engine_key="mock",
         model="mock-model",
         agent_name="none",
+        capability_policy=policy,
     )
 
 
@@ -60,7 +70,10 @@ class TestWireChannelHistory:
             handler_ref.append(fn)
 
         bridge.on_message = capture_handler
-        minimal_system.wire_channel(bridge)
+        minimal_system.wire_channel(
+            bridge,
+            sender_allowlist={"telegram": {"u1", "u2"}},
+        )
 
         cm = SimpleNamespace(
             channel="telegram",
@@ -101,7 +114,10 @@ class TestWireChannelHistory:
             handler_ref.append(fn)
 
         bridge.on_message = capture_handler
-        minimal_system.wire_channel(bridge)
+        minimal_system.wire_channel(
+            bridge,
+            sender_allowlist={"telegram": {"u1", "u2"}},
+        )
 
         cm = SimpleNamespace(
             channel="telegram",

@@ -9,7 +9,7 @@ both training and evaluation.
 from __future__ import annotations
 
 import time
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
 from openjarvis.core.types import ToolCall
 from openjarvis.learning.intelligence.orchestrator.types import (
@@ -29,15 +29,26 @@ class OrchestratorEnvironment:
         List of :class:`BaseTool` instances available to the agent.
     max_turns:
         Maximum number of turns per episode.
+    capability_policy:
+        Explicit policy for tool dispatch. Missing policy denies execution.
+    agent_id:
+        Runtime principal evaluated by the policy. Empty denies execution.
     """
 
     def __init__(
         self,
         tools: List[BaseTool],
         max_turns: int = 10,
+        *,
+        capability_policy: Optional[Any] = None,
+        agent_id: str = "",
     ) -> None:
         self._tools = tools
-        self._executor = ToolExecutor(tools)
+        self._executor = ToolExecutor(
+            tools,
+            capability_policy=capability_policy,
+            agent_id=agent_id,
+        )
         self._max_turns = max_turns
 
     def reset(self, task: str) -> EpisodeState:

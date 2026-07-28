@@ -130,6 +130,28 @@ class MorningDigestAgent(ToolUsingAgent):
     ) -> AgentResult:
         self._emit_turn_start(input)
 
+        # Artifact persistence bypasses normal BaseTool dispatch, so authorize
+        # its concrete path before connectors, inference, TTS, or SQLite can
+        # produce any side effect.
+        store_path = (
+            Path(self._digest_store_path).expanduser()
+            if self._digest_store_path
+            else get_config_dir() / "digest.db"
+        ).resolve(strict=False)
+        store_denied = self._executor.authorize(
+            str(store_path),
+            ["file:write"],
+            tool_name="digest_store",
+        )
+        if store_denied is not None:
+            self._emit_turn_end(turns=0, error=True)
+            return AgentResult(
+                content=store_denied.content,
+                tool_results=[store_denied],
+                turns=0,
+                metadata={"security_denied": True},
+            )
+
         # Step 1: Collect data from connectors
         sources = self._resolve_sources()
         collect_call = ToolCall(
@@ -138,6 +160,16 @@ class MorningDigestAgent(ToolUsingAgent):
             arguments=json.dumps({"sources": sources, "hours_back": 24}),
         )
         collect_result = self._executor.execute(collect_call)
+        if not collect_result.success:
+            # A capability/DLP/connector failure must not become prompt
+            # material, TTS input, or a persisted synthetic digest.
+            self._emit_turn_end(turns=0, error=True)
+            return AgentResult(
+                content=collect_result.content,
+                tool_results=[collect_result],
+                turns=0,
+                metadata={"collection_failed": True},
+            )
         collected_data = collect_result.content
 
         # Step 2: Synthesize narrative via LLM
@@ -235,7 +267,7 @@ class MorningDigestAgent(ToolUsingAgent):
             evaluator_feedback=evaluator_feedback,
         )
 
-        store = DigestStore(db_path=self._digest_store_path)
+        store = DigestStore(db_path=str(store_path))
         store.save(artifact)
         store.close()
 

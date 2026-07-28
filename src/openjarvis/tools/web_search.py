@@ -8,8 +8,9 @@ from typing import Any
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
-from openjarvis.security.ssrf import check_ssrf
+from openjarvis.security.taint import external_taint
 from openjarvis.tools._stubs import BaseTool, ToolSpec
+from openjarvis.tools.http_request import HttpRequestTool
 
 logger = logging.getLogger(__name__)
 
@@ -78,28 +79,27 @@ class WebSearchTool(BaseTool):
         """Fetch a URL and return extracted text content."""
         import re as _re
 
-        import httpx
-
         url = WebSearchTool._normalize_url(url)
-        ssrf_error = check_ssrf(url)
-        if ssrf_error:
-            raise ValueError(ssrf_error)
-        resp = httpx.get(
-            url.strip(),
-            follow_redirects=True,
-            timeout=30.0,
+        result = HttpRequestTool().execute(
+            url=url.strip(),
+            method="GET",
+            timeout=30,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; OpenJarvis/1.0; +https://github.com/openjarvis)"
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; OpenJarvis/1.0; "
+                    "+https://github.com/openjarvis)"
+                )
             },
         )
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
+        if not result.success:
+            raise ValueError(result.content)
+        content_type = str(result.metadata.get("content_type", ""))
         if "application/pdf" in content_type:
             return (
                 "[This URL points to a PDF file which"
                 f" cannot be read directly. URL: {url}]"
             )
-        html = resp.text
+        html = result.content
         # Strip script/style tags and their contents
         html = _re.sub(
             r"<(script|style)[^>]*>.*?</\1>",
@@ -149,16 +149,28 @@ class WebSearchTool(BaseTool):
                     tool_name="web_search",
                     content=content or "No content found at URL.",
                     success=True,
-                    metadata={"url": url, "mode": "fetch"},
+                    metadata={
+                        "url": url,
+                        "mode": "fetch",
+                        **external_taint("web:fetch"),
+                    },
                 )
-            except Exception as exc:
+            except Exception:
                 return ToolResult(
                     tool_name="web_search",
-                    content=f"Failed to fetch URL: {exc}",
+                    content="Failed to fetch URL securely.",
                     success=False,
                 )
 
         max_results = params.get("max_results", self._max_results)
+        try:
+            max_results = min(max(int(max_results), 1), 10)
+        except (TypeError, ValueError):
+            return ToolResult(
+                tool_name="web_search",
+                content="max_results must be an integer between 1 and 10.",
+                success=False,
+            )
 
         try:
             from tavily import TavilyClient
@@ -189,6 +201,7 @@ class WebSearchTool(BaseTool):
                     "num_results": len(results),
                     "engine": "tavily",
                     "credits": (response.get("usage") or {}).get("credits"),
+                    **external_taint("search:tavily"),
                 },
             )
         except Exception as exc:
@@ -202,7 +215,10 @@ class WebSearchTool(BaseTool):
                 tool_name="web_search",
                 content=formatted or "No results found.",
                 success=True,
-                metadata={"engine": "duckduckgo"},
+                metadata={
+                    "engine": "duckduckgo",
+                    **external_taint("search:duckduckgo"),
+                },
             )
         except ImportError:
             return ToolResult(
@@ -213,10 +229,10 @@ class WebSearchTool(BaseTool):
                 ),
                 success=False,
             )
-        except Exception as exc:
+        except Exception:
             return ToolResult(
                 tool_name="web_search",
-                content=f"Search error: {exc}",
+                content="Search provider request failed.",
                 success=False,
             )
 

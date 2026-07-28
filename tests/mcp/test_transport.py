@@ -17,6 +17,7 @@ from openjarvis.mcp.transport import (
     StdioTransport,
     StreamableHTTPTransport,
 )
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools.calculator import CalculatorTool
 from openjarvis.tools.think import ThinkTool
 
@@ -24,7 +25,13 @@ from openjarvis.tools.think import ThinkTool
 @pytest.fixture
 def server():
     """MCP server with calculator and think tools."""
-    return MCPServer([CalculatorTool(), ThinkTool()])
+    policy = CapabilityPolicy()
+    policy.grant("mcp-transport-test", "*", "*")
+    return MCPServer(
+        [CalculatorTool(), ThinkTool()],
+        capability_policy=policy,
+        agent_id="mcp-transport-test",
+    )
 
 
 class TestInProcessTransport:

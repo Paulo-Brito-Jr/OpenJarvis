@@ -8,6 +8,7 @@ from openjarvis.mcp.client import MCPClient
 from openjarvis.mcp.protocol import MCPError
 from openjarvis.mcp.server import MCPServer
 from openjarvis.mcp.transport import InProcessTransport
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import ToolSpec
 from openjarvis.tools.calculator import CalculatorTool
 from openjarvis.tools.think import ThinkTool
@@ -16,7 +17,13 @@ from openjarvis.tools.think import ThinkTool
 @pytest.fixture
 def client():
     """MCP client connected via in-process transport."""
-    server = MCPServer([CalculatorTool(), ThinkTool()])
+    policy = CapabilityPolicy()
+    policy.grant("mcp-client-test", "*", "*")
+    server = MCPServer(
+        [CalculatorTool(), ThinkTool()],
+        capability_policy=policy,
+        agent_id="mcp-client-test",
+    )
     transport = InProcessTransport(server)
     return MCPClient(transport)
 

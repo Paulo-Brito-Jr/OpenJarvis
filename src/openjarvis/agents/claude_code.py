@@ -1,30 +1,23 @@
-"""ClaudeCodeAgent -- wraps the Claude Agent SDK via Node.js subprocess bridge.
+"""Security-disabled Claude Code subprocess adapter.
 
-Spawns a Node.js runner process that calls the ``@anthropic-ai/claude-code``
-SDK, communicating via JSON over stdin/stdout with sentinel-delimited output.
-
-The engine parameter is accepted for interface conformance with BaseAgent but
-is not used -- inference is handled entirely by the Claude Agent SDK.
+The legacy runner delegated inference and tools to an external Node process
+outside OpenJarvis's enforceable capability boundary. Construction and
+``run`` now avoid credentials and processes until a verified isolated bridge
+exists.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import os
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any, List, Optional
 
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.core.events import EventBus
-from openjarvis.core.paths import get_config_dir
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.engine._stubs import InferenceEngine
-
-logger = logging.getLogger(__name__)
 
 # Sentinel markers for parsing subprocess output
 _OUTPUT_START = "---OPENJARVIS_OUTPUT_START---"
@@ -54,6 +47,7 @@ class ClaudeCodeAgent(BaseAgent):
 
     agent_id = "claude_code"
     accepts_tools = False
+    requires_security_context = True
     _default_temperature = 0.7
     _default_max_tokens = 1024
 
@@ -79,58 +73,40 @@ class ClaudeCodeAgent(BaseAgent):
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        del api_key
+        self._api_key = ""
         self._workspace = workspace or os.getcwd()
         self._session_id = session_id
         self._allowed_tools = allowed_tools
         self._system_prompt = system_prompt
         self._timeout = timeout
+        self._capability_policy = None
+        self._security_agent_id = ""
+
+    def bind_security(
+        self,
+        capability_policy: Optional[Any],
+        agent_id: Optional[str] = None,
+        boundary_guard: Optional[Any] = None,
+    ) -> None:
+        self._capability_policy = capability_policy
+        self._security_agent_id = agent_id if isinstance(agent_id, str) else ""
+        self._boundary_guard = boundary_guard
+
+    def bind_boundary_guard(self, boundary_guard: Optional[Any]) -> None:
+        self._boundary_guard = boundary_guard
 
     # ------------------------------------------------------------------
     # Runner management
     # ------------------------------------------------------------------
 
     def _ensure_runner(self) -> Path:
-        """Copy the bundled runner to ``~/.openjarvis/claude_code_runner/``
-        and run ``npm install`` if ``node_modules`` is missing.
-
-        Returns the path to the runner directory.
-
-        Raises :class:`RuntimeError` if Node.js is not available.
-        """
-        if shutil.which("node") is None:
-            raise RuntimeError(
-                "ClaudeCodeAgent requires Node.js (>=22). "
-                "Install it from https://nodejs.org/ or via your package manager."
-            )
-
-        dest = get_config_dir() / "claude_code_runner"
-        dest.mkdir(parents=True, exist_ok=True)
-
-        # Copy runner files if missing or outdated
-        for sub in ("package.json", "dist"):
-            src = _RUNNER_SRC / sub
-            dst = dest / sub
-            if src.is_file():
-                shutil.copy2(src, dst)
-            elif src.is_dir():
-                if dst.exists():
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
-
-        # Install npm dependencies if node_modules missing
-        node_modules = dest / "node_modules"
-        if not node_modules.exists():
-            logger.info("Installing claude_code_runner dependencies...")
-            subprocess.run(
-                ["npm", "install", "--production"],
-                cwd=str(dest),
-                check=True,
-                capture_output=True,
-                timeout=120,
-            )
-
-        return dest
+        """Refuse the unaudited external runner without side effects."""
+        raise RuntimeError(
+            "Claude Code adapter disabled: the bundled SDK runner has no "
+            "verified OpenJarvis capability and isolated-sandbox boundary. "
+            "Automatic npm installation is disabled."
+        )
 
     # ------------------------------------------------------------------
     # Run
@@ -148,59 +124,18 @@ class ClaudeCodeAgent(BaseAgent):
         reads sentinel-delimited JSON output from stdout.
         """
         self._emit_turn_start(input)
-
-        runner_dir = self._ensure_runner()
-
-        # Build the request payload
-        request = {
-            "prompt": input,
-            "api_key": self._api_key,
-            "workspace": self._workspace,
-            "allowed_tools": self._allowed_tools or [],
-            "system_prompt": self._system_prompt,
-            "session_id": self._session_id,
-        }
-
-        try:
-            proc = subprocess.run(
-                ["node", "dist/index.js"],
-                cwd=str(runner_dir),
-                input=json.dumps(request),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-            )
-        except subprocess.TimeoutExpired:
-            self._emit_turn_end(turns=1, error=True)
-            return AgentResult(
-                content=f"Claude Code agent timed out after {self._timeout}s.",
-                turns=1,
-                metadata={"error": True, "error_type": "timeout"},
-            )
-
-        if proc.returncode != 0:
-            stderr = proc.stderr.strip() if proc.stderr else "Unknown error"
-            logger.error(
-                "claude_code_runner exited with code %d: %s",
-                proc.returncode,
-                stderr,
-            )
-            self._emit_turn_end(turns=1, error=True)
-            return AgentResult(
-                content=f"Claude Code agent failed: {stderr}",
-                turns=1,
-                metadata={"error": True, "returncode": proc.returncode},
-            )
-
-        # Parse sentinel-delimited output
-        content, tool_results, metadata = self._parse_output(proc.stdout)
-
-        self._emit_turn_end(turns=1)
+        self._emit_turn_end(turns=0, error=True)
         return AgentResult(
-            content=content,
-            tool_results=tool_results,
-            turns=1,
-            metadata=metadata,
+            content=(
+                "Claude Code adapter disabled: no verified isolated sandbox "
+                "and OpenJarvis capability bridge is available."
+            ),
+            turns=0,
+            metadata={
+                "error": True,
+                "security_disabled": True,
+                "reason": "unverified_external_sandbox",
+            },
         )
 
     # ------------------------------------------------------------------

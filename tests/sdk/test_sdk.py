@@ -95,6 +95,90 @@ class TestJarvisAsk:
             assert result == "Agent response"
             j.close()
 
+    def test_tool_agent_security_is_bound_after_construction(self):
+        from openjarvis.agents._stubs import AgentResult
+        from openjarvis.core.registry import AgentRegistry
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        captured = {}
+
+        class SecureToolAgent:
+            accepts_tools = True
+
+            def __init__(
+                self,
+                eng,
+                model,
+                *,
+                bus=None,
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                max_turns=None,
+            ):
+                captured["constructor"] = {
+                    "eng": eng,
+                    "model": model,
+                    "tools": tools,
+                }
+
+            def bind_security(self, policy, agent_id):
+                captured["security"] = (policy, agent_id)
+
+            def run(self, input, context=None):
+                return AgentResult(content="secure response", turns=1)
+
+        AgentRegistry.register_value("secure-tool-agent", SecureToolAgent)
+        engine = _make_engine()
+        policy = CapabilityPolicy()
+        j = Jarvis(config=JarvisConfig(), model="test-model")
+        j._engine = engine
+        j._capability_policy = policy
+
+        result = j._run_agent(
+            "secure-tool-agent",
+            "hello",
+            "test-model",
+            tools=[],
+            temperature=0.1,
+            max_tokens=100,
+            context=False,
+        )
+
+        assert result["content"] == "secure response"
+        assert captured["security"] == (policy, "secure-tool-agent")
+        j.close()
+
+    def test_tool_agent_without_security_binding_is_rejected(self):
+        from openjarvis.agents._stubs import AgentResult
+        from openjarvis.core.registry import AgentRegistry
+
+        class InsecureToolAgent:
+            accepts_tools = True
+
+            def __init__(self, eng, model, **kwargs):
+                pass
+
+            def run(self, input, context=None):
+                return AgentResult(content="must not run")
+
+        AgentRegistry.register_value("insecure-tool-agent", InsecureToolAgent)
+        j = Jarvis(config=JarvisConfig(), model="test-model")
+        j._engine = _make_engine()
+
+        with pytest.raises(ValueError, match="does not expose bind_security"):
+            j._run_agent(
+                "insecure-tool-agent",
+                "hello",
+                "test-model",
+                tools=[],
+                temperature=0.1,
+                max_tokens=100,
+                context=False,
+            )
+
+        j.close()
+
     def test_ask_no_engine_raises(self):
         with patch("openjarvis.sdk.get_engine", return_value=None):
             j = Jarvis(config=JarvisConfig())

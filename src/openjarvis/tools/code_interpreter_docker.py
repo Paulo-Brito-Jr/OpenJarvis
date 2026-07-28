@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
+
+_PINNED_IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 
 
 @ToolRegistry.register("code_interpreter_docker")
@@ -54,8 +57,16 @@ class DockerCodeInterpreterTool(BaseTool):
                 "required": ["code"],
             },
             category="code",
+            requires_confirmation=True,
             timeout_seconds=60.0,
+            required_capabilities=["code:execute"],
+            metadata={"sandbox_required": True, "sandbox": "docker"},
         )
+
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        """Authorize the sandbox class without exposing source text."""
+        del params
+        return f"container:{self._image}"
 
     def execute(self, **params: Any) -> ToolResult:
         code = params.get("code", "")
@@ -64,6 +75,32 @@ class DockerCodeInterpreterTool(BaseTool):
                 tool_name="code_interpreter_docker",
                 content="No code provided.",
                 success=False,
+            )
+        if not _PINNED_IMAGE_RE.fullmatch(self._image):
+            return ToolResult(
+                tool_name="code_interpreter_docker",
+                content=(
+                    "Docker execution disabled: image must be pinned to an "
+                    "immutable sha256 digest."
+                ),
+                success=False,
+                metadata={
+                    "security_disabled": True,
+                    "reason": "immutable_image_digest_required",
+                },
+            )
+        if not self._network_disabled:
+            return ToolResult(
+                tool_name="code_interpreter_docker",
+                content=(
+                    "Docker execution disabled: arbitrary-code sandboxes "
+                    "must not have network access."
+                ),
+                success=False,
+                metadata={
+                    "security_disabled": True,
+                    "reason": "network_isolation_required",
+                },
             )
 
         try:
@@ -83,15 +120,23 @@ class DockerCodeInterpreterTool(BaseTool):
 
             container = client.containers.run(
                 self._image,
-                ["python", "-c", code],
+                ["python", "-I", "-S", "-B", "-c", code],
                 detach=True,
                 mem_limit=self._memory_limit,
                 nano_cpus=self._cpu_count * 10**9,
-                network_disabled=self._network_disabled,
+                network_disabled=True,
                 pids_limit=self._pids_limit,
                 read_only=True,
-                # tmpfs for /tmp so code can write temp files
-                tmpfs={"/tmp": "size=64m"},
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                user="65534:65534",
+                privileged=False,
+                init=True,
+                ipc_mode="none",
+                # Writable scratch space, but never executable or device-backed.
+                tmpfs={
+                    "/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777"
+                },
                 stderr=True,
                 stdout=True,
             )

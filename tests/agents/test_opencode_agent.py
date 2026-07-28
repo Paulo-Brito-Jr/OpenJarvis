@@ -8,6 +8,7 @@ message shape captured from a live `opencode serve` session.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from openjarvis.agents.opencode import (
     OpenCodeAgent,
@@ -123,15 +124,18 @@ class TestConfigBuilding:
         )._build_config()
         assert "provider" not in cfg
 
-    def test_build_mode_permission_allows_edit_and_bash(self, tmp_path):
+    def test_build_mode_permission_denies_all_effects(self, tmp_path):
         cfg = OpenCodeAgent(
             SimpleNamespace(_host="http://h:1"),
             "m",
             workspace=str(tmp_path),
             agent="build",
         )._build_config()
-        assert cfg["permission"]["edit"] == "allow"
-        assert cfg["permission"]["bash"] == "allow"
+        assert cfg["permission"] == {
+            "edit": "deny",
+            "bash": "deny",
+            "webfetch": "deny",
+        }
 
     def test_plan_mode_permission_denies_edit_and_bash(self, tmp_path):
         cfg = OpenCodeAgent(
@@ -142,15 +146,24 @@ class TestConfigBuilding:
         )._build_config()
         assert cfg["permission"]["edit"] == "deny"
         assert cfg["permission"]["bash"] == "deny"
+        assert cfg["permission"]["webfetch"] == "deny"
 
-    def test_custom_permission_override(self, tmp_path):
+    def test_custom_permission_cannot_override_fail_closed_policy(self, tmp_path):
         cfg = OpenCodeAgent(
             SimpleNamespace(_host="http://h:1"),
             "m",
             workspace=str(tmp_path),
-            permission={"bash": "deny"},
+            permission={
+                "bash": "allow",
+                "edit": "allow",
+                "webfetch": "allow",
+            },
         )._build_config()
-        assert cfg["permission"] == {"bash": "deny"}
+        assert cfg["permission"] == {
+            "edit": "deny",
+            "bash": "deny",
+            "webfetch": "deny",
+        }
 
     def test_does_not_pollute_workspace(self, tmp_path):
         # The config goes to a private OPENCODE_CONFIG file, never the workspace.
@@ -160,9 +173,33 @@ class TestConfigBuilding:
         assert not (tmp_path / "opencode.json").exists()
 
 
-class TestRunGracefulDegradation:
-    def test_missing_binary_returns_error_result(self, monkeypatch, tmp_path):
-        monkeypatch.setattr("openjarvis.agents.opencode.shutil.which", lambda n: None)
+class TestRunFailClosed:
+    def test_constructor_does_not_retain_disabled_adapter_credentials(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "environment-secret")
+        agent = OpenCodeAgent(
+            SimpleNamespace(_host="http://h:1"),
+            "m",
+            workspace=str(tmp_path),
+            api_key="provider-secret",
+            server_password="server-secret",
+        )
+
+        assert agent._api_key == ""
+        assert agent._server_password == ""
+
+    def test_missing_binary_still_reports_security_disabled(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(
+            "openjarvis.agents.opencode.shutil.which",
+            lambda n: None,
+        )
         agent = OpenCodeAgent(
             SimpleNamespace(_host="http://h:1"),
             "m",
@@ -171,15 +208,31 @@ class TestRunGracefulDegradation:
         )
         res = agent.run("do something")
         assert res.metadata.get("error") is True
-        assert "opencode" in res.content.lower()
+        assert res.metadata["security_disabled"] is True
+        assert res.metadata["reason"] == "unverified_external_sandbox"
 
-    def test_unresolvable_provider_fails_clearly(self, tmp_path):
-        # No derivable base URL + bare model name -> clear error, not a 500
-        # (and we fail before spawning a server).
+    def test_unresolvable_provider_is_not_reached(self, tmp_path):
         agent = OpenCodeAgent(SimpleNamespace(), "qwen3:8b", workspace=str(tmp_path))
         res = agent.run("do something")
-        assert res.metadata.get("error") is True
-        assert "could not determine" in res.content.lower()
+        assert res.metadata["security_disabled"] is True
+        assert "disabled" in res.content.lower()
+
+    def test_declares_security_context_requirement(self):
+        assert OpenCodeAgent.requires_security_context is True
+
+    def test_ensure_server_refuses_before_spawn(self, tmp_path):
+        agent = OpenCodeAgent(
+            SimpleNamespace(_host="http://h:1"),
+            "m",
+            workspace=str(tmp_path),
+        )
+
+        try:
+            agent._ensure_server()
+        except RuntimeError as exc:
+            assert "disabled" in str(exc).lower()
+        else:
+            raise AssertionError("disabled adapter unexpectedly started")
 
 
 class _FakeResp:
@@ -238,30 +291,22 @@ class _FakeClient:
         return _FakeResp(TURN_MESSAGES)
 
 
-class TestRunParsing:
-    def test_run_parses_message_and_tools(self, monkeypatch, tmp_path):
+class TestDisabledRunDoesNotReachLegacyClient:
+    def test_run_never_starts_server_or_client(self, monkeypatch, tmp_path):
         agent = OpenCodeAgent(
             SimpleNamespace(_host="http://h:1"),
             "local-model",
             workspace=str(tmp_path),
             agent="build",
         )
-        monkeypatch.setattr(agent, "_ensure_server", lambda: "http://127.0.0.1:7654")
-        agent._base = "http://127.0.0.1:7654"
-        monkeypatch.setattr(agent, "_client", lambda: _FakeClient())
+        ensure_server = MagicMock()
+        client = MagicMock()
+        monkeypatch.setattr(agent, "_ensure_server", ensure_server)
+        monkeypatch.setattr(agent, "_client", client)
 
         res = agent.run("Write a hello world")
-        assert res.content == "Hello from the local model."
-        assert res.metadata["finish"] == "stop"
-        assert res.metadata["model_id"] == "local-model"
-        assert res.metadata["agent"] == "build"
-        # the model was addressed as openjarvis/local-model
-        assert _FakeClient.last_body["model"] == {
-            "providerID": "openjarvis",
-            "modelID": "local-model",
-        }
-        # tool-results recovered from the intermediate message (not the final one)
-        assert len(res.tool_results) == 1
-        assert res.tool_results[0].tool_name == "write"
-        assert res.tool_results[0].success is True
-        assert "Wrote file" in res.tool_results[0].content
+
+        assert res.metadata["security_disabled"] is True
+        assert res.tool_results == []
+        ensure_server.assert_not_called()
+        client.assert_not_called()

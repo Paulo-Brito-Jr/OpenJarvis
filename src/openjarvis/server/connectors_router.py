@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from openjarvis.server.oauth_state import OAuthStateStore
+
 # ``Request`` must be importable at *module* scope so that FastAPI can resolve
 # the stringized ``request: Request`` annotations on the OAuth endpoints below.
 # Because this module uses ``from __future__ import annotations``, every
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Module-level cache of connector instances (keyed by connector_id).
 _instances: Dict[str, Any] = {}
+_oauth_states = OAuthStateStore()
 
 
 def _ensure_connectors_registered() -> None:
@@ -489,6 +492,25 @@ def create_connectors_router():
         )
 
         _ensure_connectors_registered()
+        principal = getattr(request.state, "api_principal", "")
+        if not isinstance(principal, str) or not principal.strip():
+            raise HTTPException(
+                status_code=503,
+                detail="Authenticated API principal is not configured",
+            )
+        from openjarvis.server.auth_middleware import explicitly_authorized
+
+        start_resource = f"/v1/connectors/{connector_id}/oauth/start"
+        if not explicitly_authorized(
+            getattr(request.app.state, "capability_policy", None),
+            principal,
+            "system:admin",
+            start_resource,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="API principal is not authorized",
+            )
         if not ConnectorRegistry.contains(connector_id):
             raise HTTPException(404, f"Connector '{connector_id}' not found")
 
@@ -505,6 +527,13 @@ def create_connectors_router():
             )
 
         client_id, _ = creds
+        try:
+            state = _oauth_states.issue(connector_id, principal)
+        except (RuntimeError, ValueError):
+            raise HTTPException(
+                status_code=503,
+                detail="OAuth authorization could not be started",
+            )
         # Build callback URL pointing to our own server
         base_url = str(request.base_url).rstrip("/")
         callback_url = f"{base_url}/v1/connectors/{connector_id}/oauth/callback"
@@ -514,6 +543,7 @@ def create_connectors_router():
             "redirect_uri": callback_url,
             "response_type": "code",
             "scope": " ".join(provider.scopes),
+            "state": state,
             **provider.extra_auth_params,
         }
         auth_url = f"{provider.auth_endpoint}?{urlencode(params)}"
@@ -528,6 +558,7 @@ def create_connectors_router():
         request: Request,
         code: str = "",
         error: str = "",
+        state: str = "",
     ):
         """Handle OAuth callback from the provider."""
         from fastapi.responses import HTMLResponse
@@ -541,6 +572,25 @@ def create_connectors_router():
         )
 
         _ensure_connectors_registered()
+        authorization = _oauth_states.consume(state, connector_id)
+        if authorization is None:
+            raise HTTPException(
+                status_code=403,
+                detail="OAuth authorization is invalid or expired",
+            )
+        from openjarvis.server.auth_middleware import explicitly_authorized
+
+        start_resource = f"/v1/connectors/{connector_id}/oauth/start"
+        if not explicitly_authorized(
+            getattr(request.app.state, "capability_policy", None),
+            authorization.principal,
+            "system:admin",
+            start_resource,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="OAuth authorization is no longer permitted",
+            )
 
         if error:
             _style = "font-family:system-ui;text-align:center;padding:60px"
@@ -548,7 +598,7 @@ def create_connectors_router():
                 content=(
                     f"<html><body style='{_style}'>"
                     f"<h2 style='color:#ef4444'>Authorization Failed</h2>"
-                    f"<p>{error}</p>"
+                    "<p>The provider denied authorization.</p>"
                     "<script>setTimeout(()=>window.close(),3000)</script>"
                     "</body></html>"
                 ),
@@ -574,13 +624,17 @@ def create_connectors_router():
             tokens = _exchange_token(
                 provider, code, client_id, client_secret, redirect_uri
             )
-        except Exception as exc:
+        except Exception:
+            logger.warning(
+                "OAuth token exchange failed for connector %s",
+                connector_id,
+            )
             _style = "font-family:system-ui;text-align:center;padding:60px"
             return HTMLResponse(
                 content=(
                     f"<html><body style='{_style}'>"
                     f"<h2 style='color:#ef4444'>Token Exchange Failed</h2>"
-                    f"<p>{exc}</p>"
+                    "<p>The provider could not complete authorization.</p>"
                     "</body></html>"
                 ),
                 status_code=500,

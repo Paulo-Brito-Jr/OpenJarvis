@@ -127,6 +127,7 @@ class TestSkillEventsAndTracing:
     def test_skill_execution_emits_events(self):
         """Running a structured skill emits SKILL_EXECUTE_START/END events."""
         from openjarvis.core.types import ToolResult
+        from openjarvis.security.capabilities import CapabilityPolicy
         from openjarvis.skills.executor import SkillExecutor
         from openjarvis.skills.types import SkillManifest, SkillStep
         from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
@@ -146,7 +147,13 @@ class TestSkillEventsAndTracing:
                 )
 
         bus = EventBus(record_history=True)
-        te = ToolExecutor([EchoTool()])
+        policy = CapabilityPolicy()
+        policy.grant("live-skill-test-agent", "tool:invoke")
+        te = ToolExecutor(
+            [EchoTool()],
+            capability_policy=policy,
+            agent_id="live-skill-test-agent",
+        )
         executor = SkillExecutor(te, bus=bus)
 
         manifest = SkillManifest(

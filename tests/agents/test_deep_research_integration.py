@@ -21,6 +21,7 @@ from openjarvis.connectors._stubs import Document
 from openjarvis.connectors.pipeline import IngestionPipeline
 from openjarvis.connectors.retriever import TwoStageRetriever
 from openjarvis.connectors.store import KnowledgeStore
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools.knowledge_search import KnowledgeSearchTool
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,13 @@ _K8S_DOCS = [
         author="sarah",
     ),
 ]
+
+
+def _allow_test_tools(agent):
+    policy = CapabilityPolicy()
+    policy.grant("deep-research-integration-agent", "*")
+    agent.bind_security(policy, "deep-research-integration-agent")
+    return agent
 
 
 def _make_engine_response(content, tool_calls=None):
@@ -163,7 +171,9 @@ def test_full_research_pipeline(tmp_path):
     mock_engine.generate.side_effect = [tool_call_response, final_response]
 
     # 5. Create agent with tool
-    agent = DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    agent = _allow_test_tools(
+        DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    )
 
     # 6. Run the agent
     result = agent.run("What is the status of the Kubernetes migration?")

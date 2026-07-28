@@ -13,6 +13,12 @@ from rich.markdown import Markdown
 from openjarvis.agents.digest_store import DigestStore
 from openjarvis.core.config import DEFAULT_CONFIG_PATH, load_config
 
+_DIGEST_SCHEDULER_AUTH_ERROR = (
+    "Digest schedule changes require an authenticated operator identity, "
+    "explicit schedule capability grants, and durable recurring consent. "
+    "This caller did not provide that security context."
+)
+
 
 def _play_audio(audio_path: str) -> None:
     """Play audio file in background using available system player."""
@@ -81,51 +87,66 @@ def _save_digest_schedule(enabled: bool, cron: str) -> None:
     config_path.write_text("\n".join(new_lines))
 
 
-def _create_scheduler_task(cron: str) -> Optional[str]:
-    """Create a digest task in the TaskScheduler. Returns task ID or None."""
-    try:
-        from openjarvis.scheduler.scheduler import TaskScheduler
-        from openjarvis.scheduler.store import SchedulerStore
+def _create_scheduler_task(
+    cron: str,
+    *,
+    scheduler=None,  # noqa: ANN001
+    operator_id: str = "",
+    capabilities: Optional[list[str]] = None,
+    consent: Optional[dict] = None,
+) -> str:
+    """Create a digest task only with caller-supplied scheduler authority."""
+    if (
+        scheduler is None
+        or not operator_id.strip()
+        or not capabilities
+        or "schedule:create" not in capabilities
+        or not consent
+    ):
+        raise PermissionError(_DIGEST_SCHEDULER_AUTH_ERROR)
 
-        db_path = DEFAULT_CONFIG_PATH.parent / "scheduler.db"
-        store = SchedulerStore(db_path)
-        scheduler = TaskScheduler(store)
+    for existing in scheduler.list_tasks(
+        status="active",
+        operator_id=operator_id,
+    ):
+        if existing.agent == "morning_digest":
+            scheduler.cancel_task(existing.id, operator_id=operator_id)
 
-        # Cancel any existing digest tasks first
-        for task in scheduler.list_tasks(status="active"):
-            if task.agent == "morning_digest":
-                scheduler.cancel_task(task.id)
-
-        task = scheduler.create_task(
-            prompt="Generate my morning digest",
-            schedule_type="cron",
-            schedule_value=cron,
-            agent="morning_digest",
-        )
-        store.close()
-        return task.id
-    except Exception:
-        return None
+    task = scheduler.create_task(
+        prompt="Generate my morning digest",
+        schedule_type="cron",
+        schedule_value=cron,
+        agent="morning_digest",
+        operator_id=operator_id,
+        capabilities=capabilities,
+        consent=consent,
+    )
+    return task.id
 
 
-def _cancel_scheduler_tasks() -> int:
-    """Cancel all active digest tasks. Returns count cancelled."""
-    try:
-        from openjarvis.scheduler.scheduler import TaskScheduler
-        from openjarvis.scheduler.store import SchedulerStore
-
-        db_path = DEFAULT_CONFIG_PATH.parent / "scheduler.db"
-        store = SchedulerStore(db_path)
-        scheduler = TaskScheduler(store)
-        count = 0
-        for task in scheduler.list_tasks(status="active"):
-            if task.agent == "morning_digest":
-                scheduler.cancel_task(task.id)
-                count += 1
-        store.close()
-        return count
-    except Exception:
-        return 0
+def _cancel_scheduler_tasks(
+    *,
+    scheduler=None,  # noqa: ANN001
+    operator_id: str = "",
+    capabilities: Optional[list[str]] = None,
+) -> int:
+    """Cancel digest tasks only with caller-supplied scheduler authority."""
+    if (
+        scheduler is None
+        or not operator_id.strip()
+        or not capabilities
+        or "schedule:create" not in capabilities
+    ):
+        raise PermissionError(_DIGEST_SCHEDULER_AUTH_ERROR)
+    count = 0
+    for task in scheduler.list_tasks(
+        status="active",
+        operator_id=operator_id,
+    ):
+        if task.agent == "morning_digest":
+            scheduler.cancel_task(task.id, operator_id=operator_id)
+            count += 1
+    return count
 
 
 @click.command("digest", help="Display and play the morning digest.")
@@ -270,16 +291,22 @@ def _handle_schedule(console: Console, schedule: str) -> None:
 
     if schedule.lower() == "off":
         # Disable the schedule
+        try:
+            cancelled = _cancel_scheduler_tasks()
+        except PermissionError as exc:
+            raise click.ClickException(str(exc)) from exc
         _save_digest_schedule(enabled=False, cron=digest_cfg.schedule)
-        cancelled = _cancel_scheduler_tasks()
         console.print("[yellow]Digest schedule disabled.[/yellow]")
         if cancelled:
             console.print(f"  Cancelled {cancelled} scheduler task(s).")
         return
 
     # Set a new cron schedule
+    try:
+        task_id = _create_scheduler_task(schedule)
+    except PermissionError as exc:
+        raise click.ClickException(str(exc)) from exc
     _save_digest_schedule(enabled=True, cron=schedule)
-    task_id = _create_scheduler_task(schedule)
     console.print(f"[green]Digest schedule set:[/green] {schedule}")
     if task_id:
         console.print(f"  Scheduler task created: {task_id}")

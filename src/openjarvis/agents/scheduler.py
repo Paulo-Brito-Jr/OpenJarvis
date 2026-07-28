@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -19,22 +20,34 @@ logger = logging.getLogger(__name__)
 def _next_cron_fire(cron_expr: str, now: float | None = None) -> float:
     """Calculate the next fire time for a cron expression.
 
-    Uses croniter if available, otherwise falls back to a simple
-    interval-based approximation.
+    Managed cron schedules require croniter.  Treating an unparsed expression
+    as "hourly" changes user intent and can replay a side effect unexpectedly.
     """
     try:
         from croniter import croniter
-    except ImportError:
-        # Fallback: treat as hourly interval
-        logger.warning("croniter not installed, treating cron as 3600s interval")
-        return (now or time.time()) + 3600
+    except ImportError as exc:
+        raise RuntimeError(
+            "Managed cron scheduling requires the optional croniter backend"
+        ) from exc
 
-    base = now or time.time()
+    if not isinstance(cron_expr, str) or len(cron_expr.split()) != 5:
+        raise ValueError("Managed cron schedule must contain five fields")
+    try:
+        valid = croniter.is_valid(cron_expr)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Managed cron schedule is invalid") from exc
+    if not valid:
+        raise ValueError("Managed cron schedule is invalid")
+
+    base = time.time() if now is None else now
     import datetime
 
-    dt = datetime.datetime.fromtimestamp(base)
-    cron = croniter(cron_expr, dt)
-    next_dt = cron.get_next(datetime.datetime)
+    dt = datetime.datetime.fromtimestamp(base, tz=datetime.timezone.utc)
+    try:
+        cron = croniter(cron_expr, dt)
+        next_dt = cron.get_next(datetime.datetime)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Managed cron schedule is invalid") from exc
     return next_dt.timestamp()
 
 
@@ -52,9 +65,16 @@ class AgentScheduler:
         tick_interval: float = 1.0,
         event_bus: Any = None,
     ) -> None:
+        if (
+            isinstance(tick_interval, bool)
+            or not isinstance(tick_interval, (int, float))
+            or not math.isfinite(float(tick_interval))
+            or tick_interval <= 0
+        ):
+            raise ValueError("Managed scheduler tick interval must be positive")
         self._manager = manager
         self._executor = executor
-        self._tick_interval = tick_interval
+        self._tick_interval = float(tick_interval)
         self._bus = event_bus
         # agent_id -> {schedule_type, schedule_value, next_fire}
         self._agents: dict[str, dict] = {}
@@ -86,9 +106,21 @@ class AgentScheduler:
         if schedule_type == "cron":
             next_fire = _next_cron_fire(str(schedule_value), now)
         elif schedule_type == "interval":
-            next_fire = now + float(schedule_value)
-        else:
+            try:
+                interval = float(schedule_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Managed agent interval must be a positive number"
+                ) from exc
+            if not math.isfinite(interval) or interval <= 0:
+                raise ValueError(
+                    "Managed agent interval must be a positive number"
+                )
+            next_fire = now + interval
+        elif schedule_type == "manual":
             next_fire = float("inf")  # Manual: never auto-fires
+        else:
+            raise ValueError(f"Unsupported managed schedule type: {schedule_type}")
 
         with self._lock:
             self._agents[agent_id] = {
@@ -111,17 +143,16 @@ class AgentScheduler:
         logger.info("Deregistered agent %s", agent_id)
 
     def start(self) -> None:
-        """Start the scheduler background thread."""
-        if self.is_running:
-            return
-        if self._bus:
-            self._bus.subscribe(EventType.AGENT_TICK_END, self._on_tick_event)
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="agent-scheduler"
+        """Refuse automatic execution until ticks have durable claims.
+
+        This scheduler keeps its ownership state only in memory. Starting it
+        in more than one process can execute the same managed-agent tick twice,
+        so unattended execution remains deliberately disabled.
+        """
+        raise RuntimeError(
+            "Managed agent scheduling is disabled until durable multi-process "
+            "tick claims and per-tick authorization snapshots are implemented"
         )
-        self._thread.start()
-        logger.info("Agent scheduler started")
 
     def stop(self) -> None:
         """Stop the scheduler background thread."""

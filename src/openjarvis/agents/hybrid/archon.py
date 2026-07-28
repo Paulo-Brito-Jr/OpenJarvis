@@ -519,6 +519,11 @@ class ArchonAgent(LocalCloudAgent):
         # local proposers run on vLLM and don't see it.
         ws_enabled, ws_max_uses = web_search_cfg(cfg)
         if ws_enabled:
+            self._require_action(
+                "search:anthropic-server-tool",
+                ["network:fetch"],
+                tool_name="web_search",
+            )
             _set_anthropic_web_search(build_web_search_tool(ws_max_uses))
         else:
             _set_anthropic_web_search(None)

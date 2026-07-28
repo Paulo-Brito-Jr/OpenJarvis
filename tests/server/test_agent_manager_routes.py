@@ -29,6 +29,19 @@ except ImportError:
     HAS_FASTAPI = False
 
 
+def _configure_test_request_security(app) -> None:
+    from openjarvis.security.capabilities import CapabilityPolicy
+
+    policy = CapabilityPolicy()
+    policy.grant("api:test", "tool:invoke", "agent:*")
+    app.state.capability_policy = policy
+
+    @app.middleware("http")
+    async def authenticated_test_principal(request, call_next):
+        request.state.api_principal = "api:test"
+        return await call_next(request)
+
+
 @pytest.mark.skipif(not HAS_FASTAPI, reason="fastapi not installed")
 class TestAgentManagerRoutes:
     @pytest.fixture
@@ -38,6 +51,7 @@ class TestAgentManagerRoutes:
         from openjarvis.server.agent_manager_routes import create_agent_manager_router
 
         app = FastAPI()
+        _configure_test_request_security(app)
         routers = create_agent_manager_router(manager)
         for r in routers:
             app.include_router(r)
@@ -160,6 +174,16 @@ class TestAgentManagerRoutes:
         resp = client.get(f"/v1/managed-agents/{agent_id}")
         assert resp.json()["status"] == "idle"
 
+    def test_external_run_is_disabled_before_tick_mutation(self, manager, client):
+        agent = manager.create_agent(name="no-deputy", agent_type="simple")
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/run",
+        )
+
+        assert response.status_code == 403
+        assert manager.get_agent(agent["id"])["status"] == "idle"
+
     def test_create_task(self, client):
         create_resp = client.post("/v1/managed-agents", json={"name": "worker"})
         agent_id = create_resp.json()["id"]
@@ -187,8 +211,11 @@ class TestAgentManagerRoutes:
         bind_resp = client.post(
             f"/v1/managed-agents/{agent_id}/channels",
             json={
-                "channel_type": "slack",
-                "config": {"channel": "#research"},
+                "channel_type": "test",
+                "config": {
+                    "channel": "#research",
+                    "allowed_senders": ["sender-1"],
+                },
             },
         )
         assert bind_resp.status_code == 200
@@ -200,6 +227,28 @@ class TestAgentManagerRoutes:
         url = f"/v1/managed-agents/{agent_id}/channels/{binding_id}"
         unbind_resp = client.delete(url)
         assert unbind_resp.status_code == 200
+
+    @pytest.mark.parametrize("channel_type", ["imessage", "sendblue", "slack"])
+    def test_unsafe_managed_channel_is_disabled_before_persisting(
+        self,
+        manager,
+        client,
+        channel_type,
+    ):
+        agent = manager.create_agent(name="channel-safe", agent_type="simple")
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/channels",
+            json={
+                "channel_type": channel_type,
+                "config": {
+                    "allowed_senders": ["sender-1"],
+                    "bot_token": "must-not-persist",
+                },
+            },
+        )
+
+        assert response.status_code == 503
+        assert manager.list_channel_bindings(agent["id"]) == []
 
     def test_templates(self, client):
         resp = client.get("/v1/templates")
@@ -242,18 +291,18 @@ class TestAgentManagerRoutes:
         assert len(agents) == 1
         assert agents[0]["name"] == "broken"
 
-    def test_send_and_list_messages(self, manager, client):
+    def test_queued_message_is_rejected_without_persisting(self, manager, client):
         agent = manager.create_agent(name="chat", agent_type="simple")
 
         res = client.post(
             f"/v1/managed-agents/{agent['id']}/messages",
             json={"content": "hello", "mode": "queued"},
         )
-        assert res.status_code == 200
+        assert res.status_code == 403
 
         res = client.get(f"/v1/managed-agents/{agent['id']}/messages")
         assert res.status_code == 200
-        assert len(res.json()["messages"]) == 1
+        assert res.json()["messages"] == []
 
     def test_get_agent_state(self, manager, client):
         agent = manager.create_agent(name="stateful", agent_type="simple")
@@ -266,17 +315,15 @@ class TestAgentManagerRoutes:
         assert "messages" in state
         assert "checkpoint" in state
 
-    def test_send_message_non_stream_unchanged(self, manager, client):
-        """stream=False (default) returns a normal JSON message, not SSE."""
+    def test_send_message_non_stream_fails_closed(self, manager, client):
+        """Background execution cannot lose the authenticated operator."""
         agent = manager.create_agent(name="basic", agent_type="simple")
         res = client.post(
             f"/v1/managed-agents/{agent['id']}/messages",
             json={"content": "hello", "stream": False},
         )
-        assert res.status_code == 200
-        data = res.json()
-        assert data["content"] == "hello"
-        assert data["direction"] == "user_to_agent"
+        assert res.status_code == 403
+        assert manager.list_messages(agent["id"]) == []
 
     def test_send_message_stream_not_found(self, manager, client):
         """Streaming to a non-existent agent returns 404."""
@@ -346,6 +393,7 @@ class TestAgentManagerStreaming:
         from openjarvis.server.agent_manager_routes import create_agent_manager_router
 
         app = FastAPI()
+        _configure_test_request_security(app)
         app.state.engine = _mock_engine
         app.state.bus = None
 
@@ -470,6 +518,7 @@ class TestAgentManagerStreaming:
         from openjarvis.server.agent_manager_routes import create_agent_manager_router
 
         app = FastAPI()
+        _configure_test_request_security(app)
         app.state.engine = error_engine
         app.state.bus = None
         routers = create_agent_manager_router(manager)

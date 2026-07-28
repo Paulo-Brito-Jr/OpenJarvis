@@ -9,6 +9,7 @@ from typing import Any, List, Optional
 
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.core.types import StepType, Trace, TraceStep
+from openjarvis.traces.redaction import sanitize_trace
 
 _CREATE_TRACES = """\
 CREATE TABLE IF NOT EXISTS traces (
@@ -115,6 +116,7 @@ class TraceStore:
         single writer — see ``server/app.py`` — rather than swallowing
         collisions here.
         """
+        trace = sanitize_trace(trace)
         self._conn.execute(
             _INSERT_TRACE,
             (

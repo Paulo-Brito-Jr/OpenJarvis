@@ -16,6 +16,7 @@ from openjarvis.core.types import (
     TelemetryRecord,
     ToolCall,
 )
+from openjarvis.security.capabilities import CapabilityPolicy
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +55,12 @@ def _make_engine(content="Hello from engine"):
         "finish_reason": "stop",
     }
     return engine
+
+
+def _tool_policy(agent_id: str) -> CapabilityPolicy:
+    policy = CapabilityPolicy()
+    policy.grant(agent_id, "tool:invoke")
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +150,7 @@ class TestOrchestratorWithCalculator:
             tools=[CalculatorTool()],
             bus=bus,
         )
+        agent.bind_security(_tool_policy("integration-agent"), "integration-agent")
         result = agent.run("What is 2+2?")
 
         assert result.content == "2+2 equals 4."
@@ -269,7 +277,12 @@ class TestToolExecutorIntegration:
         from openjarvis.tools.think import ThinkTool
 
         bus = EventBus(record_history=True)
-        executor = ToolExecutor([CalculatorTool(), ThinkTool()], bus=bus)
+        executor = ToolExecutor(
+            [CalculatorTool(), ThinkTool()],
+            bus=bus,
+            capability_policy=_tool_policy("integration-executor"),
+            agent_id="integration-executor",
+        )
 
         # Calculator
         calc_result = executor.execute(

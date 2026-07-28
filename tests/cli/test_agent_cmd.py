@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
@@ -88,6 +88,37 @@ class TestNewAgentCommands:
     def test_ask_help(self) -> None:
         result = CliRunner().invoke(cli, ["agents", "ask", "--help"])
         assert result.exit_code == 0
+        assert "--yes" not in result.output
+
+    def test_ask_rejects_removed_auto_approve_option(self) -> None:
+        result = CliRunner().invoke(
+            cli,
+            ["agents", "ask", "agent-1", "hello", "--yes"],
+        )
+        assert result.exit_code == 2
+        assert "No such option: --yes" in result.output
+
+    def test_ask_non_interactive_never_sets_confirmation_callback(self) -> None:
+        manager = MagicMock()
+        manager.get_agent.return_value = {"id": "agent-1"}
+        manager.list_messages.return_value = []
+        executor = MagicMock()
+        with (
+            patch("openjarvis.cli.agent_cmd._get_manager", return_value=manager),
+            patch(
+                "openjarvis.cli.agent_cmd._get_scheduler_and_executor",
+                return_value=(MagicMock(), executor, MagicMock()),
+            ),
+            patch("openjarvis.cli.agent_cmd._run_tick_with_live_trace"),
+        ):
+            result = CliRunner().invoke(
+                cli,
+                ["agents", "ask", "agent-1", "hello"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert executor._interactive is False
+        assert executor._confirm_callback is None
 
     def test_instruct_help(self) -> None:
         result = CliRunner().invoke(cli, ["agents", "instruct", "--help"])

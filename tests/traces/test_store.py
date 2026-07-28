@@ -7,6 +7,7 @@ from pathlib import Path
 
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import StepType, Trace, TraceStep
+from openjarvis.traces.redaction import sanitize_step
 from openjarvis.traces.store import TraceStore
 
 
@@ -165,9 +166,10 @@ class TestTraceStore:
         assert retrieved is not None
         assert len(retrieved.steps) == 3
         for orig, retr in zip(trace.steps, retrieved.steps):
+            expected = sanitize_step(orig)
             assert orig.step_type == retr.step_type
-            assert orig.input == retr.input
-            assert orig.output == retr.output
+            assert expected.input == retr.input
+            assert expected.output == retr.output
         store.close()
 
     def test_close_and_reopen(self, tmp_path: Path) -> None:
@@ -190,4 +192,53 @@ class TestTraceStore:
         assert retrieved is not None
         assert retrieved.metadata["key"] == "value"
         assert retrieved.metadata["nested"] == [1, 2, 3]
+        store.close()
+
+    def test_raw_sqlite_never_contains_sensitive_payloads(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = TraceStore(tmp_path / "test.db")
+        bearer = "Bearer supersecret123456789"
+        email = "private.person@example.com"
+        raw_argument = "do-not-persist-this-tool-argument"
+        raw_result = "do-not-persist-this-tool-result"
+        trace = Trace(
+            query=f"Contact {email} using {bearer}",
+            result=f"Answered {email}",
+            metadata={
+                "headers": {
+                    "Authorization": bearer,
+                    "X-Safe": "visible",
+                }
+            },
+            messages=[
+                {"role": "user", "content": f"My email is {email}"},
+                {
+                    "role": "tool",
+                    "name": "external",
+                    "content": raw_result,
+                },
+            ],
+            steps=[
+                TraceStep(
+                    step_type=StepType.TOOL_CALL,
+                    timestamp=time.time(),
+                    input={
+                        "tool": "external",
+                        "arguments": {"payload": raw_argument},
+                    },
+                    output={"success": True, "result": raw_result},
+                )
+            ],
+        )
+
+        store.save(trace)
+
+        trace_rows = store._conn.execute("SELECT * FROM traces").fetchall()
+        step_rows = store._conn.execute("SELECT * FROM trace_steps").fetchall()
+        raw_database_values = repr(trace_rows + step_rows)
+        for sensitive in (bearer, email, raw_argument, raw_result):
+            assert sensitive not in raw_database_values
+        assert "REDACTED" in raw_database_values
         store.close()

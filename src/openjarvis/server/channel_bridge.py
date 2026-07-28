@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import logging
 import time
+from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional
 
 from openjarvis.channels._stubs import BaseChannel, ChannelStatus
@@ -19,7 +22,7 @@ _HELP_TEXT = """\
 Available commands:
 /agents — list running agents
 /agent <id> status — agent state and current task
-/agent <id> <message> — send a message to an agent
+/agent <id> <message> — unavailable until operator identity is preserved
 /agent <id> pause — pause an agent
 /agent <id> resume — resume an agent
 /notify <channel> — set where to receive notifications
@@ -52,6 +55,8 @@ class ChannelBridge:
         system: Any = None,
         agent_manager: Any = None,
         deep_research_agent: Any = None,
+        sender_allowlist: Mapping[str, Iterable[str]] | None = None,
+        capability_policy: Any = None,
     ) -> None:
         self._channels = channels
         self._session_store = session_store
@@ -59,8 +64,86 @@ class ChannelBridge:
         self._system = system
         self._agent_manager = agent_manager
         self._deep_research_agent = deep_research_agent
+        self._capability_policy = capability_policy
+        self._sender_allowlist: dict[str, frozenset[str]] = {}
+        for channel, senders in (sender_allowlist or {}).items():
+            self.set_sender_allowlist(channel, senders)
         self._notification_timestamps: Dict[str, float] = {}
         self._subscribe_notifications()
+
+    @staticmethod
+    def principal_for(channel_type: str, sender_id: str) -> str:
+        """Return a stable, non-PII authorization principal for a sender."""
+        channel = channel_type.strip().lower()
+        sender = sender_id.strip()
+        if not channel or not sender:
+            return ""
+        digest = hashlib.sha256(f"{channel}\0{sender}".encode()).hexdigest()[:24]
+        return f"channel:{channel}:{digest}"
+
+    def set_sender_allowlist(
+        self,
+        channel_type: str,
+        senders: Iterable[str],
+    ) -> None:
+        """Replace the exact sender allowlist for one channel."""
+        channel = channel_type.strip().lower()
+        if not channel:
+            raise ValueError("channel_type must be non-empty")
+        allowed: set[str] = set()
+        for sender in senders:
+            if not isinstance(sender, str):
+                raise TypeError("sender allowlist entries must be strings")
+            normalized = sender.strip()
+            if (
+                not normalized
+                or len(normalized) > 256
+                or any(ord(char) < 32 for char in normalized)
+            ):
+                raise ValueError("sender allowlist contains an invalid identity")
+            allowed.add(normalized)
+        self._sender_allowlist[channel] = frozenset(allowed)
+
+    def is_sender_allowed(self, channel_type: str, sender_id: str) -> bool:
+        """Return whether the exact channel/sender pair is trusted."""
+        channel = channel_type.strip().lower()
+        sender = sender_id.strip()
+        return bool(
+            channel
+            and sender
+            and sender in self._sender_allowlist.get(channel, frozenset())
+        )
+
+    def _authorized(
+        self,
+        principal: str,
+        capability: str,
+        resource: str,
+    ) -> bool:
+        if not principal or self._capability_policy is None:
+            return False
+        try:
+            grants = self._capability_policy.list_grants(principal)
+            explicitly_granted = any(
+                fnmatch.fnmatch(capability, grant.capability)
+                and (
+                    grant.pattern == "*"
+                    or fnmatch.fnmatch(resource, grant.pattern)
+                )
+                for grant in grants
+            )
+            if not explicitly_granted:
+                return False
+            return bool(
+                self._capability_policy.check(
+                    principal,
+                    capability,
+                    resource,
+                )
+            )
+        except Exception:
+            logger.warning("Channel capability check failed; action denied")
+            return False
 
     # --------------------------------------------------------------
     # Backward-compatible BaseChannel interface
@@ -121,17 +204,35 @@ class ChannelBridge:
         metadata: Optional[Dict[str, Any]] = None,
         max_length: int = _DEFAULT_MAX_LENGTH,
     ) -> str:
+        if not self.is_sender_allowed(channel_type, sender_id):
+            logger.warning(
+                "Rejected inbound message from a sender outside the %s allowlist",
+                channel_type,
+            )
+            return "Unauthorized sender."
+        principal = self.principal_for(channel_type, sender_id)
         self._session_store.get_or_create(sender_id, channel_type)
 
         # Command routing
         stripped = content.strip()
         if stripped.startswith("/"):
-            result = self._handle_command(sender_id, stripped, channel_type)
+            result = self._handle_command(
+                sender_id,
+                stripped,
+                channel_type,
+                principal,
+            )
             if result is not None:
                 return result
 
         # Regular chat — route to JarvisSystem.ask()
-        return self._handle_chat(sender_id, stripped, channel_type, max_length)
+        return self._handle_chat(
+            sender_id,
+            stripped,
+            channel_type,
+            max_length,
+            principal,
+        )
 
     # --------------------------------------------------------------
     # Command parsing
@@ -142,6 +243,7 @@ class ChannelBridge:
         sender_id: str,
         content: str,
         channel_type: str,
+        principal: str,
     ) -> Optional[str]:
         parts = content.split(None, 2)
         cmd = parts[0].lower()
@@ -163,11 +265,19 @@ class ChannelBridge:
             return self._handle_sessions(sender_id)
 
         if cmd == "/agents":
+            if not self._authorized(principal, "system:admin", "agents:list"):
+                return "Not authorized."
             return self._handle_agents_list()
 
         if cmd == "/agent" and len(parts) >= 2:
             agent_id = parts[1]
             rest = parts[2] if len(parts) > 2 else "status"
+            if not self._authorized(
+                principal,
+                "system:admin",
+                f"agent:{agent_id}",
+            ):
+                return "Not authorized."
             return self._handle_agent_command(agent_id, rest)
 
         # Unknown command — fall through to chat
@@ -211,9 +321,13 @@ class ChannelBridge:
         if action_lower == "resume":
             self._agent_manager.resume_agent(agent_id)
             return f"Agent '{agent_id}' resumed."
-        # Treat as a message to the agent
-        result = self._agent_manager.send_message(agent_id, action)
-        return str(result) if result else f"Message sent to agent '{agent_id}'."
+        # Pending managed-agent messages do not yet store the authenticated
+        # channel principal.  Enqueuing here would make a later service-agent
+        # tick execute with the agent's grants (a confused deputy).
+        return (
+            "Agent messaging from channels is disabled until queued messages "
+            "preserve the authenticated operator identity."
+        )
 
     # --------------------------------------------------------------
     # Chat handling
@@ -238,6 +352,7 @@ class ChannelBridge:
         content: str,
         channel_type: str,
         max_length: int,
+        principal: str,
     ) -> str:
         self._session_store.append_message(sender_id, channel_type, "user", content)
 
@@ -255,20 +370,38 @@ class ChannelBridge:
                 f"Previous conversation:\n{context_str}\n\nCurrent message: {content}"
             )
 
-        # Try DeepResearchAgent first
+        # A shared DeepResearchAgent carries mutable executor security state.
+        # Rebinding it per message would race with concurrent callers and
+        # running it under its configured agent identity would make it a
+        # confused deputy. Until the bridge can construct an isolated agent
+        # per authenticated sender, never invoke that shared instance.
         if self._deep_research_agent is not None:
+            logger.warning(
+                "Shared DeepResearch execution is disabled for external channels"
+            )
+
+        if self._system is not None:
+            if not self._authorized(
+                principal,
+                "tool:invoke",
+                "agent:system",
+            ):
+                response_text = "Not authorized."
+                self._session_store.append_message(
+                    sender_id,
+                    channel_type,
+                    "assistant",
+                    response_text,
+                )
+                return response_text
             try:
-                result = self._deep_research_agent.run(content)
-                response_text = result.content or "No results found."
-            except Exception as exc:
-                logger.error("DeepResearch agent failed: %s", exc)
-                response_text = f"Research error: {exc}"
-        elif self._system is not None:
-            try:
-                result = self._system.ask(query)
+                result = self._system.ask(query, operator_id=principal)
                 response_text = result.get("content", str(result))
-            except Exception:
-                logger.exception("Error in JarvisSystem.ask()")
+            except Exception as exc:
+                logger.error(
+                    "JarvisSystem channel request failed (%s)",
+                    type(exc).__name__,
+                )
                 error_msg = (
                     "Sorry, I couldn't process that right now. Try again in a moment."
                 )
@@ -276,6 +409,18 @@ class ChannelBridge:
                     sender_id, channel_type, "assistant", error_msg
                 )
                 return error_msg
+        elif self._deep_research_agent is not None:
+            response_text = (
+                "Deep research is unavailable on external channels until "
+                "per-sender capability isolation is configured."
+            )
+            self._session_store.append_message(
+                sender_id,
+                channel_type,
+                "assistant",
+                response_text,
+            )
+            return response_text
         else:
             error_msg = (
                 "Sorry, I couldn't process that right now. Try again in a moment."
@@ -347,17 +492,15 @@ class ChannelBridge:
 
         if event.event_type == EventType.AGENT_TICK_END:
             summary = data.get("summary", data.get("result", ""))
-            return f"Agent '{name}' finished: {summary}" if summary else None
+            return f"Agent '{name}' finished." if summary else None
         if event.event_type == EventType.AGENT_TICK_ERROR:
-            error = data.get("error", "unknown error")
-            return f"Agent '{name}' error: {error}"
+            return f"Agent '{name}' failed."
         if event.event_type == EventType.AGENT_BUDGET_EXCEEDED:
             return f"Agent '{name}' hit budget limit."
         if event.event_type == EventType.SCHEDULER_TASK_END:
             if data.get("success", True):
                 return f"Scheduled task '{name}' completed."
-            error = data.get("error", "unknown error")
-            return f"Scheduled task '{name}' failed: {error}"
+            return f"Scheduled task '{name}' failed."
         return None
 
     def _send_notification(

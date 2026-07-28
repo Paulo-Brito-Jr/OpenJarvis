@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence
 
 from openjarvis.core.events import EventBus, EventType
@@ -162,6 +163,44 @@ class GuardrailsEngine(InferenceEngine):
             f"{len(result.findings)} finding(s) detected"
         )
 
+    def _process_messages(
+        self,
+        messages: Sequence[Message],
+    ) -> Sequence[Message]:
+        """Scan/redact an input batch before the wrapped engine sees it."""
+        if not self._scan_input:
+            return messages
+        processed = list(messages)
+        for index, message in enumerate(processed):
+            if not message.content:
+                continue
+            result = self._scan_text(message.content)
+            if result.clean:
+                continue
+            processed[index] = Message(
+                role=message.role,
+                content=self._handle_findings(
+                    message.content,
+                    result,
+                    "input",
+                ),
+                name=message.name,
+                tool_calls=message.tool_calls,
+                tool_call_id=message.tool_call_id,
+                metadata=message.metadata,
+                images=message.images,
+            )
+        return processed
+
+    def _process_output(self, content: str) -> str:
+        """Scan one complete output before it crosses the caller boundary."""
+        if not self._scan_output or not content:
+            return content
+        result = self._scan_text(content)
+        if result.clean:
+            return content
+        return self._handle_findings(content, result, "output")
+
     # -- InferenceEngine interface -------------------------------------------
 
     def generate(
@@ -174,27 +213,7 @@ class GuardrailsEngine(InferenceEngine):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Scan input, call wrapped engine, scan output."""
-        # Scan input messages
-        if self._scan_input:
-            processed = list(messages)
-            for i, msg in enumerate(processed):
-                if msg.content:
-                    result = self._scan_text(msg.content)
-                    if not result.clean:
-                        processed[i] = Message(
-                            role=msg.role,
-                            content=self._handle_findings(
-                                msg.content,
-                                result,
-                                "input",
-                            ),
-                            name=msg.name,
-                            tool_calls=msg.tool_calls,
-                            tool_call_id=msg.tool_call_id,
-                            metadata=msg.metadata,
-                            images=msg.images,
-                        )
-            messages = processed
+        messages = self._process_messages(messages)
 
         # Call wrapped engine
         response = self._engine.generate(
@@ -206,14 +225,9 @@ class GuardrailsEngine(InferenceEngine):
         )
 
         # Scan output
-        if self._scan_output:
-            content = response.get("content", "")
-            if content:
-                result = self._scan_text(content)
-                if not result.clean:
-                    response["content"] = self._handle_findings(
-                        content, result, "output"
-                    )
+        content = response.get("content", "")
+        if content:
+            response["content"] = self._process_output(content)
 
         return response
 
@@ -226,8 +240,20 @@ class GuardrailsEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Yield tokens in real-time, scan accumulated output post-hoc."""
-        accumulated = []
+        """Stream safely.
+
+        BLOCK and REDACT modes buffer the complete response before yielding a
+        single byte.  Scanning only after yielding made a later block purely
+        cosmetic because the secret/PII had already crossed the boundary.
+        WARN mode keeps live streaming semantics and emits its alert after the
+        stream; it is explicitly observational.
+        """
+        messages = self._process_messages(messages)
+        must_prebuffer = self._scan_output and self._mode in (
+            RedactionMode.BLOCK,
+            RedactionMode.REDACT,
+        )
+        accumulated: list[str] = []
         async for token in self._engine.stream(
             messages,
             model=model,
@@ -236,30 +262,21 @@ class GuardrailsEngine(InferenceEngine):
             **kwargs,
         ):
             accumulated.append(token)
-            yield token
+            if not must_prebuffer:
+                yield token
 
-        # Post-hoc scan of accumulated output for logging only
-        if self._scan_output:
-            full_output = "".join(accumulated)
-            if full_output:
-                result = self._scan_text(full_output)
-                if not result.clean and self._bus:
-                    finding_dicts = [
-                        {
-                            "pattern": f.pattern_name,
-                            "threat": f.threat_level.value,
-                            "description": f.description,
-                        }
-                        for f in result.findings
-                    ]
-                    self._bus.publish(
-                        EventType.SECURITY_ALERT,
-                        {
-                            "direction": "output",
-                            "findings": finding_dicts,
-                            "mode": "stream_post_hoc",
-                        },
-                    )
+        full_output = "".join(accumulated)
+        if must_prebuffer:
+            processed = self._process_output(full_output)
+            if processed == full_output:
+                for token in accumulated:
+                    yield token
+            elif processed:
+                yield processed
+        elif self._scan_output and full_output:
+            # WARN mode: publish the finding without attempting an impossible
+            # retroactive block/redaction.
+            self._process_output(full_output)
 
     async def stream_full(
         self,
@@ -270,7 +287,13 @@ class GuardrailsEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator["StreamChunk"]:
-        """Delegate to wrapped engine, scan accumulated output post-hoc."""
+        """Stream rich chunks with the same pre-buffer guarantee as stream()."""
+        messages = self._process_messages(messages)
+        must_prebuffer = self._scan_output and self._mode in (
+            RedactionMode.BLOCK,
+            RedactionMode.REDACT,
+        )
+        chunks: list[StreamChunk] = []
         accumulated: list[str] = []
         async for chunk in self._engine.stream_full(
             messages,
@@ -279,32 +302,31 @@ class GuardrailsEngine(InferenceEngine):
             max_tokens=max_tokens,
             **kwargs,
         ):
+            chunks.append(chunk)
             if chunk.content:
                 accumulated.append(chunk.content)
-            yield chunk
+            if not must_prebuffer:
+                yield chunk
 
-        # Post-hoc scan of accumulated output
-        if self._scan_output:
-            full_output = "".join(accumulated)
-            if full_output:
-                result = self._scan_text(full_output)
-                if not result.clean and self._bus:
-                    finding_dicts = [
-                        {
-                            "pattern": f.pattern_name,
-                            "threat": f.threat_level.value,
-                            "description": f.description,
-                        }
-                        for f in result.findings
-                    ]
-                    self._bus.publish(
-                        EventType.SECURITY_ALERT,
-                        {
-                            "direction": "output",
-                            "findings": finding_dicts,
-                            "mode": "stream_full_post_hoc",
-                        },
-                    )
+        full_output = "".join(accumulated)
+        if must_prebuffer:
+            processed = self._process_output(full_output)
+            if processed == full_output:
+                for chunk in chunks:
+                    yield chunk
+                return
+
+            content_emitted = False
+            for chunk in chunks:
+                if chunk.content and not content_emitted:
+                    yield replace(chunk, content=processed)
+                    content_emitted = True
+                elif chunk.content:
+                    yield replace(chunk, content=None)
+                else:
+                    yield chunk
+        elif self._scan_output and full_output:
+            self._process_output(full_output)
 
     def list_models(self) -> List[str]:
         """Delegate to wrapped engine."""

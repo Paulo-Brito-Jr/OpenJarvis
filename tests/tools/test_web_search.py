@@ -6,6 +6,8 @@ import sys
 from unittest.mock import MagicMock, patch
 
 from openjarvis.core.registry import ToolRegistry
+from openjarvis.core.types import ToolResult
+from openjarvis.tools.http_request import HttpRequestTool
 from openjarvis.tools.web_search import WebSearchTool
 
 
@@ -42,7 +44,12 @@ class TestWebSearchTool:
         with patch.dict("os.environ", {}, clear=True):
             tool._api_key = None
             monkeypatch.delitem(sys.modules, "tavily", raising=False)
-            result = tool.execute(query="test query")
+            with patch.object(
+                tool,
+                "_duckduckgo_search",
+                return_value="fallback result",
+            ):
+                result = tool.execute(query="test query")
         assert result.success is True
         assert result.metadata["engine"] == "duckduckgo"
 
@@ -81,7 +88,12 @@ class TestWebSearchTool:
         monkeypatch.setattr(builtins, "__import__", _mock_import)
 
         tool = WebSearchTool(api_key="test-key")
-        result = tool.execute(query="test query")
+        with patch.object(
+            tool,
+            "_duckduckgo_search",
+            return_value="fallback result",
+        ):
+            result = tool.execute(query="test query")
         assert result.success is True
         assert "Result 1" in result.content
         assert "Result 2" in result.content
@@ -111,7 +123,12 @@ class TestWebSearchTool:
         monkeypatch.setattr(builtins, "__import__", _mock_import)
 
         tool = WebSearchTool(api_key="test-key")
-        result = tool.execute(query="test query")
+        with patch.object(
+            tool,
+            "_duckduckgo_search",
+            return_value="fallback result",
+        ):
+            result = tool.execute(query="test query")
         assert result.success is True
         assert result.metadata["engine"] == "duckduckgo"
 
@@ -196,7 +213,12 @@ class TestWebSearchTool:
         monkeypatch.setattr(builtins, "__import__", _mock_import)
 
         tool = WebSearchTool(api_key="test-key")
-        result = tool.execute(query="test query")
+        with patch.object(
+            tool,
+            "_duckduckgo_search",
+            return_value="fallback result",
+        ):
+            result = tool.execute(query="test query")
         assert result.success is True
         assert result.metadata["engine"] == "duckduckgo"
 
@@ -370,63 +392,63 @@ class TestUrlNormalization:
 
 
 class TestUrlFetching:
-    def _mock_ssrf(self, monkeypatch):
-        """Stub out the SSRF check (requires Rust backend)."""
-        import openjarvis.tools.web_search as _ws
-
-        monkeypatch.setattr(_ws, "check_ssrf", lambda url: None)
+    def _mock_fetch(
+        self,
+        monkeypatch,
+        *,
+        content: str,
+        content_type: str = "text/html",
+        success: bool = True,
+    ):
+        monkeypatch.setattr(
+            HttpRequestTool,
+            "execute",
+            MagicMock(
+                return_value=ToolResult(
+                    tool_name="http_request",
+                    content=content,
+                    success=success,
+                    metadata={"content_type": content_type},
+                )
+            ),
+        )
 
     def test_fetch_url_success(self, monkeypatch):
         """Mocked HTTP GET returns HTML, stripped to text."""
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body><p>Hello world</p></body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        self._mock_fetch(
+            monkeypatch,
+            content="<html><body><p>Hello world</p></body></html>",
+        )
 
         content = WebSearchTool._fetch_url("https://example.com")
         assert "Hello world" in content
 
     def test_fetch_url_strips_scripts(self, monkeypatch):
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><script>var x=1;</script><body>Content</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        self._mock_fetch(
+            monkeypatch,
+            content=(
+                "<html><script>var x=1;</script>"
+                "<body>Content</body></html>"
+            ),
+        )
 
         content = WebSearchTool._fetch_url("https://example.com")
         assert "var x" not in content
         assert "Content" in content
 
     def test_fetch_url_truncates_long_content(self, monkeypatch):
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        mock_resp = MagicMock()
-        mock_resp.text = "<p>" + "x" * 10000 + "</p>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        self._mock_fetch(monkeypatch, content="<p>" + "x" * 10000 + "</p>")
 
         content = WebSearchTool._fetch_url("https://example.com", max_chars=100)
         assert len(content) < 200
         assert "[Content truncated]" in content
 
     def test_fetch_url_pdf_content_type(self, monkeypatch):
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        mock_resp = MagicMock()
-        mock_resp.text = "%PDF-1.4 binary data"
-        mock_resp.headers = {"content-type": "application/pdf"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        self._mock_fetch(
+            monkeypatch,
+            content="%PDF-1.4 binary data",
+            content_type="application/pdf",
+        )
 
         content = WebSearchTool._fetch_url("https://example.com/file.pdf")
         assert "PDF" in content
@@ -434,39 +456,46 @@ class TestUrlFetching:
 
 
 class TestExecuteWithUrl:
-    def _mock_ssrf(self, monkeypatch):
-        """Stub out the SSRF check (requires Rust backend)."""
-        import openjarvis.tools.web_search as _ws
-
-        monkeypatch.setattr(_ws, "check_ssrf", lambda url: None)
+    def _mock_fetch(
+        self,
+        monkeypatch,
+        *,
+        content: str,
+        success: bool = True,
+    ):
+        monkeypatch.setattr(
+            HttpRequestTool,
+            "execute",
+            MagicMock(
+                return_value=ToolResult(
+                    tool_name="http_request",
+                    content=content,
+                    success=success,
+                    metadata={"content_type": "text/html"},
+                )
+            ),
+        )
 
     def test_execute_with_url_query(self, monkeypatch):
         """When query is a URL, fetch instead of search."""
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body>Page content here</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        self._mock_fetch(
+            monkeypatch,
+            content="<html><body>Page content here</body></html>",
+        )
 
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="https://example.com/article")
         assert result.success is True
         assert "Page content here" in result.content
         assert result.metadata.get("mode") == "fetch"
+        assert result.metadata["_taint"]["labels"] == ["external"]
 
     def test_execute_with_embedded_url(self, monkeypatch):
         """When query contains a URL within text, detect and fetch it."""
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body>Article text</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        self._mock_fetch(
+            monkeypatch,
+            content="<html><body>Article text</body></html>",
+        )
 
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="Summarize https://example.com/article please")
@@ -475,28 +504,23 @@ class TestExecuteWithUrl:
 
     def test_execute_url_ssrf_blocked(self, monkeypatch):
         """SSRF check rejects unsafe URLs before any HTTP request."""
-        import openjarvis.tools.web_search as _ws
-
-        monkeypatch.setattr(
-            _ws,
-            "check_ssrf",
-            lambda url: "private IP blocked",
+        self._mock_fetch(
+            monkeypatch,
+            content="SSRF protection blocked request.",
+            success=False,
         )
 
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="http://169.254.169.254/metadata")
         assert result.success is False
-        assert "private IP blocked" in result.content
+        assert result.content == "Failed to fetch URL securely."
 
     def test_execute_url_fetch_failure(self, monkeypatch):
         """URL fetch failure returns error result."""
-        import httpx
-
-        self._mock_ssrf(monkeypatch)
-        monkeypatch.setattr(
-            httpx,
-            "get",
-            MagicMock(side_effect=httpx.HTTPError("Connection failed")),
+        self._mock_fetch(
+            monkeypatch,
+            content="Request failed.",
+            success=False,
         )
 
         tool = WebSearchTool(api_key="test-key")

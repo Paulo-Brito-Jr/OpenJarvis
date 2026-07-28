@@ -20,8 +20,31 @@ from openjarvis.server.webhook_routes import create_webhook_router
 @pytest.fixture
 def mock_bridge():
     bridge = MagicMock()
+    bridge.is_sender_allowed.return_value = True
     bridge.handle_incoming.return_value = "Got it!"
     return bridge
+
+
+def test_valid_signature_but_unallowlisted_sender_is_rejected(mock_bridge):
+    mock_bridge.is_sender_allowed.return_value = False
+    app = FastAPI()
+    app.include_router(
+        create_webhook_router(
+            bridge=mock_bridge,
+            twilio_auth_token="test_token",
+        )
+    )
+    client = TestClient(app)
+    with patch(
+        "openjarvis.server.webhook_routes._validate_twilio_signature",
+        return_value=True,
+    ):
+        response = client.post(
+            "/webhooks/twilio",
+            data={"From": "+15551234567", "Body": "hello"},
+        )
+    assert response.status_code == 403
+    mock_bridge.handle_incoming.assert_not_called()
 
 
 class TestTwilioWebhook:

@@ -81,6 +81,10 @@ def chat(
         sys.exit(1)
 
     engine_name, engine = resolved
+    from openjarvis.security import setup_security
+
+    security = setup_security(config, engine, bus)
+    engine = security.engine
     model = model_name or config.intelligence.default_model
     if not model:
         from openjarvis.engine import discover_engines, discover_models
@@ -131,16 +135,20 @@ def chat(
                             kwargs["tools"] = tool_instances
                     kwargs["max_turns"] = config.agent.max_turns
 
-                    def _confirm(prompt: str) -> bool:
-                        console.print(
-                            f"[yellow]Confirm:[/yellow] {prompt} [y/N] ",
-                            end="",
-                        )
-                        ans = input().strip().lower()
-                        return ans in ("y", "yes")
+                    if config.security.enforce_tool_confirmation and sys.stdin.isatty():
 
-                    kwargs["interactive"] = True
-                    kwargs["confirm_callback"] = _confirm
+                        def _confirm(prompt: str) -> bool:
+                            console.print(
+                                f"[yellow]Confirm:[/yellow] {prompt} [y/N] ",
+                                end="",
+                            )
+                            ans = input().strip().lower()
+                            return ans in ("y", "yes")
+
+                        kwargs["interactive"] = True
+                        kwargs["confirm_callback"] = _confirm
+                    else:
+                        kwargs["interactive"] = False
 
                 import inspect as _inspect
 
@@ -157,6 +165,18 @@ def chat(
                     )
 
                 agent = agent_cls(engine, model, **kwargs)
+                needs_security = bool(
+                    getattr(agent_cls, "accepts_tools", False)
+                    or getattr(agent_cls, "requires_security_context", False)
+                )
+                if needs_security:
+                    bind_security = getattr(agent, "bind_security", None)
+                    if not callable(bind_security):
+                        raise RuntimeError(
+                            f"Agent '{agent_key}' cannot bind the required "
+                            "security policy"
+                        )
+                    bind_security(security.capability_policy, agent_key)
         except Exception as exc:
             console.print(f"[yellow]Agent '{agent_key}' failed: {exc}[/yellow]")
 

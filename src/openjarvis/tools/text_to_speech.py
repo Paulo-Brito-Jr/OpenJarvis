@@ -49,8 +49,23 @@ class TextToSpeechTool(BaseTool):
                 "required": ["text"],
             },
             category="audio",
+            requires_confirmation=True,
             timeout_seconds=120.0,
+            required_capabilities=["file:write"],
         )
+
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        output_dir = params.get("output_dir")
+        if isinstance(output_dir, str) and output_dir.strip():
+            return str(Path(output_dir).expanduser().resolve(strict=False))
+        return "file:temporary-audio"
+
+    def authorization_capabilities(self, params: dict[str, Any]) -> list[str]:
+        backend = str(params.get("backend", "cartesia")).strip().lower()
+        capabilities = ["file:write"]
+        if backend not in {"kokoro"}:
+            capabilities.append("network:fetch")
+        return capabilities
 
     def execute(self, **params: Any) -> ToolResult:
         # Ensure TTS backends are registered

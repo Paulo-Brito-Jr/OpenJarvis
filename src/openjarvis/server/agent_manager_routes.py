@@ -7,6 +7,10 @@ import re as _re
 from typing import Any, Dict, List, Optional, Tuple
 
 from openjarvis.agents.manager import AgentManager
+from openjarvis.server.response_security import (
+    project_channel_binding,
+    project_managed_agent,
+)
 
 try:
     from fastapi import APIRouter, HTTPException, Request
@@ -662,8 +666,6 @@ def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     if cached is not None:
         return cached
 
-    import json as _json
-
     from openjarvis.core.config import load_config
 
     openai_tools: List[Dict[str, Any]] = []
@@ -678,87 +680,40 @@ def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     if not app_config.tools.mcp.enabled or not app_config.tools.mcp.servers:
         return openai_tools, adapters_by_name
 
-    from openjarvis.mcp.client import MCPClient
-    from openjarvis.mcp.transport import StdioTransport, StreamableHTTPTransport
-    from openjarvis.tools.mcp_adapter import MCPToolProvider
-
-    # Keep clients alive so transports persist for tool calls at runtime
-    mcp_clients: list = getattr(app_state, "_mcp_clients", [])
-
     try:
-        server_list = _json.loads(app_config.tools.mcp.servers)
-    except (_json.JSONDecodeError, TypeError) as exc:
-        logger.warning("Failed to parse MCP server config: %s", exc)
+        from openjarvis.mcp.loader import load_mcp_tools_from_config
+
+        discovered, mcp_clients = load_mcp_tools_from_config(
+            app_config.tools.mcp
+        )
+    except Exception as exc:
+        # Cache the failure as an empty, non-executable surface so repeated
+        # requests cannot observe a partially loaded/ambiguous tool set.
+        logger.error(
+            "MCP discovery rejected: %s",
+            type(exc).__name__,
+        )
+        app_state._mcp_tools_cache = (openai_tools, adapters_by_name)
         return openai_tools, adapters_by_name
 
-    if not isinstance(server_list, list):
-        return openai_tools, adapters_by_name
-
-    for server_cfg in server_list:
-        cfg = _json.loads(server_cfg) if isinstance(server_cfg, str) else server_cfg
-        name = cfg.get("name", "<unnamed>")
-        url = cfg.get("url")
-        # Bearer token from config — mirrors the builder.py fix for #461.
-        token = cfg.get("token")
-        command = cfg.get("command", "")
-        args = cfg.get("args", [])
-
-        try:
-            if url:
-                transport = StreamableHTTPTransport(url=url, token=token)
-            elif command:
-                transport = StdioTransport(command=[command] + args)
-            else:
-                logger.warning(
-                    "MCP server '%s' has neither 'url' nor 'command' — skipping",
-                    name,
-                )
-                continue
-
-            client = MCPClient(transport)
-            client.initialize()
-            mcp_clients.append(client)
-
-            provider = MCPToolProvider(client)
-            discovered = provider.discover()
-
-            # Per-server tool filtering
-            include_tools = set(cfg.get("include_tools", []))
-            exclude_tools = set(cfg.get("exclude_tools", []))
-            if include_tools:
-                discovered = [t for t in discovered if t.spec.name in include_tools]
-            if exclude_tools:
-                discovered = [t for t in discovered if t.spec.name not in exclude_tools]
-
-            for adapter in discovered:
-                spec = adapter.spec
-                openai_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": spec.name,
-                            "description": spec.description,
-                            "parameters": spec.parameters,
-                        },
-                    }
-                )
-                adapters_by_name[spec.name] = adapter
-
-            logger.info(
-                "Discovered %d MCP tools from server '%s'",
-                len(discovered),
-                name,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to discover MCP tools from '%s': %s",
-                name,
-                exc,
-            )
+    for adapter in discovered:
+        spec = adapter.spec
+        if spec.name in adapters_by_name:
+            raise RuntimeError(f"Duplicate MCP tool name: {spec.name}")
+        openai_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters,
+                },
+            }
+        )
+        adapters_by_name[spec.name] = adapter
 
     app_state._mcp_clients = mcp_clients
-    if openai_tools:
-        app_state._mcp_tools_cache = (openai_tools, adapters_by_name)
+    app_state._mcp_tools_cache = (openai_tools, adapters_by_name)
     return openai_tools, adapters_by_name
 
 
@@ -804,6 +759,26 @@ def _tool_progress_label(tool_name: str, args: str) -> str:
     return label
 
 
+def _build_server_tool_executor(
+    *,
+    tools: List[Any],
+    bus: Any,
+    app_state: Any,
+    agent_id: str,
+) -> Any:
+    """Build a non-interactive, identity-bound executor for server requests."""
+    from openjarvis.tools._stubs import ToolExecutor
+
+    return ToolExecutor(
+        tools=tools,
+        bus=bus,
+        capability_policy=getattr(app_state, "capability_policy", None),
+        agent_id=agent_id,
+        boundary_guard=getattr(app_state, "boundary_guard", None),
+        interactive=False,
+    )
+
+
 async def _stream_managed_agent(
     *,
     manager: AgentManager,
@@ -813,6 +788,7 @@ async def _stream_managed_agent(
     engine: Any,
     bus: Any,
     app_state: Any = None,
+    operator_id: str,
 ) -> StreamingResponse:
     """Run a managed agent with real LLM token streaming via SSE.
 
@@ -826,6 +802,9 @@ async def _stream_managed_agent(
     from openjarvis.core.types import Message, Role
 
     agent_id = agent_record["id"]
+    security_principal = operator_id.strip()
+    if not security_principal:
+        raise RuntimeError("Managed-agent streaming requires an operator identity")
     config = agent_record.get("config", {})
     # Resolve the model: prefer the agent's own config, then the server's
     # resolved model (app.state.model — what the engine was booted with),
@@ -852,6 +831,7 @@ async def _stream_managed_agent(
         from openjarvis.core.config import load_config
 
         app_config = load_config()
+    capability_policy = getattr(app_state, "capability_policy", None)
 
     final_system_prompt = _build_managed_system_prompt(system_prompt or "", app_config)
 
@@ -923,8 +903,12 @@ async def _stream_managed_agent(
                     tools=dr_tools,
                     max_turns=int(config.get("max_turns", 8)),
                     temperature=float(config.get("temperature", 0.3)),
-                    interactive=True,
-                    confirm_callback=lambda _prompt: True,
+                    interactive=False,
+                )
+                dr_agent.bind_security(
+                    capability_policy,
+                    security_principal,
+                    getattr(app_state, "boundary_guard", None),
                 )
 
                 # Wrap the executor to capture tool calls
@@ -1368,24 +1352,18 @@ async def _stream_managed_agent(
                     tool_start_ms = _time.monotonic() * 1000
 
                     try:
-                        # Try MCP adapter first (external tools)
+                        from openjarvis.tools._stubs import (
+                            ToolCall as StubToolCall,
+                        )
+
+                        tool_instance = None
+                        # Try MCP adapter first (external tools).
                         mcp_adapter = mcp_adapters.get(tool_name)
                         if mcp_adapter is not None:
-                            try:
-                                parsed_args = json.loads(tool_args) if tool_args else {}
-                            except (json.JSONDecodeError, TypeError):
-                                parsed_args = {}
-                            result = mcp_adapter.execute(**parsed_args)
-                            tool_result_content = result.content
+                            tool_instance = mcp_adapter
                         else:
                             # Try to use ToolExecutor if tools are configured
                             from openjarvis.core.registry import ToolRegistry
-                            from openjarvis.tools._stubs import (
-                                ToolCall as StubToolCall,
-                            )
-                            from openjarvis.tools._stubs import (
-                                ToolExecutor,
-                            )
 
                             tool_cls = ToolRegistry.get(tool_name)
                             if tool_cls is not None:
@@ -1400,34 +1378,31 @@ async def _stream_managed_agent(
                                     model=model,
                                     app_state=app_state,
                                 )
-                                # Tools the user explicitly added to this
-                                # agent's toolkit are considered pre-approved —
-                                # selecting them in the wizard is the
-                                # confirmation. Without this, tools that have
-                                # `requires_confirmation=True` (shell_exec,
-                                # apply_patch) would fail with "requires
-                                # confirmation but no callback available" on
-                                # every call.
-                                executor = ToolExecutor(
-                                    tools=[tool_instance],
-                                    bus=bus,
-                                    interactive=True,
-                                    confirm_callback=lambda _prompt: True,
-                                )
-                                result = executor.execute(
-                                    StubToolCall(
-                                        id=tc["id"],
-                                        name=tool_name,
-                                        arguments=tool_args,
-                                    ),
-                                )
-                                tool_result_content = result.content
                             else:
                                 logger.warning(
                                     "Tool '%s' not found in registry or MCP adapters",
                                     tool_name,
                                 )
-                        tool_succeeded = True
+
+                        if tool_instance is not None:
+                            # Server requests have no synchronous human
+                            # approval channel.  Every local and MCP tool goes
+                            # through the same fail-closed executor.
+                            executor = _build_server_tool_executor(
+                                tools=[tool_instance],
+                                bus=bus,
+                                app_state=app_state,
+                                agent_id=security_principal,
+                            )
+                            result = executor.execute(
+                                StubToolCall(
+                                    id=tc["id"],
+                                    name=tool_name,
+                                    arguments=tool_args,
+                                ),
+                            )
+                            tool_result_content = result.content
+                            tool_succeeded = result.success
                     except Exception as tool_exc:
                         logger.error(
                             "Tool execution error for %s: %s",
@@ -1540,7 +1515,12 @@ def create_agent_manager_router(
 
     @agents_router.get("")
     async def list_agents():
-        return {"agents": manager.list_agents()}
+        return {
+            "agents": [
+                project_managed_agent(agent)
+                for agent in manager.list_agents()
+            ]
+        }
 
     @agents_router.post("")
     async def create_agent(req: CreateAgentRequest, request: Request):
@@ -1559,14 +1539,14 @@ def create_agent_manager_router(
         if scheduler and sched_type in ("cron", "interval"):
             scheduler.register_agent(agent["id"])
 
-        return agent
+        return project_managed_agent(agent)
 
     @agents_router.get("/{agent_id}")
     async def get_agent(agent_id: str):
         agent = manager.get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        return agent
+        return project_managed_agent(agent)
 
     @agents_router.patch("/{agent_id}")
     async def update_agent(agent_id: str, req: UpdateAgentRequest):
@@ -1579,7 +1559,7 @@ def create_agent_manager_router(
             kwargs["agent_type"] = req.agent_type
         if req.config is not None:
             kwargs["config"] = req.config
-        return manager.update_agent(agent_id, **kwargs)
+        return project_managed_agent(manager.update_agent(agent_id, **kwargs))
 
     @agents_router.delete("/{agent_id}")
     async def delete_agent(agent_id: str):
@@ -1604,71 +1584,22 @@ def create_agent_manager_router(
 
     @agents_router.post("/{agent_id}/run")
     async def run_agent(agent_id: str, request: Request):
-        import threading
-
         agent = manager.get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
         if agent["status"] == "archived":
             raise HTTPException(status_code=400, detail="Agent is archived")
-
-        # Auto-recover from error/needs_attention state
-        if agent["status"] in ("error", "needs_attention"):
-            manager.update_agent(agent_id, status="idle")
-
-        # Acquire tick BEFORE spawning thread — prevents race
-        try:
-            manager.start_tick(agent_id)
-        except ValueError:
-            raise HTTPException(status_code=409, detail="Agent is already running")
-
-        # Re-use the server's engine + model so we don't pick a
-        # random model from Ollama's list.
-        server_engine = getattr(request.app.state, "engine", None)
-        server_model = getattr(request.app.state, "model", "")
-        server_config = getattr(request.app.state, "config", None)
-
-        def _run_tick():
-            try:
-                from openjarvis.agents.executor import AgentExecutor
-                from openjarvis.core.events import get_event_bus
-
-                _ts = getattr(request.app.state, "trace_store", None)
-                executor = AgentExecutor(
-                    manager=manager,
-                    event_bus=get_event_bus(),
-                    trace_store=_ts,
-                )
-                system = _make_lightweight_system(
-                    server_engine,
-                    server_model,
-                    server_config,
-                )
-                executor.set_system(system)
-                # The route handler above already called start_tick() to
-                # serialize concurrent POSTs; tell the executor not to
-                # re-acquire, otherwise it bails on its own guard and the
-                # tick never runs.
-                executor.execute_tick(agent_id, lock_already_held=True)
-            except Exception as exc:
-                logger.error(
-                    "Run-tick failed for agent %s: %s",
-                    agent_id,
-                    exc,
-                    exc_info=True,
-                )
-                try:
-                    manager.end_tick(agent_id)
-                except Exception:
-                    pass
-                manager.update_agent(agent_id, status="error")
-                manager.update_summary_memory(
-                    agent_id,
-                    f"ERROR: {exc}",
-                )
-
-        threading.Thread(target=_run_tick, daemon=True).start()
-        return {"status": "running", "agent_id": agent_id}
+        # AgentExecutor currently binds tool/memory authority to ``agent_id``.
+        # An external request principal would therefore inherit service-agent
+        # grants.  Refuse this asynchronous path until the immutable operator
+        # identity is carried into the tick.
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "External managed-agent runs are disabled until execution "
+                "preserves the authenticated operator identity"
+            ),
+        )
 
     # ── Recover ──────────────────────────────────────────────
 
@@ -1677,7 +1608,14 @@ def create_agent_manager_router(
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
         checkpoint = manager.recover_agent(agent_id)
-        return {"recovered": True, "checkpoint": checkpoint}
+        checkpoint_summary = None
+        if isinstance(checkpoint, dict):
+            checkpoint_summary = {
+                key: checkpoint[key]
+                for key in ("tick_id", "created_at")
+                if key in checkpoint
+            }
+        return {"recovered": True, "checkpoint": checkpoint_summary}
 
     # ── Tasks ────────────────────────────────────────────────
 
@@ -1720,7 +1658,12 @@ def create_agent_manager_router(
 
     @agents_router.get("/{agent_id}/channels")
     async def list_channels(agent_id: str):
-        return {"bindings": manager.list_channel_bindings(agent_id)}
+        return {
+            "bindings": [
+                project_channel_binding(binding)
+                for binding in manager.list_channel_bindings(agent_id)
+            ]
+        }
 
     @agents_router.post("/{agent_id}/channels")
     async def bind_channel(
@@ -1730,6 +1673,33 @@ def create_agent_manager_router(
     ):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
+        if req.channel_type in {"imessage", "sendblue", "slack"}:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This managed channel is disabled until request-scoped "
+                    "operator identity and vault-backed credentials are "
+                    "preserved end to end"
+                ),
+            )
+        channel_config = req.config or {}
+        allowed_senders = channel_config.get("allowed_senders", [])
+        if (
+            not isinstance(allowed_senders, list)
+            or not allowed_senders
+            or not all(
+                isinstance(sender, str) and sender.strip()
+                for sender in allowed_senders
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Channel bindings require a non-empty allowed_senders "
+                    "array of exact sender IDs"
+                ),
+            )
+        capability_policy = getattr(request.app.state, "capability_policy", None)
         binding = manager.bind_channel(
             agent_id,
             channel_type=req.channel_type,
@@ -1766,8 +1736,16 @@ def create_agent_manager_router(
                                     engine=engine,
                                     model=getattr(engine, "_model", ""),
                                     tools=tools,
-                                    interactive=True,
-                                    confirm_callback=lambda _prompt: True,
+                                    interactive=False,
+                                )
+                                agent_inst.bind_security(
+                                    capability_policy,
+                                    agent_id,
+                                    getattr(
+                                        request.app.state,
+                                        "boundary_guard",
+                                        None,
+                                    ),
                                 )
 
                                 def handler(text: str) -> str:
@@ -1792,7 +1770,8 @@ def create_agent_manager_router(
             api_key_id = config.get("api_key_id", "")
             api_secret_key = config.get("api_secret_key", "")
             from_number = config.get("from_number", "")
-            if api_key_id and api_secret_key:
+            webhook_secret = config.get("webhook_secret", "")
+            if api_key_id and api_secret_key and webhook_secret:
                 try:
                     from openjarvis.channels.sendblue import (
                         SendBlueChannel,
@@ -1802,6 +1781,7 @@ def create_agent_manager_router(
                         api_key_id=api_key_id,
                         api_secret_key=api_secret_key,
                         from_number=from_number,
+                        webhook_secret=webhook_secret,
                     )
                     sb_channel.connect()
                     # Store on app state so webhook route can use it
@@ -1811,6 +1791,10 @@ def create_agent_manager_router(
                     bridge = getattr(request.app.state, "channel_bridge", None)
                     if bridge and hasattr(bridge, "_channels"):
                         bridge._channels["sendblue"] = sb_channel
+                        bridge.set_sender_allowlist(
+                            "sendblue",
+                            allowed_senders,
+                        )
                     else:
                         # Create a new ChannelBridge with DeepResearch
                         from openjarvis.server.channel_bridge import (
@@ -1843,8 +1827,16 @@ def create_agent_manager_router(
                                     engine=engine,
                                     model=model_name,
                                     tools=tools,
-                                    interactive=True,
-                                    confirm_callback=lambda _prompt: True,
+                                    interactive=False,
+                                )
+                                dr_agent.bind_security(
+                                    capability_policy,
+                                    agent_id,
+                                    getattr(
+                                        request.app.state,
+                                        "boundary_guard",
+                                        None,
+                                    ),
                                 )
                         bus = getattr(request.app.state, "bus", None)
                         if bus is None:
@@ -1857,6 +1849,10 @@ def create_agent_manager_router(
                             bus=bus,
                             agent_manager=manager,
                             deep_research_agent=dr_agent,
+                            sender_allowlist={
+                                "sendblue": allowed_senders,
+                            },
+                            capability_policy=capability_policy,
                         )
                         request.app.state.channel_bridge = bridge
 
@@ -1901,6 +1897,8 @@ def create_agent_manager_router(
                         bot_token=bot_token,
                         app_token=app_token,
                         model=srv_model,
+                        agent_id=agent_id,
+                        allowed_sender_ids=allowed_senders,
                     )
                     logger.info(
                         "Slack daemon started (PID %d)",
@@ -1912,7 +1910,7 @@ def create_agent_manager_router(
                         exc,
                     )
 
-        return binding
+        return project_channel_binding(binding)
 
     @agents_router.delete("/{agent_id}/channels/{binding_id}")
     async def unbind_channel(
@@ -1949,91 +1947,51 @@ def create_agent_manager_router(
 
     @agents_router.post("/{agent_id}/messages")
     async def send_message(agent_id: str, req: SendMessageRequest, request: Request):
+        from openjarvis.server.auth_middleware import explicitly_authorized
+
+        principal = getattr(request.state, "api_principal", "")
+        if not isinstance(principal, str) or not principal.strip():
+            raise HTTPException(
+                status_code=503,
+                detail="Authenticated API principal is not configured",
+            )
+        if not explicitly_authorized(
+            getattr(request.app.state, "capability_policy", None),
+            principal,
+            "tool:invoke",
+            f"agent:{agent_id}",
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="API principal is not authorized to invoke this agent",
+            )
+
         agent_record = manager.get_agent(agent_id)
         if not agent_record:
             raise HTTPException(status_code=404, detail="Agent not found")
 
-        # Auto-recover error-state agents on immediate messages
-        if req.mode == "immediate" and agent_record["status"] in (
+        # Queued and non-streaming modes lose the authenticated operator when
+        # a later service-agent tick executes the message.  Until the queue
+        # schema carries an immutable principal and grant snapshot, refuse
+        # those modes before storing or mutating anything.
+        if not req.stream:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Managed-agent API execution requires stream=true so the "
+                    "authenticated operator identity remains bound"
+                ),
+            )
+
+        # Streaming is executed now under the request principal.  Store it as
+        # immediate even when an older client leaves mode at its queued default.
+        if agent_record["status"] in (
             "error",
             "needs_attention",
         ):
             manager.update_agent(agent_id, status="idle")
 
-        # Store user message in DB (always, regardless of stream mode)
-        msg = manager.send_message(agent_id, req.content, mode=req.mode)
-
-        if not req.stream and req.mode != "immediate":
-            return msg
-
-        if not req.stream and req.mode == "immediate":
-            # Non-streaming immediate: trigger a background tick so the
-            # agent processes the message, then return the stored msg.
-            # Re-use the server's existing system (correct model/engine).
-            import threading
-            import time as _time
-
-            from openjarvis.agents.executor import AgentExecutor
-            from openjarvis.core.events import get_event_bus
-
-            _srv_engine = getattr(request.app.state, "engine", None)
-            _srv_model = getattr(request.app.state, "model", "")
-            _srv_config = getattr(request.app.state, "config", None)
-
-            def _immediate_tick():
-                _start = _time.time()
-                logger.info(
-                    "Immediate tick starting for agent %s (model=%s)",
-                    agent_id,
-                    _srv_model,
-                )
-                try:
-                    _ts2 = getattr(request.app.state, "trace_store", None)
-                    executor = AgentExecutor(
-                        manager=manager,
-                        event_bus=get_event_bus(),
-                        trace_store=_ts2,
-                    )
-                    system = _make_lightweight_system(
-                        _srv_engine,
-                        _srv_model,
-                        _srv_config,
-                    )
-                    executor.set_system(system)
-                    logger.info(
-                        "Immediate tick: system ready in %.1fs, "
-                        "executing tick for agent %s",
-                        _time.time() - _start,
-                        agent_id,
-                    )
-                    executor.execute_tick(agent_id)
-                    logger.info(
-                        "Immediate tick completed for agent %s in %.1fs",
-                        agent_id,
-                        _time.time() - _start,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Immediate tick failed for agent %s: %s",
-                        agent_id,
-                        exc,
-                        exc_info=True,
-                    )
-                    try:
-                        manager.end_tick(agent_id)
-                    except Exception:
-                        pass
-                    manager.update_agent(agent_id, status="error")
-                    manager.update_summary_memory(
-                        agent_id,
-                        f"ERROR: {exc}",
-                    )
-
-            threading.Thread(
-                target=_immediate_tick,
-                daemon=True,
-            ).start()
-            return msg
+        msg = manager.send_message(agent_id, req.content, mode="immediate")
 
         # --- Streaming mode: run agent and return SSE response ---
         engine = getattr(request.app.state, "engine", None)
@@ -2052,6 +2010,7 @@ def create_agent_manager_router(
             engine=engine,
             bus=bus,
             app_state=request.app.state,
+            operator_id=principal,
         )
 
     # ── State inspection ─────────────────────────────────────
@@ -2062,11 +2021,25 @@ def create_agent_manager_router(
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         return {
-            "agent": agent,
+            "agent": project_managed_agent(agent),
             "tasks": manager.list_tasks(agent_id),
-            "channels": manager.list_channel_bindings(agent_id),
+            "channels": [
+                project_channel_binding(binding)
+                for binding in manager.list_channel_bindings(agent_id)
+            ],
             "messages": manager.list_messages(agent_id),
-            "checkpoint": manager.get_latest_checkpoint(agent_id),
+            "checkpoint": (
+                {
+                    key: checkpoint[key]
+                    for key in ("tick_id", "created_at")
+                    if key in checkpoint
+                }
+                if isinstance(
+                    (checkpoint := manager.get_latest_checkpoint(agent_id)),
+                    dict,
+                )
+                else None
+            ),
         }
 
     # ── Learning ─────────────────────────────────────────────
@@ -2163,7 +2136,13 @@ def create_agent_manager_router(
 
     @templates_router.post("/{template_id}/instantiate")
     async def instantiate_template(template_id: str, req: CreateAgentRequest):
-        return manager.create_from_template(template_id, req.name, overrides=req.config)
+        return project_managed_agent(
+            manager.create_from_template(
+                template_id,
+                req.name,
+                overrides=req.config,
+            )
+        )
 
     # ── Global agent endpoints ───────────────────────────────
 
@@ -2177,7 +2156,12 @@ def create_agent_manager_router(
             for a in all_agents
             if a["status"] in ("error", "needs_attention", "stalled", "budget_exceeded")
         ]
-        return {"agents": error_agents}
+        return {
+            "agents": [
+                project_managed_agent(agent)
+                for agent in error_agents
+            ]
+        }
 
     @global_router.get("/v1/agents/health")
     def agents_health():

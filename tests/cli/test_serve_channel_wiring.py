@@ -8,11 +8,15 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from openjarvis.channels._stubs import ChannelMessage
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import EventBus
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.sessions.session import SessionStore
 from openjarvis.system import JarvisSystem
+from openjarvis.system.core import channel_operator_id
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -40,6 +44,7 @@ def _make_system(engine=None, agent_name="", tmp_path=None) -> JarvisSystem:
     if tmp_path is not None:
         config.sessions.db_path = str(tmp_path / "sessions.db")
     mock_engine = engine or MagicMock()
+    policy = CapabilityPolicy()
     return JarvisSystem(
         config=config,
         bus=EventBus(record_history=False),
@@ -47,6 +52,7 @@ def _make_system(engine=None, agent_name="", tmp_path=None) -> JarvisSystem:
         engine_key="mock",
         model="test-model",
         agent_name=agent_name,
+        capability_policy=policy,
     )
 
 
@@ -54,6 +60,21 @@ def _fire(channel_mock, cm: ChannelMessage) -> None:
     """Invoke all registered on_message handlers as if the channel received cm."""
     for handler in channel_mock.on_message.call_args_list:
         handler[0][0](cm)
+
+
+def _wire_authorized(system: JarvisSystem, channel) -> None:
+    allowlist = {
+        "telegram": {"42", "u1"},
+        "discord": {"user-1", "u1"},
+    }
+    for channel_type, senders in allowlist.items():
+        for sender in senders:
+            system.capability_policy.grant(
+                channel_operator_id(channel_type, sender),
+                "tool:invoke",
+                "agent:system",
+            )
+    system.wire_channel(channel, sender_allowlist=allowlist)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +91,7 @@ class TestWireChannelWithAgent:
         system.ask = MagicMock(return_value={"content": "pong"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
 
         # Simulate an incoming message
         cm = _make_channel_message(content="ping")
@@ -79,6 +100,10 @@ class TestWireChannelWithAgent:
 
         system.ask.assert_called_once()
         assert system.ask.call_args[0][0] == "ping"
+        assert system.ask.call_args.kwargs["operator_id"] == channel_operator_id(
+            "telegram",
+            "42",
+        )
         # Canonical send contract (#515/#516): the destination is the real
         # per-adapter id (carried in ChannelMessage.conversation_id), not the
         # channel TYPE label, and the conversation_id kwarg is the inbound
@@ -95,7 +120,7 @@ class TestWireChannelWithAgent:
 
         mock_channel = MagicMock()
         system.ask = MagicMock(return_value={"content": "ok"})
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
 
         handler = mock_channel.on_message.call_args[0][0]
         handler(_make_channel_message())
@@ -109,12 +134,57 @@ class TestWireChannelWithAgent:
         system.ask = MagicMock(return_value={"content": "ok"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
 
         handler = mock_channel.on_message.call_args[0][0]
         handler(_make_channel_message())
 
         assert system.session_store is existing_store
+
+    def test_missing_allowlist_fails_before_handler_registration(self, tmp_path):
+        system = _make_system(tmp_path=tmp_path)
+        mock_channel = MagicMock()
+
+        with pytest.raises(RuntimeError, match="sender allowlist"):
+            system.wire_channel(mock_channel)
+
+        mock_channel.on_message.assert_not_called()
+
+    def test_sender_without_grant_cannot_invoke_or_persist(self, tmp_path):
+        system = _make_system(tmp_path=tmp_path)
+        system.ask = MagicMock(return_value={"content": "must not run"})
+        mock_channel = MagicMock()
+        system.wire_channel(
+            mock_channel,
+            sender_allowlist={"telegram": {"42"}},
+        )
+
+        handler = mock_channel.on_message.call_args[0][0]
+        handler(_make_channel_message())
+
+        system.ask.assert_not_called()
+        mock_channel.send.assert_not_called()
+
+    def test_unallowlisted_sender_cannot_borrow_allowed_principal(self, tmp_path):
+        system = _make_system(tmp_path=tmp_path)
+        allowed_principal = channel_operator_id("telegram", "42")
+        system.capability_policy.grant(
+            allowed_principal,
+            "tool:invoke",
+            "agent:system",
+        )
+        system.ask = MagicMock(return_value={"content": "must not run"})
+        mock_channel = MagicMock()
+        system.wire_channel(
+            mock_channel,
+            sender_allowlist={"telegram": {"42"}},
+        )
+
+        handler = mock_channel.on_message.call_args[0][0]
+        handler(_make_channel_message(sender="attacker"))
+
+        system.ask.assert_not_called()
+        mock_channel.send.assert_not_called()
 
 
 class TestWireChannelWithEngine:
@@ -125,7 +195,7 @@ class TestWireChannelWithEngine:
         system.ask = MagicMock(return_value={"content": "raw reply"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
 
         handler = mock_channel.on_message.call_args[0][0]
         handler(_make_channel_message(content="hi"))
@@ -156,7 +226,7 @@ class TestWireChannelCanonicalContract:
         system.ask = MagicMock(return_value={"content": "pong"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
         handler = mock_channel.on_message.call_args[0][0]
 
         cm = ChannelMessage(
@@ -183,7 +253,7 @@ class TestWireChannelCanonicalContract:
         system.ask = MagicMock(return_value={"content": "pong"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
         handler = mock_channel.on_message.call_args[0][0]
 
         cm = ChannelMessage(
@@ -208,7 +278,7 @@ class TestWireChannelCanonicalContract:
         system.ask = MagicMock(return_value={"content": "ok"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
         handler = mock_channel.on_message.call_args[0][0]
 
         cm = ChannelMessage(
@@ -236,7 +306,7 @@ class TestWireChannelSessionIsolation:
         )
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
         handler = mock_channel.on_message.call_args[0][0]
 
         handler(_make_channel_message(content="111", conversation_id="111"))
@@ -256,7 +326,7 @@ class TestWireChannelSessionIsolation:
         system.ask = MagicMock(return_value={"content": "reply"})
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
         handler = mock_channel.on_message.call_args[0][0]
 
         handler(_make_channel_message(content="first"))
@@ -277,7 +347,7 @@ class TestWireChannelErrorHandling:
         system.ask = MagicMock(side_effect=RuntimeError("boom"))
 
         mock_channel = MagicMock()
-        system.wire_channel(mock_channel)
+        _wire_authorized(system, mock_channel)
         handler = mock_channel.on_message.call_args[0][0]
         handler(_make_channel_message())
 

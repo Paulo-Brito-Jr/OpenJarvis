@@ -4,6 +4,15 @@ use openjarvis_tools::traits::BaseTool;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
+fn security_disabled(tool_name: &str) -> PyResult<String> {
+    Err(PyErr::new::<pyo3::exceptions::PyPermissionError, _>(
+        format!(
+            "Direct '{tool_name}' binding disabled: use an authenticated ToolExecutor \
+             with explicit capability grants and live confirmation"
+        ),
+    ))
+}
+
 #[pyclass(name = "ToolExecutor")]
 pub struct PyToolExecutor {
     pub inner: Arc<openjarvis_tools::ToolExecutor>,
@@ -84,12 +93,8 @@ impl PyFileReadTool {
     }
 
     fn execute(&self, path: &str) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::file_tools::FileReadTool;
-        let params = serde_json::json!({"path": path});
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = path;
+        security_disabled("file_read")
     }
 }
 
@@ -104,12 +109,8 @@ impl PyFileWriteTool {
     }
 
     fn execute(&self, path: &str, content: &str) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::file_tools::FileWriteTool;
-        let params = serde_json::json!({"path": path, "content": content});
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = (path, content);
+        security_disabled("file_write")
     }
 }
 
@@ -125,15 +126,8 @@ impl PyShellExecTool {
 
     #[pyo3(signature = (command, cwd=None))]
     fn execute(&self, command: &str, cwd: Option<&str>) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::shell::ShellExecTool;
-        let mut params = serde_json::json!({"command": command});
-        if let Some(cwd) = cwd {
-            params["cwd"] = serde_json::Value::String(cwd.to_string());
-        }
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = (command, cwd);
+        security_disabled("shell_exec")
     }
 }
 
@@ -149,15 +143,8 @@ impl PyHttpRequestTool {
 
     #[pyo3(signature = (url, method="GET", body=None))]
     fn execute(&self, url: &str, method: &str, body: Option<&str>) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::http_tools::HttpRequestTool;
-        let mut params = serde_json::json!({"url": url, "method": method});
-        if let Some(body) = body {
-            params["body"] = serde_json::Value::String(body.to_string());
-        }
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = (url, method, body);
+        security_disabled("http_request")
     }
 }
 
@@ -173,15 +160,8 @@ impl PyGitStatusTool {
 
     #[pyo3(signature = (cwd=None))]
     fn execute(&self, cwd: Option<&str>) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::git_tools::GitStatusTool;
-        let mut params = serde_json::json!({});
-        if let Some(cwd) = cwd {
-            params["cwd"] = serde_json::Value::String(cwd.to_string());
-        }
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = cwd;
+        security_disabled("git_status")
     }
 }
 
@@ -197,15 +177,8 @@ impl PyGitDiffTool {
 
     #[pyo3(signature = (cwd=None))]
     fn execute(&self, cwd: Option<&str>) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::git_tools::GitDiffTool;
-        let mut params = serde_json::json!({});
-        if let Some(cwd) = cwd {
-            params["cwd"] = serde_json::Value::String(cwd.to_string());
-        }
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = cwd;
+        security_disabled("git_diff")
     }
 }
 
@@ -221,17 +194,7 @@ impl PyGitLogTool {
 
     #[pyo3(signature = (cwd=None, count=None))]
     fn execute(&self, cwd: Option<&str>, count: Option<u32>) -> PyResult<String> {
-        let tool = openjarvis_tools::builtin::git_tools::GitLogTool;
-        let mut params = serde_json::json!({});
-        if let Some(cwd) = cwd {
-            params["cwd"] = serde_json::Value::String(cwd.to_string());
-        }
-        if let Some(count) = count {
-            params["count"] = serde_json::Value::Number(count.into());
-        }
-        let result = tool
-            .execute(&params)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(result.content)
+        let _ = (cwd, count);
+        security_disabled("git_log")
     }
 }

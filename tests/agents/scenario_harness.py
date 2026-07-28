@@ -23,6 +23,7 @@ class FakeSystem:
     tools: list = field(default_factory=list)
     config: Any = None
     session_store: Any = None
+    capability_policy: Any = None
 
 
 @dataclass(slots=True)

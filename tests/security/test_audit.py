@@ -41,7 +41,43 @@ class TestAuditLogger:
         assert results[0].event_type == SecurityEventType.SECRET_DETECTED
         assert len(results[0].findings) == 1
         assert results[0].findings[0].pattern_name == "openai_key"
+        assert "sk-abc123" not in results[0].findings[0].matched_text
         assert results[0].action_taken == "warn"
+        logger.close()
+
+    def test_never_persists_raw_secret_or_pii(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "audit.db"
+        logger = AuditLogger(db_path=db_path)
+        logger.log(
+            SecurityEvent(
+                event_type=SecurityEventType.SECRET_DETECTED,
+                timestamp=time.time(),
+                findings=[
+                    ScanFinding(
+                        pattern_name="token",
+                        matched_text="ghp_abcdefghijklmnopqrstuvwxyz0123456789AB",
+                        threat_level=ThreatLevel.CRITICAL,
+                        start=0,
+                        end=40,
+                    )
+                ],
+                content_preview=(
+                    "Bearer abcdefghijklmnopqrstuvwxyz user@example.com"
+                ),
+                action_taken="blocked token=abcdefghijk",
+            )
+        )
+        raw_db_strings = "\n".join(
+            str(value)
+            for row in logger._conn.execute(
+                "SELECT findings_json, content_preview, action_taken "
+                "FROM security_events"
+            )
+            for value in row
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz" not in raw_db_strings
+        assert "abcdefghijklmnopqrstuvwxyz" not in raw_db_strings
+        assert "user@example.com" not in raw_db_strings
         logger.close()
 
     def test_count(self, tmp_path: Path) -> None:

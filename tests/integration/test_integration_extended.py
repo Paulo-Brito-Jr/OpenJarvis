@@ -14,6 +14,7 @@ from openjarvis.core.types import (
     Message,
     Role,
 )
+from openjarvis.security.capabilities import CapabilityPolicy
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +69,25 @@ def _simple_response(content, model="test-model"):
     }
 
 
+def _bind_tool_agent(agent, agent_id: str):
+    policy = CapabilityPolicy()
+    policy.grant(agent_id, "*", "*")
+    agent.bind_security(policy, agent_id)
+    return agent
+
+
+def _mcp_server(tools):
+    from openjarvis.mcp.server import MCPServer
+
+    policy = CapabilityPolicy()
+    policy.grant("integration-mcp", "*", "*")
+    return MCPServer(
+        tools,
+        capability_policy=policy,
+        agent_id="integration-mcp",
+    )
+
+
 # ---------------------------------------------------------------------------
 # ReAct pipeline integration
 # ---------------------------------------------------------------------------
@@ -97,6 +117,7 @@ class TestReActPipeline:
             tools=[CalculatorTool()],
             bus=bus,
         )
+        _bind_tool_agent(agent, "integration-react-calculator")
         result = agent.run("What is 2+2?")
 
         assert isinstance(result, AgentResult)
@@ -126,6 +147,7 @@ class TestReActPipeline:
             "test-model",
             tools=[ThinkTool()],
         )
+        _bind_tool_agent(agent, "integration-react-think")
         result = agent.run("Analyze this.")
         assert result.turns == 2
         assert result.tool_results[0].success is True
@@ -197,6 +219,7 @@ class TestOpenHandsPipeline:
             "test-model",
             tools=[CodeInterpreterTool()],
         )
+        _bind_tool_agent(agent, "integration-openhands")
         result = agent.run("What is 2+2?")
 
         assert isinstance(result, AgentResult)
@@ -245,13 +268,12 @@ class TestMCPIntegration:
 
     def test_mcp_server_with_all_tools(self):
         from openjarvis.mcp.client import MCPClient
-        from openjarvis.mcp.server import MCPServer
         from openjarvis.mcp.transport import InProcessTransport
         from openjarvis.tools.calculator import CalculatorTool
         from openjarvis.tools.think import ThinkTool
 
         tools = [CalculatorTool(), ThinkTool()]
-        server = MCPServer(tools)
+        server = _mcp_server(tools)
         transport = InProcessTransport(server)
         client = MCPClient(transport)
 
@@ -285,11 +307,10 @@ class TestMCPIntegration:
     def test_mcp_unknown_tool_error(self):
         from openjarvis.mcp.client import MCPClient
         from openjarvis.mcp.protocol import MCPError
-        from openjarvis.mcp.server import MCPServer
         from openjarvis.mcp.transport import InProcessTransport
         from openjarvis.tools.calculator import CalculatorTool
 
-        server = MCPServer([CalculatorTool()])
+        server = _mcp_server([CalculatorTool()])
         client = MCPClient(InProcessTransport(server))
         client.initialize()
 
@@ -301,11 +322,10 @@ class TestMCPIntegration:
     def test_mcp_roundtrip_lifecycle(self):
         """Full lifecycle: init -> list -> call -> result."""
         from openjarvis.mcp.client import MCPClient
-        from openjarvis.mcp.server import MCPServer
         from openjarvis.mcp.transport import InProcessTransport
         from openjarvis.tools.calculator import CalculatorTool
 
-        server = MCPServer([CalculatorTool()])
+        server = _mcp_server([CalculatorTool()])
         client = MCPClient(InProcessTransport(server))
 
         # 1. Initialize
@@ -375,6 +395,10 @@ class TestCrossEngineConsistency:
                 engine,
                 "test-model",
                 tools=[CalculatorTool()],
+            )
+            _bind_tool_agent(
+                agent,
+                f"integration-cross-engine-{engine_name}",
             )
             result = agent.run("What is 3*3?")
             assert result.content == "9"

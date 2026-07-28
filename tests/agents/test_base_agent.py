@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from openjarvis.agents._stubs import (
@@ -12,6 +13,7 @@ from openjarvis.agents._stubs import (
 )
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolCall, ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -62,6 +64,10 @@ class _ConfirmTool(BaseTool):
 
     def execute(self, **params) -> ToolResult:
         return ToolResult(tool_name="confirm", content="confirmed", success=True)
+
+
+class _ExternalDummyTool(_DummyTool):
+    is_local = False
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +314,10 @@ class TestToolUsingAgent:
         events = [e for e in bus.history if e.event_type == EventType.AGENT_TURN_START]
         assert len(events) == 1
 
-    def test_propagates_confirmation_settings_to_executor(self):
+    def test_propagates_confirmation_settings_to_executor(self, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
         engine = MagicMock()
         confirm = MagicMock(return_value=True)
         agent = _ConcreteToolAgent(
@@ -318,6 +327,9 @@ class TestToolUsingAgent:
             interactive=True,
             confirm_callback=confirm,
         )
+        policy = CapabilityPolicy()
+        policy.grant("confirmation-test-agent", "*")
+        agent.bind_security(policy, "confirmation-test-agent")
 
         result = agent._executor.execute(
             ToolCall(id="1", name="confirm", arguments="{}")
@@ -325,3 +337,27 @@ class TestToolUsingAgent:
 
         assert result.success is True
         confirm.assert_called_once()
+
+    def test_security_rebind_clears_stale_boundary_guard(self):
+        engine = MagicMock()
+        policy = CapabilityPolicy()
+        policy.grant("external-agent", "tool:invoke")
+        guard = SimpleNamespace(check_outbound=lambda tool_call: tool_call)
+        agent = _ConcreteToolAgent(
+            engine,
+            "m",
+            tools=[_ExternalDummyTool()],
+        )
+        agent.bind_security(policy, "external-agent", guard)
+        allowed = agent._executor.execute(
+            ToolCall(id="1", name="dummy", arguments="{}")
+        )
+
+        agent.bind_security(policy, "external-agent")
+        denied = agent._executor.execute(
+            ToolCall(id="2", name="dummy", arguments="{}")
+        )
+
+        assert allowed.success is True
+        assert denied.success is False
+        assert "boundary guard unavailable" in denied.content.lower()

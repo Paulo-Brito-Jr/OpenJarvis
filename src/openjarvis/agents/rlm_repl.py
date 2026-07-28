@@ -1,15 +1,13 @@
-"""Sandboxed REPL environment for the RLM agent.
+"""REPL namespace for the RLM agent.
 
-Provides a persistent Python namespace with injected helper functions
+Provides a persistent namespace with injected helper functions
 (``llm_query``, ``llm_batch``, ``FINAL``, ``FINAL_VAR``) that the RLM
-agent's generated code uses to decompose context and make recursive
-sub-LM calls.
+agent's generated code uses.  Code execution is disabled unless the caller
+supplies a verified isolated sandbox executor.
 """
 
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Callable, Dict, List, Optional
 
 # Safe stdlib modules pre-injected into the REPL namespace
@@ -42,7 +40,7 @@ _BLOCKED_PATTERNS = [
 
 
 class RLMRepl:
-    """Sandboxed Python REPL with persistent namespace for the RLM agent.
+    """Persistent RLM namespace backed by an explicit isolated executor.
 
     Parameters
     ----------
@@ -52,6 +50,9 @@ class RLMRepl:
         Callback invoked when REPL code calls ``llm_batch(prompts)``.
     max_output_chars:
         Maximum characters captured from stdout per execution.
+    sandbox_executor:
+        Trusted isolated execution adapter.  Host ``exec`` is never used as a
+        fallback.
     """
 
     def __init__(
@@ -62,11 +63,15 @@ class RLMRepl:
         tool_arg_names: Optional[Dict[str, Optional[str]]] = None,
         *,
         max_output_chars: int = 10000,
+        sandbox_executor: Optional[
+            Callable[[str, Dict[str, Any], int], str]
+        ] = None,
     ) -> None:
         self._max_output_chars = max_output_chars
         self._terminated = False
         self._final_value: Any = None
         self._tool_call_fn = tool_call_fn
+        self._sandbox_executor = sandbox_executor
 
         # Build namespace
         self._namespace: Dict[str, Any] = {}
@@ -201,29 +206,27 @@ class RLMRepl:
         return None
 
     def execute(self, code: str) -> str:
-        """Execute *code* in the persistent namespace and return captured stdout.
-
-        Raises are caught and returned as error strings.
-        """
+        """Execute *code* only through the configured isolated adapter."""
         # Security check
         violation = self.security_check(code)
         if violation is not None:
             return f"Error: {violation}"
 
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
-
+        if self._sandbox_executor is None:
+            return (
+                "Error: RLM REPL disabled because no verified isolated "
+                "sandbox executor is configured."
+            )
         try:
-            with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-                exec(code, self._namespace)  # noqa: S102
+            output = self._sandbox_executor(
+                code,
+                self._namespace,
+                self._max_output_chars,
+            )
         except Exception as exc:
-            error_msg = f"{type(exc).__name__}: {exc}"
-            return error_msg
-
-        output = stdout_buf.getvalue()
-        err_output = stderr_buf.getvalue()
-        if err_output:
-            output += ("\n" if output else "") + err_output
+            return f"{type(exc).__name__}: {exc}"
+        if not isinstance(output, str):
+            return "RuntimeError: isolated sandbox returned a non-string result"
 
         # Truncate if needed
         if len(output) > self._max_output_chars:

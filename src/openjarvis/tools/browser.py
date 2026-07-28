@@ -46,6 +46,12 @@ class _BrowserSession:
 
 _session = _BrowserSession()
 
+_BROWSER_EXECUTION_DISABLED_REASON = (
+    "browser tools are disabled until sessions are isolated per principal and "
+    "every request, redirect, and subresource is protected against DNS "
+    "rebinding and SSRF"
+)
+
 
 # ---------------------------------------------------------------------------
 # Tool 1: BrowserNavigateTool
@@ -58,6 +64,7 @@ class BrowserNavigateTool(BaseTool):
 
     tool_id = "browser_navigate"
     is_local = False
+    execution_disabled_reason = _BROWSER_EXECUTION_DISABLED_REASON
 
     @property
     def spec(self) -> ToolSpec:
@@ -156,6 +163,7 @@ class BrowserClickTool(BaseTool):
 
     tool_id = "browser_click"
     is_local = False
+    execution_disabled_reason = _BROWSER_EXECUTION_DISABLED_REASON
 
     @property
     def spec(self) -> ToolSpec:
@@ -236,6 +244,7 @@ class BrowserTypeTool(BaseTool):
 
     tool_id = "browser_type"
     is_local = False
+    execution_disabled_reason = _BROWSER_EXECUTION_DISABLED_REASON
 
     @property
     def spec(self) -> ToolSpec:
@@ -327,6 +336,7 @@ class BrowserScreenshotTool(BaseTool):
 
     tool_id = "browser_screenshot"
     is_local = False
+    execution_disabled_reason = _BROWSER_EXECUTION_DISABLED_REASON
 
     @property
     def spec(self) -> ToolSpec:
@@ -407,6 +417,7 @@ class BrowserExtractTool(BaseTool):
 
     tool_id = "browser_extract"
     is_local = False
+    execution_disabled_reason = _BROWSER_EXECUTION_DISABLED_REASON
 
     @property
     def spec(self) -> ToolSpec:

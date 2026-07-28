@@ -124,6 +124,7 @@ class RLMAgent(ToolUsingAgent):
         system_prompt: Optional[str] = None,
         interactive: bool = False,
         confirm_callback=None,
+        repl_sandbox_executor=None,
     ) -> None:
         super().__init__(
             engine,
@@ -136,14 +137,12 @@ class RLMAgent(ToolUsingAgent):
             interactive=interactive,
             confirm_callback=confirm_callback,
         )
-        # Override executor: RLM only creates one if tools are provided
-        if not self._tools:
-            self._executor = None  # type: ignore[assignment]
         self._sub_model = sub_model or model
         self._sub_temperature = sub_temperature
         self._sub_max_tokens = sub_max_tokens
         self._max_output_chars = max_output_chars
         self._custom_system_prompt = system_prompt
+        self._repl_sandbox_executor = repl_sandbox_executor
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -157,6 +156,7 @@ class RLMAgent(ToolUsingAgent):
     ) -> AgentResult:
         self._emit_turn_start(input)
 
+        repl_resource = "code:rlm-repl"
         # Build system prompt with tool section
         if self._tools:
             tool_section = (
@@ -186,16 +186,17 @@ class RLMAgent(ToolUsingAgent):
         repl = RLMRepl(
             llm_query_fn=self._make_sub_query,
             llm_batch_fn=self._make_batch_query,
-            tool_call_fn=self._execute_tool_from_repl if self._executor else None,
+            tool_call_fn=self._execute_tool_from_repl if self._tools else None,
             tool_arg_names=self._tool_arg_names(),
             max_output_chars=self._max_output_chars,
+            sandbox_executor=self._repl_sandbox_executor,
         )
 
         # Resolve context and inject into REPL
         ctx_text = self._resolve_context(context)
         if ctx_text:
             repl.set_variable("context", ctx_text)
-        if self._executor is not None:
+        if self._tools:
             repl.set_variable("read_file", self._repl_read_file)
             repl.set_variable("read_file_chunk", self._repl_read_file_chunk)
 
@@ -246,6 +247,41 @@ class RLMAgent(ToolUsingAgent):
                 )
 
             # Execute code in REPL
+            denied = self._executor.authorize(
+                repl_resource,
+                ["code:execute"],
+                tool_name="repl",
+            )
+            if denied is not None:
+                all_tool_results.append(denied)
+                self._emit_turn_end(turns=turns)
+                return AgentResult(
+                    content=denied.content,
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={**total_usage, "security_denied": True},
+                )
+            if self._repl_sandbox_executor is None:
+                disabled = ToolResult(
+                    tool_name="repl",
+                    content=(
+                        "RLM disabled: no verified isolated sandbox executor "
+                        "is configured."
+                    ),
+                    success=False,
+                    metadata={
+                        "security_disabled": True,
+                        "reason": "isolated_sandbox_required",
+                    },
+                )
+                all_tool_results.append(disabled)
+                self._emit_turn_end(turns=turns, error=True)
+                return AgentResult(
+                    content=disabled.content,
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={**total_usage, "security_disabled": True},
+                )
             output = repl.execute(code)
 
             if self._repl_tool_results:

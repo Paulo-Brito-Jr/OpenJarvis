@@ -492,6 +492,9 @@ class ResearchAgent:
         clarify_handler: Optional[Callable[[str], str]] = None,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
         available_sources: Optional[List[str]] = None,
+        capability_policy: Any = None,
+        agent_id: str = "",
+        enabled: bool = True,
     ) -> None:
         self._engine = engine
         self._search = search
@@ -502,10 +505,36 @@ class ResearchAgent:
         self._num_ctx = int(num_ctx)
         self._clarify_handler = clarify_handler or _default_clarify_handler
         self._on_event = on_event
+        self._capability_policy = capability_policy
+        self._agent_id = agent_id.strip() if isinstance(agent_id, str) else ""
+        self._enabled = bool(enabled)
+        if self._enabled and (
+            self._capability_policy is None or not self._agent_id
+        ):
+            raise RuntimeError(
+                "ResearchAgent requires an explicit capability policy and "
+                "agent identity; pass enabled=False to keep it disabled."
+            )
         # Explicit list wins; otherwise we'll discover sources from the
         # KnowledgeStore on each run() call so the prompt stays accurate
         # even as the user connects new connectors mid-session.
         self._available_sources_override = available_sources
+
+    def _authorize(self, capability: str, resource: str) -> None:
+        if not self._enabled:
+            raise PermissionError("ResearchAgent is disabled.")
+        try:
+            allowed = self._capability_policy.check(
+                self._agent_id,
+                capability,
+                resource,
+            )
+        except Exception as exc:
+            raise PermissionError("Research authorization failed.") from exc
+        if not allowed:
+            raise PermissionError(
+                f"Research capability denied: {capability}"
+            )
 
     def _emit(self, event: Dict[str, Any]) -> None:
         """Fire ``self._on_event`` if set; swallow callback errors."""
@@ -546,6 +575,12 @@ class ResearchAgent:
         sources = args.get("sources") or None
         if sources and not isinstance(sources, list):
             sources = [str(sources)]
+        governed_sources = sources or ["*"]
+        for source in governed_sources:
+            self._authorize(
+                "memory:read",
+                f"research:corpus:{source}",
+            )
         limit = int(args.get("limit", 20) or 20)
         limit = max(1, min(limit, 20))
 
@@ -621,6 +656,8 @@ class ResearchAgent:
 
     def run(self, query: str) -> ResearchResult:
         """Run the loop end-to-end and return the synthesis plus a trace."""
+        self._authorize("tool:invoke", "research:planner")
+        self._authorize("memory:read", "research:corpus:*")
         sources_list = self._resolve_available_sources()
         if sources_list:
             sources_blurb = ", ".join(sources_list)

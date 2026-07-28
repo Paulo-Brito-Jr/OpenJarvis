@@ -59,17 +59,34 @@ class TestSetupSecurityEnabled:
         sec = setup_security(_make_config(), engine, bus)
 
         assert isinstance(sec, SecurityContext)
+        assert sec.capability_policy is not None
+        assert sec.capability_policy.enabled is True
+        assert sec.capability_policy._default_deny is True
         # Audit logger should always work (no Rust dependency)
         assert sec.audit_logger is not None
+        assert sec.boundary_guard is not None
+        assert sec.scanners
 
     def test_graceful_without_rust(self) -> None:
-        """Scanners fail gracefully when Rust is unavailable."""
+        """Rust absence uses a real scanner rather than a no-op boundary."""
         engine = _make_mock_engine()
         bus = EventBus()
         sec = setup_security(_make_config(), engine, bus)
 
-        # Should not raise — scanner failure is caught
         assert isinstance(sec, SecurityContext)
+        assert sec.scanners
+        redacted = sec.boundary_guard.scan_outbound(
+            "key sk-abc123def456ghi789jkl012",
+            "external:test",
+        )
+        assert "sk-abc123" not in redacted
+
+    def test_enabled_security_rejects_all_scanners_disabled(self) -> None:
+        cfg = _make_config()
+        cfg.security.secret_scanner = False
+        cfg.security.pii_scanner = False
+        with pytest.raises(RuntimeError, match="every scanner is disabled"):
+            setup_security(cfg, _make_mock_engine(), EventBus())
 
 
 class TestSetupSecurityDisabled:
@@ -78,5 +95,8 @@ class TestSetupSecurityDisabled:
         sec = setup_security(_make_config(enabled=False), engine)
 
         assert sec.engine is engine
-        assert sec.capability_policy is None
+        assert sec.capability_policy is not None
+        assert sec.capability_policy.enabled is False
+        assert not sec.capability_policy.check("", "tool:invoke", "anything")
         assert sec.audit_logger is None
+        assert sec.boundary_guard is None

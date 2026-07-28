@@ -421,7 +421,13 @@ def _cell_lock(out_dir: Path, cell_name: str):
             pass
 
 
-def _build_agent(cell: Dict[str, Any]):
+def _build_agent(
+    cell: Dict[str, Any],
+    *,
+    capability_policy: Any,
+    agent_id: str,
+    boundary_guard: Any,
+):
     """Construct the registered agent for this cell."""
     import openjarvis.agents  # noqa: F401 — populate registry
     from openjarvis.core.registry import AgentRegistry
@@ -437,7 +443,7 @@ def _build_agent(cell: Dict[str, Any]):
     cloud = cell.get("cloud") or {}
     method_cfg = dict(cell.get("method_cfg") or {})
 
-    return agent_cls(
+    agent = agent_cls(
         engine=None,  # raw SDK calls — engine unused
         model=cloud.get("model", ""),
         local_model=local.get("model"),
@@ -445,6 +451,17 @@ def _build_agent(cell: Dict[str, Any]):
         cloud_endpoint=(cloud.get("endpoint") or "anthropic").lower(),
         cfg=method_cfg,
     )
+    if not getattr(agent_cls, "requires_security_context", False):
+        raise RuntimeError(
+            f"Hybrid agent '{method}' does not declare a security boundary"
+        )
+    bind_security = getattr(agent, "bind_security", None)
+    if not callable(bind_security):
+        raise RuntimeError(
+            f"Hybrid agent '{method}' cannot bind the required security policy"
+        )
+    bind_security(capability_policy, agent_id, boundary_guard)
+    return agent
 
 
 def _error_row(task: Dict[str, Any], t0: float, error: str) -> Dict[str, Any]:
@@ -698,6 +715,27 @@ def _run_cell_locked(
     do_score: bool,
     resume: bool,
 ) -> None:
+    from openjarvis.core.config import load_config
+    from openjarvis.security import setup_security
+    from openjarvis.tools._stubs import ToolExecutor
+
+    security = setup_security(load_config(), engine=None)
+    capability_policy = security.capability_policy
+    authorizer = ToolExecutor(
+        [],
+        capability_policy=capability_policy,
+        agent_id=cell_name,
+        boundary_guard=security.boundary_guard,
+    )
+    resource = str(out_dir.resolve(strict=False))
+    denied = authorizer.authorize(
+        resource,
+        ["file:write", "network:fetch", "code:execute"],
+        tool_name="hybrid_runner",
+    )
+    if denied is not None:
+        raise PermissionError(denied.content)
+
     (out_dir / "config.json").write_text(
         json.dumps({"name": cell_name, **cell}, indent=2)
     )
@@ -750,7 +788,12 @@ def _run_cell_locked(
     if task_timeout_s > 0:
         print(f"[task-timeout] {task_timeout_s / 60:.1f}m per task", flush=True)
 
-    agent = _build_agent(cell)
+    agent = _build_agent(
+        cell,
+        capability_policy=capability_policy,
+        agent_id=cell_name,
+        boundary_guard=security.boundary_guard,
+    )
 
     t_start = time.time()
     write_lock = threading.Lock()

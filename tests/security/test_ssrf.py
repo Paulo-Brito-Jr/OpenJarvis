@@ -69,6 +69,36 @@ class TestIsPrivateIp:
         # 0.0.0.0/8 routes to localhost on Linux.
         assert is_private_ip("0.1.2.3") is True
 
+    def test_cgnat_and_tailscale_range_is_private(self):
+        assert is_private_ip("100.64.0.1") is True
+        assert is_private_ip("100.100.100.100") is True
+        assert is_private_ip("100.127.255.254") is True
+        assert is_private_ip("100.128.0.1") is False
+
+    def test_ipv4_special_use_ranges_are_private(self):
+        for value in (
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+        ):
+            assert is_private_ip(value) is True, value
+
+    def test_ipv6_special_use_ranges_are_private(self):
+        for value in (
+            "64:ff9b::8.8.8.8",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:db8::1",
+            "2002:0808:0808::1",
+            "3fff::1",
+            "5f00::1",
+        ):
+            assert is_private_ip(value) is True, value
+
     def test_multicast_and_broadcast_blocked(self):
         assert is_private_ip("239.0.0.1") is True
         assert is_private_ip("255.255.255.255") is True
@@ -154,6 +184,15 @@ class TestCheckSsrf:
                 (2, 1, 6, "", ("10.0.0.5", 0)),
             ]
             result = _check_ssrf_python("https://evil-rebind.example.com")
+        assert result is not None
+        assert "private IP" in result
+
+    def test_blocks_dns_resolution_to_tailscale_address(self):
+        with patch("openjarvis.security.ssrf.socket.getaddrinfo") as mock_dns:
+            mock_dns.return_value = [
+                (2, 1, 6, "", ("100.100.100.100", 0)),
+            ]
+            result = _check_ssrf_python("https://tailnet-rebind.example.com")
         assert result is not None
         assert "private IP" in result
 

@@ -1,13 +1,14 @@
 """The three SkillOrchestra tools: search, enhance_reasoning (code), answer.
 
 Faithful port of ``orchestration/eval_frames.py:call_tool`` — same worker
-prompts, same extraction, same Python subprocess execution. Two deltas,
-both forced by the OpenJarvis environment and documented inline:
+prompts and extraction. Security deltas forced by the OpenJarvis environment:
 
 * ``search`` — the original POSTs to a FAISS wiki retriever service. We
-  honor ``method_cfg.retriever_url`` and POST the exact same payload when
-  it's set; with no retriever configured we fall back to Anthropic's
-  server-side ``web_search`` tool so the stage still grounds.
+  route configured retrievers through the SSRF-safe HTTP transport; with no
+  retriever configured we fall back to provider-side web search.
+* ``enhance_reasoning`` — generated Python is retained for inspection but is
+  never executed on the host. A verified isolated sandbox adapter is required
+  before execution can be re-enabled.
 * in-tool correctness check — the original ``answer`` tool LLM-judges the
   prediction against the gold answer inside ``call_tool``. OpenJarvis
   scores with its own harness judge downstream, so we only return the
@@ -16,11 +17,10 @@ both forced by the OpenJarvis environment and documented inline:
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
+import json
 from typing import Any, Dict, List, Optional
+
+from openjarvis.tools.http_request import HttpRequestTool
 
 from .._base import (
     GEMINI_SEARCH_COST_PER_CALL,
@@ -155,12 +155,19 @@ def run_code(
     problem: str,
     bash_timeout_s: int = 60,
 ) -> Dict[str, Any]:
-    """Generate self-contained Python with ``spec``, execute it, return stdout.
+    """Generate self-contained Python without executing it on the host.
 
-    Mirrors the original worker prompt and ``subprocess.run(['python', ...],
-    timeout=60)`` verbatim. Execution failures yield empty ``exec_result``
-    rather than raising — the orchestrator learns the model can't code.
+    The historical implementation passed model-authored source directly to
+    the host Python interpreter. Capability checks cannot make that an
+    isolation boundary, so execution remains disabled until a verified
+    sandbox adapter is wired.
     """
+    del bash_timeout_s
+    agent._require_action(
+        "code:skillorchestra",
+        ["code:execute"],
+        tool_name="skillorchestra_code",
+    )
     prompt = (
         context_str.strip()
         + "\n\n"
@@ -182,20 +189,11 @@ def run_code(
         generated_code = text.split("```python")[-1].split("```")[0]
 
     exec_result = ""
-    if generated_code.strip():
-        with tempfile.TemporaryDirectory() as td:
-            code_path = Path(td) / "exec_code.py"
-            code_path.write_text(generated_code)
-            try:
-                proc = subprocess.run(
-                    [sys.executable, str(code_path)],
-                    timeout=bash_timeout_s,
-                    capture_output=True,
-                    text=True,
-                )
-                exec_result = proc.stdout
-            except Exception:
-                exec_result = ""
+    security_disabled = bool(generated_code.strip())
+    if security_disabled:
+        exec_result = (
+            "[execution disabled: verified isolated sandbox executor required]"
+        )
     return {
         "tool": "enhance_reasoning",
         "model": spec.model,
@@ -207,6 +205,7 @@ def run_code(
         "tokens_out": c,
         "cost_usd": cost,
         "is_local": spec.is_local,
+        "security_disabled": security_disabled,
     }
 
 
@@ -337,27 +336,56 @@ def run_search(
 
     contents: List[str] = []
     search_uses = 0
-
     if search_backend == "tavily":
-        res = tavily_search_context(query, max_results=tavily_max_results)
+        res = tavily_search_context(
+            query,
+            max_results=tavily_max_results,
+            action_authorizer=agent._action_authorizer,
+        )
         contents.append(res["text"])
         search_uses = int(res["n_searches"])
         cost += float(res["cost_usd"])
     elif retriever_url:
-        # Faithful path — the original FAISS retriever service.
-        import requests
-
+        # Route retriever POSTs through the hardened HTTP transport so DNS
+        # pinning and every redirect receive an SSRF check. Scan model-authored
+        # query text before it crosses the boundary.
+        endpoint = f"{retriever_url.rstrip('/')}/retrieve"
+        agent._require_action(
+            endpoint,
+            ["network:fetch", "network:mutate"],
+            tool_name="skillorchestra_retriever",
+        )
+        confirmation_denied = agent._action_authorizer.confirm_action(
+            "skillorchestra_retriever",
+            {"url": endpoint, "method": "POST"},
+        )
+        if confirmation_denied is not None:
+            raise PermissionError(confirmation_denied.content)
+        guarded_query = agent._action_authorizer.guard_outbound_content(
+            query[:390],
+            endpoint,
+        )
         payload = {
-            "queries": [query[:390]],
+            "queries": [guarded_query],
             "topk": topk,
             "return_scores": True,
         }
         try:
-            results = requests.post(
-                f"{retriever_url.rstrip('/')}/retrieve",
-                json=payload,
-                timeout=120,
-            ).json()
+            response = HttpRequestTool().execute(
+                url=endpoint,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(payload),
+                timeout=60,
+            )
+            if not response.success:
+                raise RuntimeError(response.content)
+            status_code = int(response.metadata.get("status_code", 0))
+            if not 200 <= status_code < 300:
+                raise RuntimeError(
+                    f"retriever returned HTTP status {status_code}"
+                )
+            results = json.loads(response.content)
             for r in results[0]:
                 doc = r.get("document", {})
                 if "content" in doc:
@@ -395,6 +423,7 @@ def run_search(
                     temperature=1.0,
                     tools=[build_web_search_tool(web_search_max_uses)],
                     max_turns=4,
+                    action_authorizer=agent._action_authorizer,
                 )
                 ws_cost_per_call = WEB_SEARCH_COST_PER_CALL
             elif endpoint == "openai":
@@ -404,6 +433,7 @@ def run_search(
                     max_tokens=4096,
                     temperature=1.0,
                     max_turns=4,
+                    action_authorizer=agent._action_authorizer,
                 )
                 ws_cost_per_call = OPENAI_WEB_SEARCH_COST_PER_CALL
             else:  # gemini
@@ -413,6 +443,7 @@ def run_search(
                     max_tokens=4096,
                     temperature=1.0,
                     max_turns=4,
+                    action_authorizer=agent._action_authorizer,
                 )
                 ws_cost_per_call = GEMINI_SEARCH_COST_PER_CALL
             contents.append(ws_text)
@@ -421,6 +452,8 @@ def run_search(
             search_uses = n_searches
             cost += agent.cost_usd(agent._cloud_model, wp, wc)
             cost += n_searches * ws_cost_per_call
+        except PermissionError:
+            raise
         except Exception as exc:  # noqa: BLE001
             contents.append(f"[web_search error: {exc}]")
 

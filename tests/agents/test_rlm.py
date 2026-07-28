@@ -2,18 +2,52 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import io
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.rlm import RLMAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _isolated_test_executor(code, namespace, max_output_chars):
+    """Test double for a sandbox transport; production never uses host exec."""
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    try:
+        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+            exec(code, namespace)  # noqa: S102
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    output = stdout_buf.getvalue()
+    err_output = stderr_buf.getvalue()
+    if err_output:
+        output += ("\n" if output else "") + err_output
+    if len(output) > max_output_chars:
+        output = output[:max_output_chars] + "\n... (output truncated)"
+    return output
+
+
+@pytest.fixture(autouse=True)
+def _inject_isolated_test_executor(monkeypatch):
+    original = RLMAgent.__init__
+
+    def secured_init(self, *args, **kwargs):
+        kwargs.setdefault("repl_sandbox_executor", _isolated_test_executor)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(RLMAgent, "__init__", secured_init)
 
 
 class _CalcStub(BaseTool):
@@ -92,6 +126,21 @@ def _make_engine(content: str = "Final answer.") -> MagicMock:
         "finish_reason": "stop",
     }
     return engine
+
+
+def _allow_test_tools(agent):
+    policy = CapabilityPolicy()
+    policy.grant("rlm-test-agent", "*")
+    agent.bind_security(policy, "rlm-test-agent")
+    return agent
+
+
+def _allow_repl(agent):
+    policy = CapabilityPolicy()
+    policy.grant("rlm-test-agent", "tool:invoke", "code:rlm-repl")
+    policy.grant("rlm-test-agent", "code:execute", "code:rlm-repl")
+    agent.bind_security(policy, "rlm-test-agent")
+    return agent
 
 
 def _make_engine_with_code(
@@ -191,7 +240,7 @@ class TestRLMFinalTermination:
             "model": "test-model",
             "finish_reason": "stop",
         }
-        agent = RLMAgent(engine, "test-model")
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
         result = agent.run("Test")
         assert result.content == "hello world"
         assert len(result.tool_results) == 1
@@ -206,7 +255,7 @@ class TestRLMFinalTermination:
             "model": "test-model",
             "finish_reason": "stop",
         }
-        agent = RLMAgent(engine, "test-model")
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
         result = agent.run("Test")
         assert result.content == "42"
 
@@ -260,7 +309,7 @@ class TestRLMSubLMCalls:
                 "finish_reason": "stop",
             },
         ]
-        agent = RLMAgent(engine, "test-model")
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
         result = agent.run("Calculate")
         assert result.content == "4"
         # engine.generate should be called at least twice (root + sub)
@@ -296,7 +345,7 @@ class TestRLMMultiTurn:
                 "finish_reason": "stop",
             },
         ]
-        agent = RLMAgent(engine, "test-model")
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
         result = agent.run("Calculate")
         assert result.content == "20"
         assert result.turns == 2
@@ -312,7 +361,7 @@ class TestRLMMultiTurn:
             "model": "test-model",
             "finish_reason": "stop",
         }
-        agent = RLMAgent(engine, "test-model", max_turns=3)
+        agent = _allow_repl(RLMAgent(engine, "test-model", max_turns=3))
         result = agent.run("Loop")
         assert result.turns == 3
         assert result.metadata.get("max_turns_exceeded") is True
@@ -327,7 +376,7 @@ class TestRLMMultiTurn:
             "model": "test-model",
             "finish_reason": "stop",
         }
-        agent = RLMAgent(engine, "test-model", max_turns=2)
+        agent = _allow_repl(RLMAgent(engine, "test-model", max_turns=2))
         result = agent.run("Work")
         assert result.content == "partial"
         assert result.metadata.get("max_turns_exceeded") is True
@@ -353,7 +402,7 @@ class TestRLMEventBus:
             "model": "test-model",
             "finish_reason": "stop",
         }
-        agent = RLMAgent(engine, "test-model", bus=bus)
+        agent = _allow_repl(RLMAgent(engine, "test-model", bus=bus))
         agent.run("Test")
         event_types = [e.event_type for e in bus.history]
         assert EventType.AGENT_TURN_START in event_types
@@ -409,7 +458,7 @@ class TestRLMSubLMWithTools:
                 "finish_reason": "stop",
             },
         ]
-        agent = RLMAgent(engine, "test-model", tools=[_CalcStub()])
+        agent = _allow_test_tools(RLMAgent(engine, "test-model", tools=[_CalcStub()]))
         result = agent.run("Calculate")
         assert result.content == "The answer is 4."
 
@@ -437,6 +486,7 @@ class TestRLMDirectToolBridge:
             }
         ]
         agent = RLMAgent(engine, "test-model", tools=[_FileReadStub()])
+        agent = _allow_test_tools(agent)
         result = agent.run("Read Cargo")
         assert result.content == "read ok"
         assert any(tr.tool_name == "file_read" for tr in result.tool_results)
@@ -466,6 +516,7 @@ class TestRLMDirectToolBridge:
             }
         ]
         agent = RLMAgent(engine, "test-model", tools=[_FileReadStub()])
+        agent = _allow_test_tools(agent)
         result = agent.run("Read file head")
         assert result.content == "line1\nline2\n"
         assert any(tr.tool_name == "file_read" for tr in result.tool_results)
@@ -491,6 +542,7 @@ class TestRLMDirectToolBridge:
             }
         ]
         agent = RLMAgent(engine, "test-model", tools=[_FileReadStub()])
+        agent = _allow_test_tools(agent)
         result = agent.run("Read file chunk")
         assert result.content == "line2\nline3\nline4\n"
         assert any(tr.tool_name == "file_read" for tr in result.tool_results)
@@ -524,7 +576,7 @@ class TestRLMBlockedCode:
                 "finish_reason": "stop",
             },
         ]
-        agent = RLMAgent(engine, "test-model")
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
         result = agent.run("Test")
         assert result.content == "I apologize, let me answer directly."
         # The blocked code should produce a failed tool result
@@ -569,8 +621,92 @@ class TestRLMReplResults:
             "model": "test-model",
             "finish_reason": "stop",
         }
-        agent = RLMAgent(engine, "test-model")
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
         result = agent.run("Test")
         assert len(result.tool_results) == 1
         assert result.tool_results[0].tool_name == "rlm_repl"
         assert "hello" in result.tool_results[0].content
+
+
+class TestRLMSecurityBoundary:
+    def test_missing_isolated_sandbox_denies_before_host_execution(self):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {
+            "content": "```python\nFINAL('must not execute')\n```",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        agent = RLMAgent(
+            engine,
+            "test-model",
+            repl_sandbox_executor=None,
+        )
+        agent = _allow_repl(agent)
+
+        with patch(
+            "openjarvis.agents.rlm.RLMRepl.execute",
+            autospec=True,
+        ) as execute:
+            result = agent.run("Test")
+
+        execute.assert_not_called()
+        assert result.metadata["security_disabled"] is True
+        assert "isolated sandbox" in result.content
+
+    def test_missing_policy_denies_before_repl_execution(self):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {
+            "content": "```python\nFINAL('must not execute')\n```",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        agent = RLMAgent(engine, "test-model")
+
+        with patch(
+            "openjarvis.agents.rlm.RLMRepl.execute",
+            autospec=True,
+        ) as execute:
+            result = agent.run("Test")
+
+        execute.assert_not_called()
+        assert result.metadata["security_denied"] is True
+        assert result.tool_results[0].tool_name == "repl"
+        assert result.tool_results[0].success is False
+        assert "policy unavailable" in result.content.lower()
+
+    def test_missing_code_capability_denies_before_repl_execution(self):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {
+            "content": "```python\nFINAL('must not execute')\n```",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        policy = CapabilityPolicy()
+        policy.grant("rlm-test-agent", "tool:invoke", "code:rlm-repl")
+        agent = RLMAgent(engine, "test-model")
+        agent.bind_security(policy, "rlm-test-agent")
+
+        with patch(
+            "openjarvis.agents.rlm.RLMRepl.execute",
+            autospec=True,
+        ) as execute:
+            result = agent.run("Test")
+
+        execute.assert_not_called()
+        assert result.metadata["security_denied"] is True
+        assert "code:execute" in result.content
+
+    def test_minimal_repl_grants_allow_execution(self):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {
+            "content": "```python\nFINAL('authorized')\n```",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
+
+        result = agent.run("Test")
+
+        assert result.content == "authorized"
+        assert result.tool_results[0].tool_name == "rlm_repl"
+        assert result.tool_results[0].success is True
