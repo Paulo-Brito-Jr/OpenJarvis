@@ -134,6 +134,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         normalized_method = method.upper()
         if normalized_method in {"GET", "HEAD"}:
             sensitive_reads = (
+                # Keep the narrower schedule rule before the digest prefix so
+                # reading schedule configuration cannot inherit memory access.
+                ("/api/digest/schedule", "schedule:create"),
+                # Future digest read routes remain private by default.
+                ("/api/digest", "memory:read"),
                 ("/v1/memory", "memory:read"),
                 ("/v1/traces", "memory:read"),
                 ("/v1/sessions", "memory:read"),
