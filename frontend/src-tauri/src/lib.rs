@@ -10,6 +10,11 @@ const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
 const OPENJARVIS_API_KEY_NAME: &str = "OPENJARVIS_API_KEY";
 const OPENJARVIS_API_PRINCIPAL: &str = "api:l99-desktop";
+const SKYNET_L99_READ_TOKEN_NAMES: &[&str] = &[
+    "SKYNET_JARVIS_CASA_READ_TOKEN",
+    "SKYNET_JARVIS_AGENDA_READ_TOKEN",
+    "SKYNET_JARVIS_FROTA_READ_TOKEN",
+];
 const DESKTOP_UV_SYNC_COMMAND: &str =
     "uv sync --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
 
@@ -2146,6 +2151,7 @@ async fn submit_savings(
 // ---------------------------------------------------------------------------
 
 const SECURE_KEY_SERVICE: &str = "OpenJarvis Cloud Keys";
+const SHADOW_READ_TOKEN_SERVICE: &str = "OpenJarvis L99 Shadow Keys";
 const MANAGED_CLOUD_KEY_NAMES: &[&str] = &[
     OPENJARVIS_API_KEY_NAME,
     "OPENAI_API_KEY",
@@ -2166,16 +2172,24 @@ fn legacy_cloud_keys_path() -> std::path::PathBuf {
 }
 
 fn validate_cloud_key_name(key_name: &str) -> Result<(), String> {
-    let valid = !key_name.is_empty()
+    let valid_api_key = !key_name.is_empty()
         && key_name.len() <= 128
         && key_name.ends_with("_API_KEY")
         && key_name
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
-    if valid {
+    if valid_api_key {
         Ok(())
     } else {
-        Err(format!("Invalid API key name: {}", key_name))
+        Err(format!("Invalid secure key name: {}", key_name))
+    }
+}
+
+fn validate_shadow_read_token_name(key_name: &str) -> Result<(), String> {
+    if SKYNET_L99_READ_TOKEN_NAMES.contains(&key_name) {
+        Ok(())
+    } else {
+        Err(format!("Invalid L99 shadow read token name: {}", key_name))
     }
 }
 
@@ -2247,6 +2261,39 @@ fn secure_store_set(key_name: &str, key_value: &str) -> Result<(), String> {
     entry
         .set_password(key_value)
         .map_err(|err| format!("Failed to save {} in secure key storage: {}", key_name, err))
+}
+
+fn shadow_secure_store_get(key_name: &str) -> Result<Option<String>, String> {
+    validate_shadow_read_token_name(key_name)?;
+    let entry = keyring::Entry::new(SHADOW_READ_TOKEN_SERVICE, key_name)
+        .map_err(|err| format!("Failed to open L99 shadow storage for {}: {}", key_name, err))?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(format!(
+            "Failed to read {} from L99 shadow storage: {}",
+            key_name, err
+        )),
+    }
+}
+
+fn shadow_secure_store_set(key_name: &str, key_value: &str) -> Result<(), String> {
+    validate_shadow_read_token_name(key_name)?;
+    let entry = keyring::Entry::new(SHADOW_READ_TOKEN_SERVICE, key_name)
+        .map_err(|err| format!("Failed to open L99 shadow storage for {}: {}", key_name, err))?;
+    if key_value.is_empty() {
+        return match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(format!(
+                "Failed to remove {} from L99 shadow storage: {}",
+                key_name, err
+            )),
+        };
+    }
+    entry
+        .set_password(key_value)
+        .map_err(|err| format!("Failed to save {} in L99 shadow storage: {}", key_name, err))
 }
 
 fn configured_local_api_key() -> Result<Option<String>, String> {
@@ -2350,13 +2397,35 @@ async fn save_cloud_key(key_name: String, key_value: String) -> Result<(), Strin
     let key_value = key_value.trim().to_string();
     secure_store_set(&key_name, &key_value)?;
 
-    // Tell the running server to hot-reload its cloud engine so the user
-    // doesn't need to restart the app after entering an API key.
+    // Only provider API keys belong in the cloud-reload endpoint. The local
+    // bearer key is inherited by the next normal desktop server process.
     if key_name != OPENJARVIS_API_KEY_NAME {
         reload_cloud_keys(vec![(key_name, key_value)]).await;
     }
 
     Ok(())
+}
+
+/// Save one of the three exact read-only shadow bindings.
+///
+/// These credentials use a distinct Keychain service and are never returned
+/// by `read_cloud_keys`, injected into normal desktop autostart, or hot-reloaded.
+#[tauri::command]
+async fn save_shadow_read_token(key_name: String, key_value: String) -> Result<(), String> {
+    shadow_secure_store_set(&key_name, key_value.trim())
+}
+
+/// Report shadow binding presence without exposing credential values.
+#[tauri::command]
+fn get_shadow_read_token_status() -> Result<serde_json::Value, String> {
+    let status: Vec<serde_json::Value> = SKYNET_L99_READ_TOKEN_NAMES
+        .iter()
+        .map(|key| {
+            let set = matches!(shadow_secure_store_get(key), Ok(Some(value)) if !value.is_empty());
+            serde_json::json!({ "key": key, "set": set })
+        })
+        .collect();
+    Ok(serde_json::json!(status))
 }
 
 /// Load the local server API key into ephemeral WebView memory at startup.
@@ -3096,8 +3165,10 @@ pub fn run() {
             pull_ollama_model,
             delete_ollama_model,
             save_cloud_key,
+            save_shadow_read_token,
             get_local_api_key,
             get_cloud_key_status,
+            get_shadow_read_token_status,
             get_inference_source,
             set_inference_source,
             toggle_overlay,
@@ -3128,8 +3199,10 @@ mod tests {
         format_uv_sync_spawn_error, matching_installed_model, model_names_match, normalize_host,
         local_speech_endpoint, parse_inference_config, parse_ollama_model_names,
         preferred_installed_model, should_persist_resolved_model, startup_installed_model,
-        upsert_engine_host, uv_sync_stderr_tail, validate_wav_upload, InferenceConfig, SourceKind,
+        upsert_engine_host, uv_sync_stderr_tail, validate_cloud_key_name,
+        validate_shadow_read_token_name, validate_wav_upload, InferenceConfig, SourceKind,
         DESKTOP_UV_SYNC_COMMAND, MANAGED_CLOUD_KEY_NAMES, OPENJARVIS_API_KEY_NAME,
+        SHADOW_READ_TOKEN_SERVICE, SKYNET_L99_READ_TOKEN_NAMES,
     };
     use std::path::Path;
 
@@ -3517,6 +3590,26 @@ mod tests {
     #[test]
     fn local_server_api_key_is_managed_in_secure_storage() {
         assert!(MANAGED_CLOUD_KEY_NAMES.contains(&OPENJARVIS_API_KEY_NAME));
+    }
+
+    #[test]
+    fn l99_secure_storage_accepts_only_the_three_read_tokens() {
+        for key_name in SKYNET_L99_READ_TOKEN_NAMES {
+            assert!(!MANAGED_CLOUD_KEY_NAMES.contains(key_name));
+            assert!(validate_cloud_key_name(key_name).is_err());
+            assert!(validate_shadow_read_token_name(key_name).is_ok());
+        }
+
+        for denied in [
+            "SKYNET_JARVIS_CASA_ACTION_TOKEN",
+            "SKYNET_JARVIS_REMINDER_PLAN_TOKEN",
+            "ARBITRARY_TOKEN",
+            "lowercase_TOKEN",
+        ] {
+            assert!(validate_cloud_key_name(denied).is_err(), "{denied}");
+            assert!(validate_shadow_read_token_name(denied).is_err(), "{denied}");
+        }
+        assert_ne!(SHADOW_READ_TOKEN_SERVICE, super::SECURE_KEY_SERVICE);
     }
 
     #[test]
