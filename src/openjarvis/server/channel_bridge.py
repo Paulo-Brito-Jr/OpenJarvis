@@ -126,10 +126,7 @@ class ChannelBridge:
             grants = self._capability_policy.list_grants(principal)
             explicitly_granted = any(
                 fnmatch.fnmatch(capability, grant.capability)
-                and (
-                    grant.pattern == "*"
-                    or fnmatch.fnmatch(resource, grant.pattern)
-                )
+                and (grant.pattern == "*" or fnmatch.fnmatch(resource, grant.pattern))
                 for grant in grants
             )
             if not explicitly_granted:

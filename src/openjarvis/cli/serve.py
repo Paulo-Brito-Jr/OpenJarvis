@@ -335,8 +335,7 @@ def serve(
                         for t in mcp_tools:
                             if t.spec.name in existing:
                                 raise RuntimeError(
-                                    "Duplicate tool name rejected: "
-                                    f"{t.spec.name}"
+                                    f"Duplicate tool name rejected: {t.spec.name}"
                                 )
                             tools.append(t)
                             existing.add(t.spec.name)
@@ -646,8 +645,7 @@ def serve(
                 "multi-process claims are available"
             )
             console.print(
-                "  Scheduler: [yellow]disabled "
-                "(durable claims pending)[/yellow]"
+                "  Scheduler: [yellow]disabled (durable claims pending)[/yellow]"
             )
         except Exception as exc:
             logger.debug("Agent scheduler init failed: %s", exc)

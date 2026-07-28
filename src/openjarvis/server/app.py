@@ -168,9 +168,7 @@ def create_app(
     app.state.api_key = api_key
     app.state.api_principal = api_principal.strip()
     app.state.api_principal_allowlist = frozenset(
-        value.strip()
-        for value in (api_principal_allowlist or set())
-        if value.strip()
+        value.strip() for value in (api_principal_allowlist or set()) if value.strip()
     )
 
     needs_security = agent is not None and bool(

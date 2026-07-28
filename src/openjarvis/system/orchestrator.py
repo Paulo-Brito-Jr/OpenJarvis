@@ -20,9 +20,7 @@ class _ScopedCapabilityPolicy:
     def __init__(self, policy: Any, capabilities: List[str]) -> None:
         self._policy = policy
         self._capabilities = frozenset(capabilities)
-        self.enabled = bool(
-            policy is not None and getattr(policy, "enabled", True)
-        )
+        self.enabled = bool(policy is not None and getattr(policy, "enabled", True))
 
     def check(self, agent_id: str, capability: str, resource: str = "") -> bool:
         if (
@@ -268,16 +266,12 @@ class QueryOrchestrator:
             if tool_names is not None:
                 declared = set(tool_names)
                 digest_tools = [
-                    tool
-                    for tool in digest_tools
-                    if tool.spec.name in declared
+                    tool for tool in digest_tools if tool.spec.name in declared
                 ]
             existing = agent_kwargs.get("tools", [])
             existing_names = {tool.spec.name for tool in existing}
             agent_kwargs["tools"] = list(existing) + [
-                tool
-                for tool in digest_tools
-                if tool.spec.name not in existing_names
+                tool for tool in digest_tools if tool.spec.name not in existing_names
             ]
 
         # Filter compatibility kwargs using the concrete constructor
@@ -319,9 +313,7 @@ class QueryOrchestrator:
             # this invocation.  Binding the agent's display name here would
             # let an unprivileged sender inherit service-level grants.
             security_principal = (
-                agent_name
-                if effective_operator_id is None
-                else effective_operator_id
+                agent_name if effective_operator_id is None else effective_operator_id
             )
             try:
                 from openjarvis.agents.executor import _bind_agent_security
@@ -344,8 +336,7 @@ class QueryOrchestrator:
                 )
                 return {
                     "content": (
-                        f"Agent '{agent_name}' cannot bind a valid security "
-                        "principal."
+                        f"Agent '{agent_name}' cannot bind a valid security principal."
                     ),
                     "error": True,
                 }

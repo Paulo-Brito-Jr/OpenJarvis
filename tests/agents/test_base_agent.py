@@ -354,9 +354,7 @@ class TestToolUsingAgent:
         )
 
         agent.bind_security(policy, "external-agent")
-        denied = agent._executor.execute(
-            ToolCall(id="2", name="dummy", arguments="{}")
-        )
+        denied = agent._executor.execute(ToolCall(id="2", name="dummy", arguments="{}"))
 
         assert allowed.success is True
         assert denied.success is False

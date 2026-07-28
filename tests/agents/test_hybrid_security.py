@@ -177,9 +177,7 @@ def test_tavily_uses_boundary_guard_output(monkeypatch):
     )
     authorizer = _web_search_authorizer(grant_network=True)
     authorizer.bind_boundary_guard(
-        SimpleNamespace(
-            scan_outbound=lambda content, destination: "[REDACTED]"
-        )
+        SimpleNamespace(scan_outbound=lambda content, destination: "[REDACTED]")
     )
 
     tavily_search_context(
@@ -447,9 +445,7 @@ def test_hybrid_trace_requires_file_write_before_paradigm(tmp_path):
     agent.bind_security(policy, "hybrid-agent", _PassBoundaryGuard())
     run_paradigm = MagicMock(return_value=("safe answer", {}))
     agent._run_paradigm = run_paradigm
-    context = AgentContext(
-        metadata={"log_dir": str(tmp_path), "task_id": "task-1"}
-    )
+    context = AgentContext(metadata={"log_dir": str(tmp_path), "task_id": "task-1"})
 
     result = agent.run("private input", context)
 
@@ -474,9 +470,7 @@ def test_hybrid_trace_rejects_task_id_traversal_before_paradigm(tmp_path):
     agent.bind_security(policy, "hybrid-agent", _PassBoundaryGuard())
     run_paradigm = MagicMock(return_value=("safe answer", {}))
     agent._run_paradigm = run_paradigm
-    context = AgentContext(
-        metadata={"log_dir": str(tmp_path), "task_id": "../escaped"}
-    )
+    context = AgentContext(metadata={"log_dir": str(tmp_path), "task_id": "../escaped"})
 
     result = agent.run("private input", context)
 
@@ -498,12 +492,8 @@ def test_hybrid_trace_writes_only_to_authorized_canonical_path(tmp_path):
     policy.grant("hybrid-agent", "code:execute", resource)
     policy.grant("hybrid-agent", "file:write", str(target))
     agent.bind_security(policy, "hybrid-agent", _PassBoundaryGuard())
-    agent._run_paradigm = MagicMock(
-        return_value=("safe answer", {"turns": 1})
-    )
-    context = AgentContext(
-        metadata={"log_dir": str(tmp_path), "task_id": "task-1"}
-    )
+    agent._run_paradigm = MagicMock(return_value=("safe answer", {"turns": 1}))
+    context = AgentContext(metadata={"log_dir": str(tmp_path), "task_id": "task-1"})
 
     result = agent.run("private input", context)
 
@@ -591,8 +581,7 @@ def test_skillorchestra_retriever_uses_ssrf_safe_transport_and_dlp(
         )
 
     monkeypatch.setattr(
-        "openjarvis.agents.hybrid.skillorchestra.tools."
-        "HttpRequestTool.execute",
+        "openjarvis.agents.hybrid.skillorchestra.tools.HttpRequestTool.execute",
         safe_http_execute,
     )
     action_authorizer = SimpleNamespace(
@@ -640,8 +629,7 @@ def test_skillorchestra_retriever_uses_ssrf_safe_transport_and_dlp(
 def test_skillorchestra_retriever_requires_central_confirmation(monkeypatch):
     http_execute = MagicMock()
     monkeypatch.setattr(
-        "openjarvis.agents.hybrid.skillorchestra.tools."
-        "HttpRequestTool.execute",
+        "openjarvis.agents.hybrid.skillorchestra.tools.HttpRequestTool.execute",
         http_execute,
     )
     denied = ToolResult(

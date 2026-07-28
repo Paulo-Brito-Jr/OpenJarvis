@@ -140,10 +140,7 @@ def _base_url(environ: Mapping[str, str]) -> str:
         or not _HOST_RE.fullmatch(hostname)
         or ".." in hostname
         or any(
-            not label
-            or len(label) > 63
-            or label.startswith("-")
-            or label.endswith("-")
+            not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
             for label in hostname.split(".")
         )
         or (port is not None and not 1 <= port <= 65_535)
@@ -302,9 +299,7 @@ class _SkynetBoundaryTool(BaseTool):
 
         failure_metadata: dict[str, Any] = {"error_code": "request_failed"}
         if outcome_unknown_on_failure:
-            failure_metadata.update(
-                {"outcome": "unknown", "reconcile_required": True}
-            )
+            failure_metadata.update({"outcome": "unknown", "reconcile_required": True})
 
         try:
             with httpx.Client(
@@ -578,10 +573,7 @@ class SkynetFrotaReadTool(_SkynetBoundaryTool):
 
     def execute(self, **params: Any) -> ToolResult:
         host = params.get("host", "all")
-        if (
-            not _only_keys(params, frozenset({"host"}))
-            or host not in _FLEET_HOSTS
-        ):
+        if not _only_keys(params, frozenset({"host"})) or host not in _FLEET_HOSTS:
             return _invalid(self.tool_id)
         return self._request(method="GET", query={"host": host})
 
@@ -676,9 +668,7 @@ class SkynetCasaActionStatusTool(_SkynetCasaActionTool):
             description="Read the status of one exact physical-action approval.",
             parameters={
                 "type": "object",
-                "properties": {
-                    "approval_id": {"type": "string", "format": "uuid"}
-                },
+                "properties": {"approval_id": {"type": "string", "format": "uuid"}},
                 "required": ["approval_id"],
                 "additionalProperties": False,
             },
@@ -698,9 +688,8 @@ class SkynetCasaActionStatusTool(_SkynetCasaActionTool):
 
     def execute(self, **params: Any) -> ToolResult:
         approval_id = params.get("approval_id")
-        if (
-            not _only_keys(params, frozenset({"approval_id"}))
-            or not _valid_uuid(approval_id)
+        if not _only_keys(params, frozenset({"approval_id"})) or not _valid_uuid(
+            approval_id
         ):
             return _invalid(self.tool_id)
         return self._request(
@@ -759,9 +748,7 @@ class SkynetCasaExecuteActionTool(_SkynetCasaActionTool):
         if (
             not _only_keys(
                 params,
-                frozenset(
-                    {"approval_id", "desired_state", "idempotency_key"}
-                ),
+                frozenset({"approval_id", "desired_state", "idempotency_key"}),
             )
             or not _valid_uuid(approval_id)
             or desired_state not in _DESIRED_STATES

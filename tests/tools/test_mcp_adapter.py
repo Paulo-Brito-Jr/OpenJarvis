@@ -148,10 +148,7 @@ class TestMCPToolProvider:
     def test_discovered_tool_execution(self, client):
         provider = _provider(client)
         tools = provider.discover()
-        calc = next(
-            t for t in tools
-            if t.spec.name == "mcp__test_server__calculator"
-        )
+        calc = next(t for t in tools if t.spec.name == "mcp__test_server__calculator")
         result = calc.execute(expression="3*7")
         assert result.success is True
         assert "21" in result.content
@@ -168,10 +165,7 @@ class TestMCPAdapterRoundTrip:
         provider = _provider(client)
         tools = provider.discover()
 
-        calc = next(
-            t for t in tools
-            if t.spec.name == "mcp__test_server__calculator"
-        )
+        calc = next(t for t in tools if t.spec.name == "mcp__test_server__calculator")
         result = calc.execute(expression="10+20")
         assert result.success is True
         assert "30" in result.content

@@ -99,13 +99,9 @@ def test_sensitive_agent_reads_require_system_admin() -> None:
 
 
 def test_oauth_callback_uses_state_instead_of_bearer_auth() -> None:
-    assert not AuthMiddleware._requires_auth(
-        "/v1/connectors/gdrive/oauth/callback"
-    )
+    assert not AuthMiddleware._requires_auth("/v1/connectors/gdrive/oauth/callback")
     assert AuthMiddleware._requires_auth("/v1/connectors/gdrive/oauth/start")
-    assert AuthMiddleware._requires_auth(
-        "/v1/connectors/gdrive/oauth/callback/extra"
-    )
+    assert AuthMiddleware._requires_auth("/v1/connectors/gdrive/oauth/callback/extra")
 
 
 def test_default_allow_is_not_an_explicit_external_grant() -> None:

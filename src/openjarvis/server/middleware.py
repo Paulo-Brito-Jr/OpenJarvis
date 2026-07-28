@@ -28,10 +28,7 @@ class RequestBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = {
-            key.lower(): value
-            for key, value in scope.get("headers", [])
-        }
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
         raw_length = headers.get(b"content-length")
         if raw_length is not None:
             try:

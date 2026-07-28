@@ -156,9 +156,7 @@ class TaskScheduler:
         except Exception as exc:
             raise PermissionError("Scheduler authorization failed") from exc
         if not allowed:
-            raise PermissionError(
-                f"Scheduler capability denied: {capability}"
-            )
+            raise PermissionError(f"Scheduler capability denied: {capability}")
 
     @staticmethod
     def _validate_consent(
@@ -188,9 +186,7 @@ class TaskScheduler:
             consent.get("scope") != "recurring"
             or consent.get("allow_replay") is not True
         ):
-            raise PermissionError(
-                "Recurring schedules require explicit replay consent"
-            )
+            raise PermissionError("Recurring schedules require explicit replay consent")
         expires_at = consent.get("expires_at")
         if not isinstance(expires_at, str) or not expires_at:
             raise PermissionError("Recurring scheduler consent must expire")
@@ -274,9 +270,8 @@ class TaskScheduler:
         task_id = kwargs.get("task_id")
         if task_id is None:
             task_id = uuid.uuid4().hex[:16]
-        if (
-            not isinstance(task_id, str)
-            or not re.fullmatch(r"[A-Za-z0-9:_-]{1,128}", task_id)
+        if not isinstance(task_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9:_-]{1,128}", task_id
         ):
             raise ValueError("Scheduled task ID is invalid")
         raw_tools = kwargs.get("tools", "")
@@ -493,8 +488,7 @@ class TaskScheduler:
                 or claimed.get("claim_token") != claim_token
             ):
                 logger.warning(
-                    "Scheduler task %s claim ownership is invalid; "
-                    "execution skipped",
+                    "Scheduler task %s claim ownership is invalid; execution skipped",
                     task.id,
                 )
                 return
@@ -514,21 +508,16 @@ class TaskScheduler:
 
         try:
             self._validate_consent(task.schedule_type, task.consent)
-            if (
-                "schedule:create" not in task.capabilities
-                or not all(
-                    isinstance(capability, str)
-                    and re.fullmatch(
-                        r"[A-Za-z][A-Za-z0-9_.-]*:"
-                        r"[A-Za-z][A-Za-z0-9_.-]*",
-                        capability,
-                    )
-                    for capability in task.capabilities
+            if "schedule:create" not in task.capabilities or not all(
+                isinstance(capability, str)
+                and re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_.-]*:"
+                    r"[A-Za-z][A-Za-z0-9_.-]*",
+                    capability,
                 )
+                for capability in task.capabilities
             ):
-                raise PermissionError(
-                    "Scheduled task capability snapshot is invalid"
-                )
+                raise PermissionError("Scheduled task capability snapshot is invalid")
             # The scheduler-management grant is checked against the schedule
             # resource. Other snapshot capabilities are enforced against the
             # real tool/provider resource by QueryOrchestrator's scoped policy.
@@ -553,9 +542,7 @@ class TaskScheduler:
                     )
                     for tool_name in tools_list
                 ):
-                    raise PermissionError(
-                        "Scheduled task tool snapshot is invalid"
-                    )
+                    raise PermissionError("Scheduled task tool snapshot is invalid")
                 ask_kwargs: Dict[str, Any] = {
                     "agent": task.agent,
                     # An explicit empty list means no tools. Never expand an
@@ -698,9 +685,7 @@ class TaskScheduler:
                     "One-time schedule must be an ISO 8601 datetime"
                 ) from exc
             if target.tzinfo is None or target.utcoffset() is None:
-                raise ValueError(
-                    "One-time schedule must include an explicit timezone"
-                )
+                raise ValueError("One-time schedule must include an explicit timezone")
             return target.astimezone(timezone.utc).isoformat()
 
         if schedule_type == "cron":
@@ -777,9 +762,8 @@ class TaskScheduler:
         # strictly-after-now semantics.
         candidate = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
         for _ in range(24 * 60 + 1):
-            if (
-                (target_minute is None or candidate.minute == target_minute)
-                and (target_hour is None or candidate.hour == target_hour)
+            if (target_minute is None or candidate.minute == target_minute) and (
+                target_hour is None or candidate.hour == target_hour
             ):
                 return candidate.isoformat()
             candidate += timedelta(minutes=1)

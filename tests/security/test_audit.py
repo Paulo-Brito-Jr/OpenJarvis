@@ -61,9 +61,7 @@ class TestAuditLogger:
                         end=40,
                     )
                 ],
-                content_preview=(
-                    "Bearer abcdefghijklmnopqrstuvwxyz user@example.com"
-                ),
+                content_preview=("Bearer abcdefghijklmnopqrstuvwxyz user@example.com"),
                 action_taken="blocked token=abcdefghijk",
             )
         )

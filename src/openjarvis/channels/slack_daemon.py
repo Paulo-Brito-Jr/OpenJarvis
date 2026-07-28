@@ -194,8 +194,7 @@ def start_slack_daemon(
     Returns the PID of the spawned process.
     """
     raise RuntimeError(
-        "Slack daemon is disabled; credentials will not be placed in "
-        "process arguments"
+        "Slack daemon is disabled; credentials will not be placed in process arguments"
     )
 
 

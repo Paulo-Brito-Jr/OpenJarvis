@@ -41,10 +41,7 @@ def test_paste_limit_is_checked_before_store_creation(client):
 
 def test_file_count_limit_is_checked_before_parsing(client):
     test_client, store = client
-    files = [
-        ("files", (f"{index}.txt", b"safe", "text/plain"))
-        for index in range(9)
-    ]
+    files = [("files", (f"{index}.txt", b"safe", "text/plain")) for index in range(9)]
 
     response = test_client.post(
         "/v1/connectors/upload/ingest/files",

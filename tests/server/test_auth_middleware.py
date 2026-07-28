@@ -106,9 +106,7 @@ class TestAuthMiddleware:
         from openjarvis.security.capabilities import CapabilityPolicy
 
         denied_policy = CapabilityPolicy()
-        denied = TestClient(
-            _make_app("oj_sk_test123", capability_policy=denied_policy)
-        )
+        denied = TestClient(_make_app("oj_sk_test123", capability_policy=denied_policy))
         denied_response = denied.post(
             "/v1/models/pull",
             headers={"Authorization": "Bearer oj_sk_test123"},

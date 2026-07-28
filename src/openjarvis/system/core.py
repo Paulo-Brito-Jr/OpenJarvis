@@ -71,15 +71,10 @@ def _explicit_channel_grant(
         grants = policy.list_grants(principal)
         has_grant = any(
             fnmatch.fnmatchcase("tool:invoke", grant.capability)
-            and (
-                grant.pattern == "*"
-                or fnmatch.fnmatchcase(resource, grant.pattern)
-            )
+            and (grant.pattern == "*" or fnmatch.fnmatchcase(resource, grant.pattern))
             for grant in grants
         )
-        return has_grant and bool(
-            policy.check(principal, "tool:invoke", resource)
-        )
+        return has_grant and bool(policy.check(principal, "tool:invoke", resource))
     except Exception:
         return False
 
@@ -267,9 +262,7 @@ class JarvisSystem:
                 "Generic channel wiring requires an explicit sender allowlist"
             )
         if self.capability_policy is None:
-            raise RuntimeError(
-                "Generic channel wiring requires a capability policy"
-            )
+            raise RuntimeError("Generic channel wiring requires a capability policy")
 
         if self.session_store is None:
             from pathlib import Path

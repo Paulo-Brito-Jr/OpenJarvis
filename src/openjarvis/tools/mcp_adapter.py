@@ -19,9 +19,7 @@ _MAX_MCP_RESULT_CHARS = 1_048_576
 def validate_mcp_namespace(namespace: str) -> str:
     """Validate a stable namespace used in model-visible MCP tool names."""
     if not isinstance(namespace, str) or not _NAMESPACE_RE.fullmatch(namespace):
-        raise ValueError(
-            "MCP namespace must match ^[a-z][a-z0-9_]{0,31}$"
-        )
+        raise ValueError("MCP namespace must match ^[a-z][a-z0-9_]{0,31}$")
     return namespace
 
 
@@ -114,9 +112,7 @@ class MCPToolAdapter(BaseTool):
                     "mcp_namespace": self._namespace,
                     "remote_tool": self._remote_name,
                     "truncated": truncated,
-                    **external_taint(
-                        f"mcp:{self._namespace}:{self._remote_name}"
-                    ),
+                    **external_taint(f"mcp:{self._namespace}:{self._remote_name}"),
                 },
             )
         except Exception:

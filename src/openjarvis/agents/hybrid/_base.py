@@ -108,9 +108,7 @@ def _require_action_authorized(
     if action_authorizer is None:
         action_authorizer = _current_action_authorizer()
     if action_authorizer is None:
-        raise PermissionError(
-            "Capability policy unavailable; tool execution denied."
-        )
+        raise PermissionError("Capability policy unavailable; tool execution denied.")
     denied = action_authorizer.authorize(
         resource,
         required_capabilities,
@@ -132,8 +130,7 @@ def _guard_provider_text(
         action_authorizer = _current_action_authorizer()
     if action_authorizer is None:
         raise PermissionError(
-            "Capability policy and boundary guard unavailable; "
-            "outbound content denied."
+            "Capability policy and boundary guard unavailable; outbound content denied."
         )
     return action_authorizer.guard_outbound_content(content, destination)
 
@@ -610,11 +607,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="anthropic_sdk",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://api.anthropic.com",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.anthropic.com",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -719,11 +719,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="openai_sdk",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://api.openai.com",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.openai.com",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -832,11 +835,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="openrouter_sdk",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://openrouter.ai/api/v1",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://openrouter.ai/api/v1",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -936,11 +942,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="gemini_sdk",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://generativelanguage.googleapis.com",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://generativelanguage.googleapis.com",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -1118,11 +1127,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="anthropic_sdk",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://api.anthropic.com",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.anthropic.com",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -1274,11 +1286,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="web_search",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://api.openai.com",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.openai.com",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -1426,11 +1441,14 @@ class LocalCloudAgent(BaseAgent):
             ["network:fetch"],
             tool_name="web_search",
         )
-        user = _guard_provider_text(
-            action_authorizer,
-            user,
-            "https://generativelanguage.googleapis.com",
-        ) or ""
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://generativelanguage.googleapis.com",
+            )
+            or ""
+        )
         system = _guard_provider_text(
             action_authorizer,
             system,
@@ -1787,28 +1805,20 @@ class LocalCloudAgent(BaseAgent):
             return None
         task_id = context.metadata.get("task_id")
         if not isinstance(log_dir, (str, os.PathLike)):
-            raise PermissionError(
-                "Trace configuration invalid; execution denied."
-            )
+            raise PermissionError("Trace configuration invalid; execution denied.")
         raw_dir = Path(log_dir).expanduser()
         if not raw_dir.is_absolute():
-            raise PermissionError(
-                "Trace configuration invalid; execution denied."
-            )
+            raise PermissionError("Trace configuration invalid; execution denied.")
         if (
             not isinstance(task_id, str)
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id)
             or task_id in {".", ".."}
         ):
-            raise PermissionError(
-                "Trace configuration invalid; execution denied."
-            )
+            raise PermissionError("Trace configuration invalid; execution denied.")
         out_dir = raw_dir.resolve(strict=False)
         target = (out_dir / f"{task_id}.json").resolve(strict=False)
         if target.parent != out_dir:
-            raise PermissionError(
-                "Trace configuration invalid; execution denied."
-            )
+            raise PermissionError("Trace configuration invalid; execution denied.")
         return target
 
     @abstractmethod

@@ -683,9 +683,7 @@ def _get_mcp_tools(app_state: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     try:
         from openjarvis.mcp.loader import load_mcp_tools_from_config
 
-        discovered, mcp_clients = load_mcp_tools_from_config(
-            app_config.tools.mcp
-        )
+        discovered, mcp_clients = load_mcp_tools_from_config(app_config.tools.mcp)
     except Exception as exc:
         # Cache the failure as an empty, non-executable surface so repeated
         # requests cannot observe a partially loaded/ambiguous tool set.
@@ -1516,10 +1514,7 @@ def create_agent_manager_router(
     @agents_router.get("")
     async def list_agents():
         return {
-            "agents": [
-                project_managed_agent(agent)
-                for agent in manager.list_agents()
-            ]
+            "agents": [project_managed_agent(agent) for agent in manager.list_agents()]
         }
 
     @agents_router.post("")
@@ -1688,8 +1683,7 @@ def create_agent_manager_router(
             not isinstance(allowed_senders, list)
             or not allowed_senders
             or not all(
-                isinstance(sender, str) and sender.strip()
-                for sender in allowed_senders
+                isinstance(sender, str) and sender.strip() for sender in allowed_senders
             )
         ):
             raise HTTPException(
@@ -2156,12 +2150,7 @@ def create_agent_manager_router(
             for a in all_agents
             if a["status"] in ("error", "needs_attention", "stalled", "budget_exceeded")
         ]
-        return {
-            "agents": [
-                project_managed_agent(agent)
-                for agent in error_agents
-            ]
-        }
+        return {"agents": [project_managed_agent(agent) for agent in error_agents]}
 
     @global_router.get("/v1/agents/health")
     def agents_health():

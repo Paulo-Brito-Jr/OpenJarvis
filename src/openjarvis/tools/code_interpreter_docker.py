@@ -134,9 +134,7 @@ class DockerCodeInterpreterTool(BaseTool):
                 init=True,
                 ipc_mode="none",
                 # Writable scratch space, but never executable or device-backed.
-                tmpfs={
-                    "/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777"
-                },
+                tmpfs={"/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777"},
                 stderr=True,
                 stdout=True,
             )

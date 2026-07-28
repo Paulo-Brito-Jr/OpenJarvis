@@ -433,19 +433,14 @@ class TestChatCompletions:
             "/v1/chat/completions",
             json={
                 "model": "test-model",
-                "messages": [
-                    {"role": "user", "content": "x"}
-                    for _ in range(129)
-                ],
+                "messages": [{"role": "user", "content": "x"} for _ in range(129)],
             },
         )
         oversized = client.post(
             "/v1/chat/completions",
             json={
                 "model": "test-model",
-                "messages": [
-                    {"role": "user", "content": "x" * 65_537}
-                ],
+                "messages": [{"role": "user", "content": "x" * 65_537}],
             },
         )
         excessive_tokens = client.post(

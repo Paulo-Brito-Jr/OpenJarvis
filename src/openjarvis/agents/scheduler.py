@@ -113,9 +113,7 @@ class AgentScheduler:
                     "Managed agent interval must be a positive number"
                 ) from exc
             if not math.isfinite(interval) or interval <= 0:
-                raise ValueError(
-                    "Managed agent interval must be a positive number"
-                )
+                raise ValueError("Managed agent interval must be a positive number")
             next_fire = now + interval
         elif schedule_type == "manual":
             next_fire = float("inf")  # Manual: never auto-fires

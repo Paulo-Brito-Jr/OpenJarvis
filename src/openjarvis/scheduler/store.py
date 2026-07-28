@@ -150,9 +150,7 @@ class SchedulerStore:
         cursor = self._conn.execute(_UPSERT_TASK, self._task_values(task))
         if cursor.rowcount != 1:
             self._conn.rollback()
-            raise PermissionError(
-                "Scheduled task ID is owned by another operator"
-            )
+            raise PermissionError("Scheduled task ID is owned by another operator")
         self._conn.commit()
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:

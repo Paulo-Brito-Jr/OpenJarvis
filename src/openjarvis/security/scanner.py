@@ -56,6 +56,7 @@ def _redact_with_patterns(
         redacted = pattern.sub(f"[REDACTED:{name}]", redacted)
     return redacted
 
+
 # ---------------------------------------------------------------------------
 # SecretScanner
 # ---------------------------------------------------------------------------

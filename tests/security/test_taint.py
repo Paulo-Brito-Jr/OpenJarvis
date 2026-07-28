@@ -258,10 +258,7 @@ class TestToolExecutorTaintSerialization:
             ToolCall(
                 id="1",
                 name="web_search",
-                arguments=(
-                    '{"query":"do not send",'
-                    '"_taint":{"labels":["secret"]}}'
-                ),
+                arguments=('{"query":"do not send","_taint":{"labels":["secret"]}}'),
             )
         )
 
@@ -307,10 +304,7 @@ class TestToolExecutorTaintSerialization:
             ToolCall(
                 id="1",
                 name="web_search",
-                arguments=(
-                    '{"query":"do not send",'
-                    '"_taint":{"labels":["unknown"]}}'
-                ),
+                arguments=('{"query":"do not send","_taint":{"labels":["unknown"]}}'),
             )
         )
 
@@ -345,8 +339,7 @@ class TestToolExecutorTaintSerialization:
                 id="1",
                 name="web_search",
                 arguments=(
-                    '{"query":"public result",'
-                    '"_taint":{"labels":["external"]}}'
+                    '{"query":"public result","_taint":{"labels":["external"]}}'
                 ),
             )
         )

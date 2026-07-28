@@ -230,9 +230,7 @@ class ToolExecutor:
                 content=f"Unknown tool: {tool_call.name}",
                 success=False,
             )
-        disabled_reason = str(
-            getattr(tool, "execution_disabled_reason", "")
-        ).strip()
+        disabled_reason = str(getattr(tool, "execution_disabled_reason", "")).strip()
         if disabled_reason:
             return ToolResult(
                 tool_name=tool_call.name,
@@ -245,10 +243,7 @@ class ToolExecutor:
         try:
             if len(tool_call.arguments) > _MAX_TOOL_ARGUMENT_BYTES:
                 raise ValueError("arguments exceed the 256 KiB limit")
-            if (
-                len(tool_call.arguments.encode("utf-8"))
-                > _MAX_TOOL_ARGUMENT_BYTES
-            ):
+            if len(tool_call.arguments.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES:
                 raise ValueError("arguments exceed the 256 KiB limit")
             params = json.loads(tool_call.arguments) if tool_call.arguments else {}
             self._validate_argument_shape(params)
@@ -513,11 +508,7 @@ class ToolExecutor:
             has_live_tty = bool(sys.stdin.isatty())
         except Exception:
             has_live_tty = False
-        if (
-            not self._interactive
-            or self._confirm_callback is None
-            or not has_live_tty
-        ):
+        if not self._interactive or self._confirm_callback is None or not has_live_tty:
             return ToolResult(
                 tool_name=tool_name,
                 content=(
@@ -537,9 +528,7 @@ class ToolExecutor:
             )
             return ToolResult(
                 tool_name=tool_name,
-                content=(
-                    f"Tool '{tool_name}' confirmation failed; execution denied."
-                ),
+                content=(f"Tool '{tool_name}' confirmation failed; execution denied."),
                 success=False,
             )
         if confirmed is not True:

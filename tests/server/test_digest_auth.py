@@ -96,12 +96,14 @@ def test_digest_get_route_inventory_requires_capabilities(tmp_path):
 
     assert get_paths == set(_DIGEST_READ_CAPABILITIES)
     for path in get_paths:
-        assert AuthMiddleware._required_capability(
-            "GET", path
-        ) == _DIGEST_READ_CAPABILITIES[path]
-        assert AuthMiddleware._required_capability(
-            "HEAD", path
-        ) == _DIGEST_READ_CAPABILITIES[path]
+        assert (
+            AuthMiddleware._required_capability("GET", path)
+            == _DIGEST_READ_CAPABILITIES[path]
+        )
+        assert (
+            AuthMiddleware._required_capability("HEAD", path)
+            == _DIGEST_READ_CAPABILITIES[path]
+        )
 
 
 @pytest.mark.parametrize(

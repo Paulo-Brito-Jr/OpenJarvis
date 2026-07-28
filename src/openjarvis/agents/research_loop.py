@@ -508,9 +508,7 @@ class ResearchAgent:
         self._capability_policy = capability_policy
         self._agent_id = agent_id.strip() if isinstance(agent_id, str) else ""
         self._enabled = bool(enabled)
-        if self._enabled and (
-            self._capability_policy is None or not self._agent_id
-        ):
+        if self._enabled and (self._capability_policy is None or not self._agent_id):
             raise RuntimeError(
                 "ResearchAgent requires an explicit capability policy and "
                 "agent identity; pass enabled=False to keep it disabled."
@@ -532,9 +530,7 @@ class ResearchAgent:
         except Exception as exc:
             raise PermissionError("Research authorization failed.") from exc
         if not allowed:
-            raise PermissionError(
-                f"Research capability denied: {capability}"
-            )
+            raise PermissionError(f"Research capability denied: {capability}")
 
     def _emit(self, event: Dict[str, Any]) -> None:
         """Fire ``self._on_event`` if set; swallow callback errors."""

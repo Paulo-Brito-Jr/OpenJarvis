@@ -52,9 +52,10 @@ def test_digest_collect_executes():
         "memory:read",
         "network:fetch",
     }
-    assert tool.authorization_resource(
-        {"sources": ["gmail", "gcalendar", "gmail"]}
-    ) == "connectors:gcalendar,gmail"
+    assert (
+        tool.authorization_resource({"sources": ["gmail", "gcalendar", "gmail"]})
+        == "connectors:gcalendar,gmail"
+    )
 
 
 def test_digest_collect_missing_connector():

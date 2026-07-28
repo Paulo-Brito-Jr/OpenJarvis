@@ -220,11 +220,7 @@ class TraceCollector:
                 step_type=StepType.RETRIEVE,
                 timestamp=event.timestamp,
                 duration_seconds=event.data.get("latency", 0.0),
-                input={
-                    "query": redact_sensitive_text(
-                        event.data.get("query", "")
-                    )
-                },
+                input={"query": redact_sensitive_text(event.data.get("query", ""))},
                 output={
                     "num_results": event.data.get("num_results", 0),
                 },

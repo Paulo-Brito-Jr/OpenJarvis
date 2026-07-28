@@ -382,9 +382,7 @@ def run_search(
                 raise RuntimeError(response.content)
             status_code = int(response.metadata.get("status_code", 0))
             if not 200 <= status_code < 300:
-                raise RuntimeError(
-                    f"retriever returned HTTP status {status_code}"
-                )
+                raise RuntimeError(f"retriever returned HTTP status {status_code}")
             results = json.loads(response.content)
             for r in results[0]:
                 doc = r.get("document", {})

@@ -64,9 +64,7 @@ def load_mcp_tools_from_config(
     except (json.JSONDecodeError, TypeError) as exc:
         raise RuntimeError("Failed to parse MCP servers config") from exc
     if not isinstance(server_list, list):
-        raise RuntimeError(
-            "MCP servers config must be a JSON array"
-        )
+        raise RuntimeError("MCP servers config must be a JSON array")
 
     # Imported lazily so that `openjarvis.mcp.loader` can be imported
     # cheaply from CLI startup paths without dragging in the heavy MCP
@@ -85,9 +83,7 @@ def load_mcp_tools_from_config(
 
     try:
         for server_cfg in server_list:
-            cfg = (
-                json.loads(server_cfg) if isinstance(server_cfg, str) else server_cfg
-            )
+            cfg = json.loads(server_cfg) if isinstance(server_cfg, str) else server_cfg
             if not isinstance(cfg, dict):
                 raise RuntimeError("Each MCP server config must be an object")
             name = validate_mcp_namespace(cfg.get("name", ""))
@@ -105,9 +101,7 @@ def load_mcp_tools_from_config(
             if not isinstance(args, list) or not all(
                 isinstance(arg, str) for arg in args
             ):
-                raise RuntimeError(
-                    f"MCP server '{name}' args must be a string array"
-                )
+                raise RuntimeError(f"MCP server '{name}' args must be a string array")
 
             if url:
                 from urllib.parse import urlsplit
@@ -148,8 +142,7 @@ def load_mcp_tools_from_config(
                 discovered = [
                     tool
                     for tool in discovered
-                    if tool.spec.metadata["mcp"]["remote_name"]
-                    not in exclude_tools
+                    if tool.spec.metadata["mcp"]["remote_name"] not in exclude_tools
                 ]
             if allowed_names:
                 discovered = [
@@ -157,16 +150,13 @@ def load_mcp_tools_from_config(
                     for tool in discovered
                     if (
                         tool.spec.name in allowed_names
-                        or tool.spec.metadata["mcp"]["remote_name"]
-                        in allowed_names
+                        or tool.spec.metadata["mcp"]["remote_name"] in allowed_names
                     )
                 ]
 
             for tool in discovered:
                 if tool.spec.name in seen_tools:
-                    raise RuntimeError(
-                        f"Duplicate MCP tool name: {tool.spec.name}"
-                    )
+                    raise RuntimeError(f"Duplicate MCP tool name: {tool.spec.name}")
                 seen_tools.add(tool.spec.name)
                 tools.append(tool)
             logger.info(

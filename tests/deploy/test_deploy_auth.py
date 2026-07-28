@@ -60,10 +60,7 @@ def test_skynet_l99_policy_is_narrow_and_default_deny_compatible():
     assert agent["agent_id"] == "orchestrator"
     assert set(agent) == {"agent_id", "grants", "deny"}
 
-    grants = {
-        (grant["capability"], grant["pattern"])
-        for grant in agent["grants"]
-    }
+    grants = {(grant["capability"], grant["pattern"]) for grant in agent["grants"]}
     assert ("tool:invoke", "skynet://*") in grants
     assert ("network:fetch", "skynet://*") in grants
     assert (
@@ -74,10 +71,7 @@ def test_skynet_l99_policy_is_narrow_and_default_deny_compatible():
         capability in {"code:execute", "file:write", "channel:send"}
         for capability, _ in grants
     )
-    assert not any(
-        pattern in {"*", "http://*", "https://*"}
-        for _, pattern in grants
-    )
+    assert not any(pattern in {"*", "http://*", "https://*"} for _, pattern in grants)
 
 
 @pytest.mark.parametrize(

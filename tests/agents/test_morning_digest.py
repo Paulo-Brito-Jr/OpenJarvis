@@ -87,9 +87,7 @@ def test_morning_digest_stops_before_inference_and_storage_when_collect_denied(
     with (
         patch.object(agent._executor, "authorize", return_value=None),
         patch.object(agent._executor, "execute", return_value=failed_collect),
-        patch(
-            "openjarvis.agents.morning_digest.DigestStore"
-        ) as digest_store,
+        patch("openjarvis.agents.morning_digest.DigestStore") as digest_store,
     ):
         result = agent.run("Generate morning digest")
 
@@ -113,9 +111,7 @@ def test_morning_digest_denies_store_before_collect_or_inference(tmp_path):
 
     with (
         patch.object(agent._executor, "execute") as execute,
-        patch(
-            "openjarvis.agents.morning_digest.DigestStore"
-        ) as digest_store,
+        patch("openjarvis.agents.morning_digest.DigestStore") as digest_store,
     ):
         result = agent.run("Generate morning digest")
 

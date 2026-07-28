@@ -119,9 +119,9 @@ class TestSkillTraceTaggingEndToEnd:
         assert len(tool_steps) >= 1, "Should have captured at least one tool step"
 
         first = tool_steps[0]
-        assert (
-            first.metadata.get("skill") == "my-skill"
-        ), f"Expected metadata.skill='my-skill', got {first.metadata!r}"
+        assert first.metadata.get("skill") == "my-skill", (
+            f"Expected metadata.skill='my-skill', got {first.metadata!r}"
+        )
         assert first.metadata.get("skill_source") == "openclaw"
         assert first.metadata.get("skill_kind") == "instructional"
 
@@ -186,9 +186,9 @@ class TestEventMetadataIsJsonSafe:
 
         # And the internal _taint key must NOT be present (it would have
         # been the offender if json.dumps had failed)
-        assert (
-            "_taint" not in captured
-        ), f"_taint key leaked into event metadata: {captured!r}"
+        assert "_taint" not in captured, (
+            f"_taint key leaked into event metadata: {captured!r}"
+        )
 
     def test_skill_metadata_still_present_after_filtering(self):
         """The JSON-safe filter must NOT drop legitimate skill metadata."""

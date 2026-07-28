@@ -22,9 +22,7 @@ def _valid_glob_pattern(pattern: str) -> bool:
     differently in Python and Rust can turn a fallback into an authorization
     bypass, so malformed policy patterns invalidate the policy fail-closed.
     """
-    return bool(pattern) and not any(
-        char in pattern for char in _UNSUPPORTED_GLOB_META
-    )
+    return bool(pattern) and not any(char in pattern for char in _UNSUPPORTED_GLOB_META)
 
 
 def _glob_match(pattern: str, text: str) -> bool:

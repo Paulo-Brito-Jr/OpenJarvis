@@ -176,9 +176,7 @@ class TestToolExecutor:
     def test_execute_rejects_deeply_nested_arguments(self):
         executor = _permitted_executor([_EchoTool()])
         nested = '{"value":' * 21 + "null" + "}" * 21
-        result = executor.execute(
-            ToolCall(id="1", name="echo", arguments=nested)
-        )
+        result = executor.execute(ToolCall(id="1", name="echo", arguments=nested))
         assert result.success is False
         assert "nested too deeply" in result.content
 

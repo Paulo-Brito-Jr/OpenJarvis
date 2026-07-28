@@ -40,9 +40,7 @@ _AGENT_EVENTS = {
 _EVENT_FIELD_ALLOWLIST: dict[EventType, frozenset[str]] = {
     EventType.AGENT_TICK_START: frozenset({"agent_id", "agent_name"}),
     EventType.AGENT_TICK_END: frozenset({"agent_id", "duration", "status"}),
-    EventType.AGENT_TICK_ERROR: frozenset(
-        {"agent_id", "duration", "error_type"}
-    ),
+    EventType.AGENT_TICK_ERROR: frozenset({"agent_id", "duration", "error_type"}),
     EventType.AGENT_BUDGET_EXCEEDED: frozenset(
         {
             "agent_id",
@@ -56,16 +54,10 @@ _EVENT_FIELD_ALLOWLIST: dict[EventType, frozenset[str]] = {
         {"agent_id", "last_activity_at", "stall_retries"}
     ),
     EventType.AGENT_MESSAGE_RECEIVED: frozenset({"agent_id", "source"}),
-    EventType.AGENT_CHECKPOINT_SAVED: frozenset(
-        {"agent_id", "checkpoint_id"}
-    ),
+    EventType.AGENT_CHECKPOINT_SAVED: frozenset({"agent_id", "checkpoint_id"}),
     EventType.TOOL_CALL_START: frozenset({"tool", "agent"}),
-    EventType.TOOL_CALL_END: frozenset(
-        {"tool", "agent", "success", "latency"}
-    ),
-    EventType.INFERENCE_START: frozenset(
-        {"model", "engine", "agent", "message_count"}
-    ),
+    EventType.TOOL_CALL_END: frozenset({"tool", "agent", "success", "latency"}),
+    EventType.INFERENCE_START: frozenset({"model", "engine", "agent", "message_count"}),
     EventType.INFERENCE_END: frozenset(
         {"model", "agent", "finish_reason", "latency", "usage"}
     ),
@@ -120,10 +112,7 @@ def _project_event(event: Event) -> dict[str, Any] | None:
         event.timestamp
         if isinstance(event.timestamp, (int, float))
         and not isinstance(event.timestamp, bool)
-        and (
-            not isinstance(event.timestamp, float)
-            or math.isfinite(event.timestamp)
-        )
+        and (not isinstance(event.timestamp, float) or math.isfinite(event.timestamp))
         else 0.0
     )
     return {
@@ -185,13 +174,10 @@ def create_ws_router(event_bus: EventBus) -> Any:
                 (),
             ),
         )
-        authorized = (
-            authenticated
-            and websocket_capability_authorized(
-                websocket,
-                "system:admin",
-                "/v1/agents/events",
-            )
+        authorized = authenticated and websocket_capability_authorized(
+            websocket,
+            "system:admin",
+            "/v1/agents/events",
         )
         if not authorized:
             # 1008 = policy violation; reject before accepting the connection.

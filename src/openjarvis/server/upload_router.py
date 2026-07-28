@@ -268,10 +268,7 @@ async def ingest_files(
                 break
             file_bytes += len(chunk)
             total_bytes += len(chunk)
-            if (
-                file_bytes > _MAX_FILE_BYTES
-                or total_bytes > _MAX_TOTAL_UPLOAD_BYTES
-            ):
+            if file_bytes > _MAX_FILE_BYTES or total_bytes > _MAX_TOTAL_UPLOAD_BYTES:
                 raise HTTPException(
                     status_code=413,
                     detail="Uploaded files exceed the configured size limits.",

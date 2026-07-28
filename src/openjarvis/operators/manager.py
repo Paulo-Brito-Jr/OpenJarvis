@@ -149,9 +149,7 @@ class OperatorManager:
         scheduler = self._system.scheduler
         if scheduler is None:
             raise RuntimeError("TaskScheduler not available.")
-        principal, _capabilities, _consent = (
-            self._require_scheduler_authorization()
-        )
+        principal, _capabilities, _consent = self._require_scheduler_authorization()
         task_id = f"operator:{operator_id}"
         try:
             scheduler.cancel_task(task_id, operator_id=principal)
@@ -164,9 +162,7 @@ class OperatorManager:
         scheduler = self._system.scheduler
         if scheduler is None:
             raise RuntimeError("TaskScheduler not available.")
-        principal, _capabilities, _consent = (
-            self._require_scheduler_authorization()
-        )
+        principal, _capabilities, _consent = self._require_scheduler_authorization()
         scheduler.pause_task(
             f"operator:{operator_id}",
             operator_id=principal,
@@ -178,9 +174,7 @@ class OperatorManager:
         scheduler = self._system.scheduler
         if scheduler is None:
             raise RuntimeError("TaskScheduler not available.")
-        principal, _capabilities, _consent = (
-            self._require_scheduler_authorization()
-        )
+        principal, _capabilities, _consent = self._require_scheduler_authorization()
         scheduler.resume_task(
             f"operator:{operator_id}",
             operator_id=principal,

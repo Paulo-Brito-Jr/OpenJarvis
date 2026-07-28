@@ -51,9 +51,7 @@ def _consent(schedule_type: str) -> dict:
         "scope": "recurring",
         "allow_replay": True,
         "granted_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(days=1)
-        ).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
     }
 
 

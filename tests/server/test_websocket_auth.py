@@ -188,9 +188,7 @@ class TestAgentEventsAuth:
         app.state.capability_policy = CapabilityPolicy()
         client = TestClient(app)
         with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect(
-                "/v1/agents/events?token=secret"
-            ) as ws:
+            with client.websocket_connect("/v1/agents/events?token=secret") as ws:
                 ws.receive_text()
 
     def test_oversized_agent_filter_closes_with_1009(self):

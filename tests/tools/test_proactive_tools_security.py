@@ -50,10 +50,7 @@ def test_mutating_proactive_tools_are_disabled_without_store_access():
         result = tool.execute(**params)
         assert result.success is False
         assert result.metadata["security_disabled"] is True
-        assert (
-            result.metadata["reason"]
-            == "authenticated_digest_approval_required"
-        )
+        assert result.metadata["reason"] == "authenticated_digest_approval_required"
 
     assert store.method_calls == []
     executor_fn.assert_not_called()

@@ -209,21 +209,15 @@ def test_execute_action_sends_matching_approval_and_never_dry_run() -> None:
     ("tool", "valid_params"),
     [
         (
-            SkynetCasaReadTool(
-                environ=_environment("SKYNET_JARVIS_CASA_READ")
-            ),
+            SkynetCasaReadTool(environ=_environment("SKYNET_JARVIS_CASA_READ")),
             {"alias": "casa", "operation": "resumo"},
         ),
         (
-            SkynetAgendaReadTool(
-                environ=_environment("SKYNET_JARVIS_AGENDA_READ")
-            ),
+            SkynetAgendaReadTool(environ=_environment("SKYNET_JARVIS_AGENDA_READ")),
             {},
         ),
         (
-            SkynetFrotaReadTool(
-                environ=_environment("SKYNET_JARVIS_FROTA_READ")
-            ),
+            SkynetFrotaReadTool(environ=_environment("SKYNET_JARVIS_FROTA_READ")),
             {"host": "all"},
         ),
         (
@@ -273,22 +267,12 @@ def test_arbitrary_boundary_parameters_are_rejected(
             {"SKYNET_JARVIS_API_BASE_URL": "http://skynet.example.test"}
         ),
         lambda env: env.update(
-            {
-                "SKYNET_JARVIS_API_BASE_URL": (
-                    "https://skynet.example.test/path"
-                )
-            }
+            {"SKYNET_JARVIS_API_BASE_URL": ("https://skynet.example.test/path")}
         ),
         lambda env: env.update(
-            {
-                "SKYNET_JARVIS_API_BASE_URL": (
-                    "https://user@skynet.example.test"
-                )
-            }
+            {"SKYNET_JARVIS_API_BASE_URL": ("https://user@skynet.example.test")}
         ),
-        lambda env: env.update(
-            {"SKYNET_JARVIS_CASA_READ_CHANNEL": "skynet"}
-        ),
+        lambda env: env.update({"SKYNET_JARVIS_CASA_READ_CHANNEL": "skynet"}),
     ],
 )
 def test_unsafe_configuration_fails_closed(
@@ -365,8 +349,7 @@ def test_oversized_response_fails_instead_of_returning_partial_json() -> None:
         httpx.Response(
             200,
             headers={"content-type": "application/json"},
-            content=b'{"ok":true,"schema":"jarvis.casa.snapshot.v1",'
-            b'"schema":"wrong"}',
+            content=b'{"ok":true,"schema":"jarvis.casa.snapshot.v1","schema":"wrong"}',
         ),
         httpx.Response(200, json=["not", "an", "object"]),
         httpx.Response(
@@ -421,9 +404,7 @@ def test_success_payload_is_recursively_stripped_and_redacted() -> None:
     }
     tool = SkynetCasaReadTool(
         environ=_environment("SKYNET_JARVIS_CASA_READ"),
-        transport=_transport(
-            lambda request: httpx.Response(200, json=payload)
-        ),
+        transport=_transport(lambda request: httpx.Response(200, json=payload)),
     )
 
     result = tool.execute(alias="casa", operation="resumo")

@@ -63,9 +63,7 @@ class RLMRepl:
         tool_arg_names: Optional[Dict[str, Optional[str]]] = None,
         *,
         max_output_chars: int = 10000,
-        sandbox_executor: Optional[
-            Callable[[str, Dict[str, Any], int], str]
-        ] = None,
+        sandbox_executor: Optional[Callable[[str, Dict[str, Any], int], str]] = None,
     ) -> None:
         self._max_output_chars = max_output_chars
         self._terminated = False

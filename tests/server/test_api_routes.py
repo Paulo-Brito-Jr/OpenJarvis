@@ -182,9 +182,7 @@ class TestMemoryIndexAuthorization:
         monkeypatch.delenv("OPENJARVIS_WORKSPACE", raising=False)
         target = tmp_path / "note.txt"
         target.write_text("content long enough to be indexed")
-        client, backend = self._client(
-            {"tool:invoke", "file:read", "memory:write"}
-        )
+        client, backend = self._client({"tool:invoke", "file:read", "memory:write"})
 
         response = client.post("/v1/memory/index", json={"path": str(target)})
 
@@ -198,9 +196,7 @@ class TestMemoryIndexAuthorization:
         outside = tmp_path / "outside.txt"
         outside.write_text("content long enough to be indexed")
         monkeypatch.setenv("OPENJARVIS_WORKSPACE", str(workspace))
-        client, backend = self._client(
-            {"tool:invoke", "file:read", "memory:write"}
-        )
+        client, backend = self._client({"tool:invoke", "file:read", "memory:write"})
 
         response = client.post("/v1/memory/index", json={"path": str(outside)})
 
@@ -222,9 +218,7 @@ class TestMemoryIndexAuthorization:
         target = tmp_path / "note.txt"
         target.write_text("content long enough to be indexed")
         monkeypatch.setenv("OPENJARVIS_WORKSPACE", str(tmp_path))
-        client, backend = self._client(
-            {"tool:invoke", "file:read", "memory:write"}
-        )
+        client, backend = self._client({"tool:invoke", "file:read", "memory:write"})
 
         response = client.post("/v1/memory/index", json={"path": str(target)})
 

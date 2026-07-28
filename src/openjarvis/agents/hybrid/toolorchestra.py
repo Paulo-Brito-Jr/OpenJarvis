@@ -411,11 +411,14 @@ def _call_modal_python(
         ["network:fetch", "code:execute"],
         tool_name="modal_python",
     )
-    code = _guard_provider_text(
-        action_authorizer,
-        code,
-        destination,
-    ) or ""
+    code = (
+        _guard_provider_text(
+            action_authorizer,
+            code,
+            destination,
+        )
+        or ""
+    )
     try:
         import modal
 

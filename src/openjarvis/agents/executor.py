@@ -42,8 +42,7 @@ def _bind_agent_security(
     bind_security = getattr(agent, "bind_security", None)
     if not callable(bind_security):
         raise FatalError(
-            f"Security-bound agent type '{agent_type}' does not expose "
-            "bind_security()"
+            f"Security-bound agent type '{agent_type}' does not expose bind_security()"
         )
 
     if boundary_guard is None:
@@ -57,18 +56,22 @@ def _bind_agent_security(
 
     try:
         parameters = inspect.signature(bind_security).parameters.values()
-        supports_third_arg = any(
-            parameter.kind
-            in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-            for parameter in parameters
-        ) or sum(
-            parameter.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        supports_third_arg = (
+            any(
+                parameter.kind
+                in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for parameter in parameters
             )
-            for parameter in parameters
-        ) >= 3
+            or sum(
+                parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                for parameter in parameters
+            )
+            >= 3
+        )
     except (TypeError, ValueError):
         supports_third_arg = False
 
@@ -488,19 +491,11 @@ class AgentExecutor:
             # These are mutable raw backends. Expose them only when the
             # managed principal has both read and write authority; a read-only
             # wrapper does not exist yet.
-            if (
-                _accepts("session_store")
-                and can_read_memory
-                and can_write_memory
-            ):
+            if _accepts("session_store") and can_read_memory and can_write_memory:
                 state_kwargs["session_store"] = getattr(
                     self._system, "session_store", None
                 )
-            if (
-                _accepts("memory_backend")
-                and can_read_memory
-                and can_write_memory
-            ):
+            if _accepts("memory_backend") and can_read_memory and can_write_memory:
                 state_kwargs["memory_backend"] = getattr(
                     self._system, "memory_backend", None
                 )
@@ -583,11 +578,7 @@ class AgentExecutor:
 
         today = datetime.date.today().strftime("%A, %B %d, %Y")
         instruction = config.get("instruction", "")
-        memory = (
-            (agent.get("summary_memory") or "").strip()
-            if can_read_memory
-            else ""
-        )
+        memory = (agent.get("summary_memory") or "").strip() if can_read_memory else ""
         last_run_at = agent.get("last_run_at")
 
         tick_note = ""

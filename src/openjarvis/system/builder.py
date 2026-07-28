@@ -519,9 +519,7 @@ class SystemBuilder:
 
                     namespace = validate_mcp_namespace(namespace)
                     if namespace in seen_servers:
-                        raise RuntimeError(
-                            f"Duplicate MCP namespace: {namespace}"
-                        )
+                        raise RuntimeError(f"Duplicate MCP namespace: {namespace}")
                     seen_servers.add(namespace)
                     external_tools = self._discover_external_mcp(cfg)
                     if tool_names:
@@ -530,17 +528,14 @@ class SystemBuilder:
                             for tool in external_tools
                             if (
                                 tool.spec.name in tool_names
-                                or tool.spec.metadata.get("mcp", {}).get(
-                                    "remote_name"
-                                )
+                                or tool.spec.metadata.get("mcp", {}).get("remote_name")
                                 in tool_names
                             )
                         ]
                     for tool in external_tools:
                         if tool.spec.name in seen_tools:
                             raise RuntimeError(
-                                "Duplicate tool name rejected: "
-                                f"{tool.spec.name}"
+                                f"Duplicate tool name rejected: {tool.spec.name}"
                             )
                         seen_tools.add(tool.spec.name)
                         tools.append(tool)
@@ -732,9 +727,7 @@ class SystemBuilder:
             raise ValueError(
                 f"MCP server '{name}' must configure exactly one transport"
             )
-        if not isinstance(args, list) or not all(
-            isinstance(arg, str) for arg in args
-        ):
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError(f"MCP server '{name}' args must be a string array")
 
         if url:

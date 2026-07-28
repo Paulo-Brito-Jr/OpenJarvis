@@ -197,9 +197,7 @@ class TestLoaderClientLifetime:
 
 
 class TestLoaderFailureIsolation:
-    def test_one_server_failure_aborts_batch_and_closes_clients(
-        self, _mock_mcp_stack
-    ):
+    def test_one_server_failure_aborts_batch_and_closes_clients(self, _mock_mcp_stack):
         """A partial MCP surface must never be exposed after discovery failure."""
         from openjarvis.mcp.loader import load_mcp_tools_from_config
 

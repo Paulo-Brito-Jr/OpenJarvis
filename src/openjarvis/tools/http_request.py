@@ -388,15 +388,11 @@ class HttpRequestTool(BaseTool):
             raise _SSRFRedirectError("DNS resolution returned no addresses.")
         blocked = [address for address in addresses if is_private_ip(address)]
         if blocked:
-            raise _SSRFRedirectError(
-                "Destination resolves to a non-public address."
-            )
+            raise _SSRFRedirectError("Destination resolves to a non-public address.")
         selected = addresses[0]
         rendered_ip = f"[{selected}]" if ":" in selected else selected
         default_port = 443 if parsed.scheme == "https" else 80
-        pinned_netloc = (
-            rendered_ip if port == default_port else f"{rendered_ip}:{port}"
-        )
+        pinned_netloc = rendered_ip if port == default_port else f"{rendered_ip}:{port}"
         pinned_url = urllib.parse.urlunsplit(
             (
                 parsed.scheme,
@@ -483,10 +479,10 @@ class HttpRequestTool(BaseTool):
                 # against the pinned IP URL exposed to the transport.
                 next_url = urllib.parse.urljoin(current_url, location)
                 if self._origin(current_url) != self._origin(next_url):
-                    if (
-                        streamed.status_code in (307, 308)
-                        and current_method not in {"GET", "HEAD"}
-                    ):
+                    if streamed.status_code in (307, 308) and current_method not in {
+                        "GET",
+                        "HEAD",
+                    }:
                         raise _SSRFRedirectError(
                             "Cross-origin redirect for a mutating request denied."
                         )
@@ -496,10 +492,7 @@ class HttpRequestTool(BaseTool):
                 current_url = next_url
                 # Per RFC 7231, 301/302/303 turn the method into GET and drop
                 # the body (except for HEAD).
-                if (
-                    streamed.status_code in (301, 302, 303)
-                    and current_method != "HEAD"
-                ):
+                if streamed.status_code in (301, 302, 303) and current_method != "HEAD":
                     current_method = "GET"
                     body = None
         raise _SSRFRedirectError(f"Exceeded maximum of {_MAX_REDIRECTS} redirects.")

@@ -109,10 +109,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         by unauthenticated clients, so it is gated alongside ``/v1`` and
         ``/api``. ``/health`` stays open for liveness probes.
         """
-        if (
-            path.startswith("/v1/connectors/")
-            and path.endswith("/oauth/callback")
-        ):
+        if path.startswith("/v1/connectors/") and path.endswith("/oauth/callback"):
             # OAuth providers cannot attach the API bearer token.  This exact
             # callback route authenticates a one-time state value instead.
             return False
@@ -311,10 +308,7 @@ def explicitly_authorized(
         grants = capability_policy.list_grants(principal.strip())
         explicitly_granted = any(
             fnmatch.fnmatchcase(capability, grant.capability)
-            and (
-                grant.pattern == "*"
-                or fnmatch.fnmatchcase(resource, grant.pattern)
-            )
+            and (grant.pattern == "*" or fnmatch.fnmatchcase(resource, grant.pattern))
             for grant in grants
         )
         if not explicitly_granted:

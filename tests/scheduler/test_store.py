@@ -60,9 +60,7 @@ class TestTaskCRUD:
     def test_create_task_is_insert_only(self, store):
         assert store.create_task(_make_task("stable-id")) is True
         assert (
-            store.create_task(
-                _make_task("stable-id", prompt="must not overwrite")
-            )
+            store.create_task(_make_task("stable-id", prompt="must not overwrite"))
             is False
         )
         assert store.get_task("stable-id")["prompt"] == "summarize the news"

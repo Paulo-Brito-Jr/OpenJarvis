@@ -120,9 +120,7 @@ class TestDockerCodeInterpreterTool:
         assert call_kwargs[1]["user"] == "65534:65534"
         assert call_kwargs[1]["privileged"] is False
         assert call_kwargs[1]["ipc_mode"] == "none"
-        assert call_kwargs[1]["tmpfs"]["/tmp"].startswith(
-            "rw,noexec,nosuid,nodev,"
-        )
+        assert call_kwargs[1]["tmpfs"]["/tmp"].startswith("rw,noexec,nosuid,nodev,")
         assert call_kwargs[0][1][:4] == ["python", "-I", "-S", "-B"]
 
     def test_output_truncation(self):
@@ -173,9 +171,9 @@ class TestDockerCodeInterpreterTool:
 
         mock_docker, _ = _make_docker_mock()
         with patch.dict(sys.modules, {"docker": mock_docker}):
-            result = DockerCodeInterpreterTool(
-                image="python:3.12-slim"
-            ).execute(code="print('must not run')")
+            result = DockerCodeInterpreterTool(image="python:3.12-slim").execute(
+                code="print('must not run')"
+            )
 
         assert result.success is False
         assert result.metadata["reason"] == "immutable_image_digest_required"

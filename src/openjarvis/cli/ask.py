@@ -379,9 +379,7 @@ def _run_agent(
         existing = {t.spec.name for t in tools}
         for t in mcp_tools:
             if t.spec.name in existing:
-                raise RuntimeError(
-                    f"Duplicate tool name rejected: {t.spec.name}"
-                )
+                raise RuntimeError(f"Duplicate tool name rejected: {t.spec.name}")
             tools.append(t)
             existing.add(t.spec.name)
 
