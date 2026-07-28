@@ -35,7 +35,7 @@ class LoopGuard:
     """Detect and prevent degenerate agent loops.
 
     Features:
-    1. Hash tracking: SHA-256 of (tool_name, args) blocks after max_identical_calls
+    1. Hash tracking: SHA-256 of (tool_name, args) blocks duplicate calls
     2. Ping-pong detection: Sliding window detects A-B-A-B or A-B-C-A-B-C patterns
     3. Poll-tool awareness: Tools with spec.metadata["polling"] = True
        get relaxed budget
@@ -93,17 +93,16 @@ class LoopGuard:
 
     def _python_check(self, tool_name: str, arguments: str) -> LoopVerdict:
         """Pure-Python fallback when Rust backend is not available."""
-        # 1. Hash tracking — identical calls
+        # 1. Hash tracking — mirror Rust's HashSet and block any duplicate.
         call_hash = hashlib.sha256(f"{tool_name}:{arguments}".encode()).hexdigest()[:16]
         self._call_counts[call_hash] = self._call_counts.get(call_hash, 0) + 1
-        if self._call_counts[call_hash] > self._config.max_identical_calls:
+        if self._call_counts[call_hash] > 1:
             self._emit_triggered("identical_call", tool_name)
             return LoopVerdict(
                 blocked=True,
                 reason=(
-                    f"Identical call to '{tool_name}' repeated "
-                    f"{self._call_counts[call_hash]} times "
-                    f"(max {self._config.max_identical_calls})."
+                    f"Loop detected: identical call to '{tool_name}' "
+                    "with same arguments"
                 ),
             )
 

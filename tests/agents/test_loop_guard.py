@@ -23,6 +23,22 @@ class TestLoopGuard:
         assert v2.blocked
         assert "identical" in v2.reason.lower()
 
+    def test_python_fallback_blocks_only_second_identical_call(self):
+        guard, _ = self._make_guard(
+            max_identical_calls=100,
+            poll_tool_budget=100,
+        )
+        guard._rust_impl = None
+
+        first = guard.check_call("calc", '{"x": 1}')
+        different = guard.check_call("calc", '{"x": 2}')
+        duplicate = guard.check_call("calc", '{"x": 1}')
+
+        assert not first.blocked
+        assert not different.blocked
+        assert duplicate.blocked
+        assert "identical" in duplicate.reason.lower()
+
     def test_different_args_not_blocked(self):
         guard, _ = self._make_guard(max_identical_calls=2)
         guard.check_call("calc", '{"x": 1}')
