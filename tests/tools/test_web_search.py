@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import socket
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import openjarvis.tools.web_search as web_search_module
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
-from openjarvis.tools.http_request import HttpRequestTool
 from openjarvis.tools.web_search import WebSearchTool
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every web-search test hermetic, even if a mock stops intercepting."""
+
+    def fail_network(*args, **kwargs):
+        pytest.fail("web-search tests must not access the real network")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_network)
+    monkeypatch.setattr(socket, "create_connection", fail_network)
 
 
 class TestWebSearchTool:
@@ -401,7 +415,7 @@ class TestUrlFetching:
         success: bool = True,
     ):
         monkeypatch.setattr(
-            HttpRequestTool,
+            web_search_module.HttpRequestTool,
             "execute",
             MagicMock(
                 return_value=ToolResult(
@@ -426,10 +440,7 @@ class TestUrlFetching:
     def test_fetch_url_strips_scripts(self, monkeypatch):
         self._mock_fetch(
             monkeypatch,
-            content=(
-                "<html><script>var x=1;</script>"
-                "<body>Content</body></html>"
-            ),
+            content=("<html><script>var x=1;</script><body>Content</body></html>"),
         )
 
         content = WebSearchTool._fetch_url("https://example.com")
@@ -464,7 +475,7 @@ class TestExecuteWithUrl:
         success: bool = True,
     ):
         monkeypatch.setattr(
-            HttpRequestTool,
+            web_search_module.HttpRequestTool,
             "execute",
             MagicMock(
                 return_value=ToolResult(

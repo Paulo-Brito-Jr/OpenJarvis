@@ -330,11 +330,11 @@ class _LiveGPUSampler:
 
 class ResearchRequest(BaseModel):
     query: str = Field(..., description="Natural-language question to research.")
-    # Preferred planner model from the active chat selector. Server-side
-    # [deep_research] config can still override it when a dedicated planner is
-    # desired.
+    # Retained for wire compatibility only. External callers cannot select the
+    # planner model; the server's governed runtime/config remains authoritative.
     model: Optional[str] = Field(
-        default=None, description="Preferred planner model for this request."
+        default=None,
+        description="Legacy client planner model hint; accepted but ignored.",
     )
 
 
@@ -595,8 +595,11 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
             status_code=400,
             detail="Research query must contain 1 to 10000 characters",
         )
-    principal = getattr(request.state, "api_principal", "").strip()
-    policy = getattr(request.app.state, "capability_policy", None)
+    request_state = getattr(request, "state", None)
+    app_state = getattr(getattr(request, "app", None), "state", None)
+    raw_principal = getattr(request_state, "api_principal", "")
+    principal = raw_principal.strip() if isinstance(raw_principal, str) else ""
+    policy = getattr(app_state, "capability_policy", None)
     if not principal or policy is None:
         raise HTTPException(
             status_code=503,
@@ -617,9 +620,9 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
     if not authorized:
         raise HTTPException(status_code=403, detail="Research is not authorized")
 
-    active_engine = getattr(request.app.state, "engine", None)
-    active_model = str(getattr(request.app.state, "model", "") or "")
-    active_engine_key = str(getattr(request.app.state, "engine_name", "") or "")
+    active_engine = getattr(app_state, "engine", None)
+    active_model = str(getattr(app_state, "model", "") or "")
+    active_engine_key = str(getattr(app_state, "engine_name", "") or "")
     if active_engine is not None and not active_engine_key:
         active_engine_key = str(getattr(active_engine, "engine_id", "") or "")
     return StreamingResponse(

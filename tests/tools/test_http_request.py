@@ -9,7 +9,7 @@ import pytest
 import respx
 
 import openjarvis.tools.http_request as http_request_module
-from openjarvis.tools.http_request import HttpRequestTool, _SSRFRedirectError
+from openjarvis.tools.http_request import HttpRequestTool
 
 _REAL_PIN_DESTINATION = HttpRequestTool._pin_destination
 
@@ -21,7 +21,7 @@ def _keep_respx_on_logical_hosts():
     def _passthrough_pin(self, url):
         error = http_request_module.check_ssrf(url)
         if error:
-            raise _SSRFRedirectError(error)
+            raise http_request_module._SSRFRedirectError(error)
         parsed = httpx.URL(url)
         host = parsed.host
         port = parsed.port
@@ -45,12 +45,8 @@ class TestHttpRequestTool:
 
     def test_mutations_require_extra_capability_and_confirmation(self):
         tool = HttpRequestTool()
-        assert tool.authorization_capabilities({"method": "GET"}) == [
-            "network:fetch"
-        ]
-        assert "network:mutate" in tool.authorization_capabilities(
-            {"method": "POST"}
-        )
+        assert tool.authorization_capabilities({"method": "GET"}) == ["network:fetch"]
+        assert "network:mutate" in tool.authorization_capabilities({"method": "POST"})
         assert tool.requires_confirmation_for({"method": "GET"}) is False
         assert tool.requires_confirmation_for({"method": "POST"}) is True
 
@@ -285,9 +281,7 @@ class TestHttpRequestTool:
 
         assert result.success is True
         assert len(requests) == 2
-        assert requests[0].headers["authorization"] == (
-            "Bearer first-origin-only"
-        )
+        assert requests[0].headers["authorization"] == ("Bearer first-origin-only")
         for name in (
             "authorization",
             "cookie",
@@ -471,9 +465,7 @@ class TestHttpRequestTool:
                 headers={"X-Test": "$OPENJARVIS_TEST_SECRET"},
             )
         assert result.success
-        assert route.calls[0].request.headers["x-test"] == (
-            "$OPENJARVIS_TEST_SECRET"
-        )
+        assert route.calls[0].request.headers["x-test"] == ("$OPENJARVIS_TEST_SECRET")
 
     def test_dns_resolution_is_pinned_to_validated_public_ip(self):
         resolver = MagicMock(
@@ -506,7 +498,7 @@ class TestHttpRequestTool:
         )
         tool = HttpRequestTool(resolver=resolver)
         with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
-            with pytest.raises(_SSRFRedirectError):
+            with pytest.raises(http_request_module._SSRFRedirectError):
                 _REAL_PIN_DESTINATION(tool, "https://example.com/")
 
 
