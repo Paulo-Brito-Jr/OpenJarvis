@@ -72,7 +72,10 @@ class TestAgentRoutes:
                 "agent_id": "denied-server-api-agent",
             },
         )
-        assert resp.status_code in (400, 501)
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == (
+            "Authenticated API principal is not configured"
+        )
         assert "denied-server-api-agent" not in _SPAWNED_AGENTS
 
     def test_create_agent_with_explicit_server_policy(self):
@@ -80,8 +83,8 @@ class TestAgentRoutes:
         from openjarvis.tools.agent_tools import _SPAWNED_AGENTS
 
         policy = CapabilityPolicy()
-        policy.grant("server-api", "tool:invoke", "agent_spawn")
-        policy.grant("server-api", "system:admin", "agent_spawn")
+        policy.grant("server-api", "tool:invoke", "tool:agent_spawn")
+        policy.grant("server-api", "system:admin", "tool:agent_spawn")
         client = TestClient(_make_app(policy, authenticated=True))
         try:
             resp = client.post(
@@ -99,20 +102,23 @@ class TestAgentRoutes:
     def test_kill_nonexistent(self):
         client = TestClient(_make_app())
         resp = client.delete("/v1/agents/nonexistent")
-        assert resp.status_code in (404, 501)
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == (
+            "Authenticated API principal is not configured"
+        )
 
 
 class TestMemoryRoutes:
     def test_search(self):
         client = TestClient(_make_app())
         resp = client.post("/v1/memory/search", json={"query": "test"})
-        # May fail if SQLite not set up, that's ok
-        assert resp.status_code in (200, 500)
+        # The optional Rust backend may be absent in a pure-Python test env.
+        assert resp.status_code in (200, 503)
 
     def test_stats(self):
         client = TestClient(_make_app())
         resp = client.get("/v1/memory/stats")
-        assert resp.status_code in (200, 500)
+        assert resp.status_code in (200, 503)
 
 
 class TestMemoryRustMissing:
@@ -227,7 +233,13 @@ class TestMemoryIndexAuthorization:
         backend.store.assert_called()
 
     def test_config_reports_unavailable(self, monkeypatch):
-        client = self._client(monkeypatch)
+        def _boom():
+            raise ImportError("No module named 'openjarvis_rust'")
+
+        import openjarvis._rust_bridge as bridge
+
+        monkeypatch.setattr(bridge, "get_rust_module", _boom)
+        client = TestClient(_make_app())
         resp = client.get("/v1/memory/config")
         assert resp.status_code == 200
         data = resp.json()
