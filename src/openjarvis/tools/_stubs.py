@@ -19,6 +19,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import ToolCall, ToolResult
+from openjarvis.tools._execution_context import (
+    _authorized_execution,
+    _new_authorized_execution,
+    _revoke_authorized_execution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +319,9 @@ class ToolExecutor:
             if isinstance(params, dict):
                 params.pop("_taint", None)
 
+        requested_resource = params.get("path")
+        if not isinstance(requested_resource, str):
+            requested_resource = None
         try:
             resource = tool.authorization_resource(params)
             required_capabilities = tool.authorization_capabilities(params)
@@ -362,11 +370,25 @@ class ToolExecutor:
         timeout = tool.spec.timeout_seconds or self._default_timeout
         t0 = time.time()
         pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        receipt = None
         try:
+            receipt = _new_authorized_execution(
+                tool_call.name,
+                resource,
+                requested_resource,
+                self._agent_id,
+            )
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = pool.submit(tool.execute, **params)
+
+            def execute_authorized() -> ToolResult:
+                with _authorized_execution(receipt):
+                    return tool.execute(**params)
+
+            future = pool.submit(execute_authorized)
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            if receipt is not None:
+                _revoke_authorized_execution(receipt)
             future.cancel()
             pool.shutdown(wait=False, cancel_futures=True)
             if self._bus:
@@ -394,6 +416,8 @@ class ToolExecutor:
                 },
             )
         except Exception as exc:
+            if receipt is not None:
+                _revoke_authorized_execution(receipt)
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
             result = ToolResult(

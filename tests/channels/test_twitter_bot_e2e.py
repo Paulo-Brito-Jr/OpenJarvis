@@ -5,7 +5,7 @@ Tests cover:
 - Prompt building for each mention type
 - Mention polling → handler dispatch
 - Full reactive flow: mention → classify → prompt → agent → tool call → reply
-- Environment variable expansion in http_request headers (GitHub issue creation)
+- Literal header handling and in-memory HTTP transport (GitHub issue creation)
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import sys
 import threading
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from openjarvis.channels._stubs import ChannelMessage
@@ -47,6 +48,36 @@ _build_bug_prompt = twitter_bot._build_bug_prompt
 _build_feature_prompt = twitter_bot._build_feature_prompt
 _build_praise_prompt = twitter_bot._build_praise_prompt
 DEMO_TWEETS = twitter_bot.DEMO_TWEETS
+
+
+def _in_memory_http_tool(
+    response_json: dict | None = None,
+    *,
+    status_code: int = 200,
+) -> tuple[HttpRequestTool, list[httpx.Request]]:
+    """Return an HTTP tool whose requests cannot leave the test process."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code, json=response_json or {})
+
+    resolver = MagicMock(
+        return_value=[
+            (
+                2,
+                1,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ]
+    )
+    tool = HttpRequestTool(
+        resolver=resolver,
+        transport=httpx.MockTransport(handler),
+    )
+    return tool, requests
 
 
 # =========================================================================
@@ -457,38 +488,18 @@ class TestMentionPolling:
 
 
 # =========================================================================
-# 4. Env var expansion in http_request (GitHub issue creation)
+# 4. Header safety in http_request (GitHub issue creation)
 # =========================================================================
 
 
-class TestEnvVarExpansion:
-    """Verify the http_request tool expands $ENV_VARS in headers."""
+class TestHeaderSafety:
+    """Verify prompt-controlled headers cannot interpolate environment secrets."""
 
-    def test_github_token_expanded(self):
-        """$GITHUB_TOKEN in Authorization header should be expanded."""
-        tool = HttpRequestTool()
-
-        mock_rust = MagicMock()
-        mock_rust.HttpRequestTool.return_value.execute.side_effect = RuntimeError(
-            "mocked",
-        )
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 201
-        mock_resp.text = '{"number": 42}'
-        mock_resp.headers = {"content-type": "application/json"}
-
+    def test_environment_reference_is_never_expanded(self):
+        tool, requests = _in_memory_http_tool({"number": 42}, status_code=201)
         with (
-            patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_test123"}),
-            patch(
-                "openjarvis._rust_bridge.get_rust_module",
-                return_value=mock_rust,
-            ),
+            patch.dict(os.environ, {"GITHUB_TOKEN": "unit-test-value"}),
             patch("openjarvis.tools.http_request.check_ssrf", return_value=None),
-            patch(
-                "openjarvis.tools.http_request.httpx.request",
-                return_value=mock_resp,
-            ) as mock_req,
         ):
             result = tool.execute(
                 url="https://api.github.com/repos/open-jarvis/OpenJarvis/issues",
@@ -501,80 +512,37 @@ class TestEnvVarExpansion:
             )
 
         assert result.success is True
-        actual_headers = mock_req.call_args[1]["headers"]
-        assert actual_headers["Authorization"] == "Bearer ghp_test123"
-        assert actual_headers["Accept"] == "application/vnd.github+json"
+        assert len(requests) == 1
+        assert requests[0].headers["Authorization"] == "Bearer $GITHUB_TOKEN"
+        assert requests[0].headers["Accept"] == "application/vnd.github+json"
 
-    def test_unexpanded_var_without_env(self):
-        """$GITHUB_TOKEN without env var set should remain as literal."""
-        tool = HttpRequestTool()
-
-        mock_rust = MagicMock()
-        mock_rust.HttpRequestTool.return_value.execute.side_effect = RuntimeError(
-            "mocked",
-        )
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 401
-        mock_resp.text = "Bad credentials"
-        mock_resp.headers = {"content-type": "text/plain"}
-
-        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
+    def test_unset_environment_reference_remains_literal(self):
+        tool, requests = _in_memory_http_tool(status_code=401)
         with (
-            patch.dict(os.environ, env, clear=True),
-            patch(
-                "openjarvis._rust_bridge.get_rust_module",
-                return_value=mock_rust,
-            ),
+            patch.dict(os.environ, {}, clear=True),
             patch("openjarvis.tools.http_request.check_ssrf", return_value=None),
-            patch(
-                "openjarvis.tools.http_request.httpx.request",
-                return_value=mock_resp,
-            ) as mock_req,
         ):
-            tool.execute(
+            result = tool.execute(
                 url="https://api.github.com/repos/test/test/issues",
                 method="POST",
                 headers={"Authorization": "Bearer $GITHUB_TOKEN"},
                 body="{}",
             )
 
-        actual_headers = mock_req.call_args[1]["headers"]
-        assert actual_headers["Authorization"] == "Bearer $GITHUB_TOKEN"
+        assert result.success is True
+        assert len(requests) == 1
+        assert requests[0].headers["Authorization"] == "Bearer $GITHUB_TOKEN"
 
-    def test_non_string_header_values_pass_through(self):
-        """Non-string header values should pass through without error."""
-        tool = HttpRequestTool()
-
-        mock_rust = MagicMock()
-        mock_rust.HttpRequestTool.return_value.execute.side_effect = RuntimeError(
-            "mocked",
+    def test_non_string_header_values_are_rejected(self):
+        tool, requests = _in_memory_http_tool()
+        result = tool.execute(
+            url="https://example.com",
+            headers={"X-Count": 42, "X-Name": "test"},
         )
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.text = "ok"
-        mock_resp.headers = {}
-
-        with (
-            patch(
-                "openjarvis._rust_bridge.get_rust_module",
-                return_value=mock_rust,
-            ),
-            patch("openjarvis.tools.http_request.check_ssrf", return_value=None),
-            patch(
-                "openjarvis.tools.http_request.httpx.request",
-                return_value=mock_resp,
-            ) as mock_req,
-        ):
-            tool.execute(
-                url="https://example.com",
-                headers={"X-Count": 42, "X-Name": "test"},
-            )
-
-        actual_headers = mock_req.call_args[1]["headers"]
-        assert actual_headers["X-Count"] == 42
-        assert actual_headers["X-Name"] == "test"
+        assert result.success is False
+        assert "strings" in result.content
+        assert requests == []
 
 
 # =========================================================================
@@ -766,45 +734,28 @@ class TestReplyConversationId:
 
 
 # =========================================================================
-# 7. GitHub issue creation e2e (http_request with expanded token)
+# 7. GitHub issue payloads over an in-memory transport
 # =========================================================================
 
 
 class TestGitHubIssueCreation:
-    """Simulate the LLM calling http_request to create a GitHub issue."""
+    """Validate generated issue requests without making a live network call."""
 
     def test_create_bug_issue(self):
-        tool = HttpRequestTool()
-
-        mock_rust = MagicMock()
-        mock_rust.HttpRequestTool.return_value.execute.side_effect = RuntimeError(
-            "mocked"
-        )
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 201
-        mock_resp.text = json.dumps(
+        tool, requests = _in_memory_http_tool(
             {
                 "number": 42,
                 "html_url": "https://github.com/open-jarvis/OpenJarvis/issues/42",
-            }
+            },
+            status_code=201,
         )
-        mock_resp.headers = {"content-type": "application/json"}
 
-        with (
-            patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_testtoken123"}),
-            patch("openjarvis._rust_bridge.get_rust_module", return_value=mock_rust),
-            patch("openjarvis.tools.http_request.check_ssrf", return_value=None),
-            patch(
-                "openjarvis.tools.http_request.httpx.request",
-                return_value=mock_resp,
-            ) as mock_req,
-        ):
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
             result = tool.execute(
                 url="https://api.github.com/repos/open-jarvis/OpenJarvis/issues",
                 method="POST",
                 headers={
-                    "Authorization": "Bearer $GITHUB_TOKEN",
+                    "Authorization": "Bearer unit-test-token",
                     "Accept": "application/vnd.github+json",
                 },
                 body=json.dumps(
@@ -822,43 +773,25 @@ class TestGitHubIssueCreation:
         assert result.success is True
         assert "42" in result.content
 
-        actual_call = mock_req.call_args
-        assert actual_call[0][0] == "POST"
-        assert "api.github.com" in actual_call[0][1]
-        assert actual_call[1]["headers"]["Authorization"] == "Bearer ghp_testtoken123"
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.method == "POST"
+        assert request.headers["Host"] == "api.github.com"
+        assert request.headers["Authorization"] == "Bearer unit-test-token"
 
-        body = actual_call[1]["content"]
-        parsed_body = json.loads(body)
+        parsed_body = json.loads(request.content)
         assert parsed_body["labels"] == ["bug", "from-twitter"]
         assert "bob_user" in parsed_body["body"]
 
     def test_create_feature_issue(self):
-        tool = HttpRequestTool()
+        tool, requests = _in_memory_http_tool({"number": 43}, status_code=201)
 
-        mock_rust = MagicMock()
-        mock_rust.HttpRequestTool.return_value.execute.side_effect = RuntimeError(
-            "mocked"
-        )
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 201
-        mock_resp.text = json.dumps({"number": 43})
-        mock_resp.headers = {"content-type": "application/json"}
-
-        with (
-            patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_testtoken123"}),
-            patch("openjarvis._rust_bridge.get_rust_module", return_value=mock_rust),
-            patch("openjarvis.tools.http_request.check_ssrf", return_value=None),
-            patch(
-                "openjarvis.tools.http_request.httpx.request",
-                return_value=mock_resp,
-            ) as mock_req,
-        ):
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
             result = tool.execute(
                 url="https://api.github.com/repos/open-jarvis/OpenJarvis/issues",
                 method="POST",
                 headers={
-                    "Authorization": "Bearer $GITHUB_TOKEN",
+                    "Authorization": "Bearer unit-test-token",
                     "Accept": "application/vnd.github+json",
                 },
                 body=json.dumps(
@@ -874,6 +807,7 @@ class TestGitHubIssueCreation:
             )
 
         assert result.success is True
-        body = json.loads(mock_req.call_args[1]["content"])
+        assert len(requests) == 1
+        body = json.loads(requests[0].content)
         assert body["labels"] == ["enhancement", "from-twitter"]
         assert "carol_eng" in body["body"]

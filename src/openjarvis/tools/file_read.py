@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
+from openjarvis.tools._execution_context import _authorized_resource
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # Maximum file size to read (1 MB)
@@ -45,6 +46,7 @@ class FileReadTool(BaseTool):
                 "required": ["path"],
             },
             category="filesystem",
+            required_capabilities=["file:read"],
         )
 
     def _is_path_allowed(self, path: Path) -> bool:
@@ -56,15 +58,31 @@ class FileReadTool(BaseTool):
             resolved == d or resolved.is_relative_to(d) for d in self._allowed_dirs
         )
 
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        """Reject invalid paths instead of falling back to a tool-wide grant."""
+        file_path = params.get("path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError("path must be a non-empty string")
+        return super().authorization_resource(params)
+
     def execute(self, **params: Any) -> ToolResult:
         file_path = params.get("path", "")
-        if not file_path:
+        if not isinstance(file_path, str) or not file_path.strip():
             return ToolResult(
                 tool_name="file_read",
                 content="No path provided.",
                 success=False,
             )
-        path = Path(file_path)
+        resource = _authorized_resource(self.spec.name, file_path)
+        if resource is None:
+            return ToolResult(
+                tool_name="file_read",
+                content=(
+                    "Security block: authenticated ToolExecutor dispatch required."
+                ),
+                success=False,
+            )
+        path = Path(resource)
         # Block sensitive files (secrets, credentials, keys)
         from openjarvis.security.file_policy import is_sensitive_file
 
@@ -108,16 +126,8 @@ class FileReadTool(BaseTool):
                 success=False,
             )
         try:
-            from openjarvis._rust_bridge import get_rust_module
-
-            _rust = get_rust_module()
-            text = _rust.FileReadTool().execute(str(path))
-        except ImportError:
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                text = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
             return ToolResult(
                 tool_name="file_read",
                 content=f"Read error: {exc}",

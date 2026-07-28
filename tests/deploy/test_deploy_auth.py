@@ -107,7 +107,10 @@ def test_desktop_settings_sync_the_local_api_key_with_keychain():
     assert "saveCloudKey('OPENJARVIS_API_KEY', next)" in text
     assert "saveCloudKey('OPENJARVIS_API_KEY', '')" in text
     assert "Saved securely in Keychain." in text
-    assert "Removed from Keychain and local settings." in text
+    assert (
+        "Removed from Keychain. This session keeps using its current key "
+        "until OpenJarvis restarts."
+    ) in text
 
 
 @pytest.mark.parametrize(

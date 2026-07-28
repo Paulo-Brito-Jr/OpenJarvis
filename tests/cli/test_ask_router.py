@@ -112,6 +112,7 @@ class TestAskModelResolution:
             cfg.intelligence.max_tokens = 1024
             cfg.agent.context_from_memory = False
             cfg.agent.default_agent = ""
+            cfg.security.mode = "warn"
             result = CliRunner().invoke(cli, ["ask", "Hello"])
         assert result.exit_code == 0
 
@@ -144,5 +145,6 @@ class TestAskModelResolution:
             cfg.intelligence.max_tokens = 1024
             cfg.agent.context_from_memory = False
             cfg.agent.default_agent = ""
+            cfg.security.mode = "warn"
             result = CliRunner().invoke(cli, ["ask", "Hello"])
         assert result.exit_code == 0
