@@ -1,6 +1,7 @@
 """Tests for speech backend auto-discovery."""
 
-from unittest.mock import patch
+import builtins
+from unittest.mock import MagicMock, patch
 
 from openjarvis.core.config import JarvisConfig
 
@@ -46,3 +47,28 @@ def test_auto_discovery_priority():
     assert DISCOVERY_ORDER[0] == "faster-whisper"
     assert "openai" in DISCOVERY_ORDER
     assert "deepgram" in DISCOVERY_ORDER
+
+
+def test_disabled_backend_returns_none_without_registration_or_env(monkeypatch):
+    import openjarvis.speech._discovery as discovery
+
+    config = JarvisConfig()
+    config.speech.backend = "disabled"
+    guarded_environ = MagicMock()
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "openjarvis.speech":
+            raise AssertionError("disabled speech must not register backends")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(discovery.os, "environ", guarded_environ)
+    with (
+        patch.object(discovery, "_create_backend") as create_backend,
+        patch.object(builtins, "__import__", side_effect=guarded_import),
+    ):
+        result = discovery.get_speech_backend(config)
+
+    assert result is None
+    create_backend.assert_not_called()
+    assert guarded_environ.mock_calls == []

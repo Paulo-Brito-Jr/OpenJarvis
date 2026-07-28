@@ -38,6 +38,26 @@ _MAX_CHAT_TOOL_BYTES = 131_072
 _MAX_CHAT_OUTPUT_TOKENS = 32_768
 
 
+def _server_cloud_enabled(request: Request) -> bool:
+    """Return the configured cloud policy, defaulting on for compatibility."""
+    config = getattr(request.app.state, "config", None)
+    server_config = getattr(config, "server", None)
+    return bool(getattr(server_config, "cloud_enabled", True))
+
+
+def _reject_disabled_cloud_model(request: Request, model: str) -> None:
+    """Fail before any engine or cloud credential path can run."""
+    if _server_cloud_enabled(request):
+        return
+    from openjarvis.server.cloud_router import is_cloud_model
+
+    if is_cloud_model(model):
+        raise HTTPException(
+            status_code=403,
+            detail="Cloud models are disabled by server configuration.",
+        )
+
+
 def _validate_chat_request(request_body: ChatCompletionRequest) -> None:
     """Reject oversized or nonsensical chat work before model dispatch."""
     if not request_body.messages:
@@ -178,9 +198,10 @@ def _ensure_identity_prompt(messages: list[Message], app_config) -> list[Message
 async def chat_completions(request_body: ChatCompletionRequest, request: Request):
     """Handle chat completion requests (streaming and non-streaming)."""
     _validate_chat_request(request_body)
+    model = request_body.model
+    _reject_disabled_cloud_model(request, model)
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
-    model = request_body.model
     external_principal = getattr(request.state, "api_principal", "").strip()
     if external_principal and agent is not None and not request_body.tools:
         # The app-level agent is a shared mutable object already bound to its
@@ -1056,6 +1077,12 @@ async def reload_cloud_engine(request: Request):
     Called by the desktop app immediately after the user saves a cloud API
     key so that cloud models become available without a full app restart.
     """
+    if not _server_cloud_enabled(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Cloud models are disabled by server configuration.",
+        )
+
     import os
 
     submitted_keys: dict[str, str] | None = None

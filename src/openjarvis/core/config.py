@@ -1015,6 +1015,7 @@ class ServerConfig:
     port: int = 8000
     agent: str = "orchestrator"
     model: str = ""
+    cloud_enabled: bool = True
     workers: int = 1
     cors_origins: list = field(
         default_factory=lambda: [
@@ -1443,7 +1444,7 @@ class OperatorsConfig:
 class SpeechConfig:
     """Speech-to-text settings."""
 
-    backend: str = "auto"  # "auto", "faster-whisper", "openai", "deepgram"
+    backend: str = "auto"  # "auto", "disabled", "faster-whisper", "openai", "deepgram"
     model: str = "base"  # Whisper model size: tiny, base, small, medium, large-v3
     language: str = ""  # Empty = auto-detect
     device: str = "auto"  # "auto", "cpu", "cuda"
@@ -2056,6 +2057,7 @@ enabled = true
 host = "0.0.0.0"
 port = 8000
 agent = "orchestrator"
+cloud_enabled = true
 
 [learning]
 enabled = false
