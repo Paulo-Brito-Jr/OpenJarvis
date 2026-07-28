@@ -174,13 +174,12 @@ class TestSkillExecutorCapabilities:
             ],
         )
 
-    def test_no_policy_runs_capability_skills(self):
-        """Default construction (no allowed_capabilities) must not enforce —
-        this is the pre-enforcement behavior every manager.py call site relies on."""
+    def test_no_tool_policy_fails_closed(self):
+        """Manifest capabilities cannot bypass the tool policy boundary."""
         executor = SkillExecutor(ToolExecutor([EchoTool()]))
         result = executor.run(self._manifest())
-        assert result.success
-        assert result.context.get("result") == "hello"
+        assert not result.success
+        assert "Capability policy unavailable" in result.step_results[0].content
 
     def test_policy_blocks_missing_capability(self):
         executor = SkillExecutor(ToolExecutor([EchoTool()]), allowed_capabilities=set())
@@ -192,7 +191,7 @@ class TestSkillExecutorCapabilities:
 
     def test_policy_allows_granted_capability(self):
         executor = SkillExecutor(
-            ToolExecutor([EchoTool()]),
+            _permitted_tool_executor([EchoTool()]),
             allowed_capabilities={"network:fetch"},
         )
         result = executor.run(self._manifest())

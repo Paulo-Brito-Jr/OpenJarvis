@@ -6,6 +6,8 @@ Mark: live
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from openjarvis.core.events import EventBus, EventType
@@ -17,6 +19,13 @@ from openjarvis.system import SystemBuilder
 @pytest.mark.live
 class TestSkillSystemIntegration:
     """Integration tests verifying skills flow end-to-end with a real engine."""
+
+    @pytest.fixture(autouse=True)
+    def _require_live_opt_in(self):
+        if os.environ.get("OPENJARVIS_RUN_LIVE_TESTS") != "1":
+            pytest.skip(
+                "set OPENJARVIS_RUN_LIVE_TESTS=1 to use local Ollama and skills"
+            )
 
     def test_system_builder_discovers_skills(self):
         """SystemBuilder.build() discovers installed skills and adds them to tools."""

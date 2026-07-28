@@ -196,7 +196,7 @@ class TestReActPipeline:
 class TestOpenHandsPipeline:
     """End-to-end: OpenHands agent with code execution."""
 
-    def test_openhands_code_execution_e2e(self):
+    def test_openhands_code_execution_requires_isolated_sandbox(self, monkeypatch):
         _register_all()
         from openjarvis.agents.native_openhands import NativeOpenHandsAgent
         from openjarvis.tools.code_interpreter import (
@@ -211,13 +211,21 @@ class TestOpenHandsPipeline:
 
         responses = [
             _simple_response("I'll calculate this:\n```python\nprint(2 + 2)\n```"),
-            _simple_response("The result is 4."),
+            _simple_response(
+                "Execution was denied because no isolated sandbox is configured."
+            ),
         ]
         engine = _make_engine(responses)
+        monkeypatch.setattr(
+            "openjarvis.tools._stubs.sys.stdin.isatty",
+            lambda: True,
+        )
         agent = NativeOpenHandsAgent(
             engine,
             "test-model",
             tools=[CodeInterpreterTool()],
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
         )
         _bind_tool_agent(agent, "integration-openhands")
         result = agent.run("What is 2+2?")
@@ -225,8 +233,11 @@ class TestOpenHandsPipeline:
         assert isinstance(result, AgentResult)
         assert result.turns == 2
         assert len(result.tool_results) == 1
-        # The code_interpreter actually runs print(2+2)
-        assert "4" in result.tool_results[0].content
+        tool_result = result.tool_results[0]
+        assert tool_result.success is False
+        assert tool_result.metadata["security_disabled"] is True
+        assert tool_result.metadata["reason"] == "isolated_sandbox_required"
+        assert "isolated sandbox" in tool_result.content
 
     def test_openhands_direct_answer(self):
         """OpenHands returns directly when no code is needed."""
@@ -416,7 +427,11 @@ class TestMemoryPipeline:
     """Index and retrieve across available backends."""
 
     def test_sqlite_index_and_retrieve(self, tmp_path):
+        from openjarvis._rust_bridge import RUST_AVAILABLE
         from openjarvis.tools.storage.sqlite import SQLiteMemory
+
+        if not RUST_AVAILABLE:
+            pytest.skip("requires the native openjarvis_rust extension")
 
         backend = SQLiteMemory(db_path=str(tmp_path / "mem.db"))
         backend.store(

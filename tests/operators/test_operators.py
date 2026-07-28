@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -72,29 +73,149 @@ class FakeMemoryBackend:
 
 
 class FakeSchedulerStore:
-    """Minimal scheduler store stub."""
+    """In-memory scheduler store with durable-copy and CAS semantics."""
 
     def __init__(self) -> None:
         self._tasks: Dict[str, Dict] = {}
         self._runs: List[Dict] = []
 
+    def create_task(self, task_dict: Dict) -> bool:
+        task_id = task_dict["id"]
+        if task_id in self._tasks:
+            return False
+        self._tasks[task_id] = deepcopy(task_dict)
+        return True
+
     def save_task(self, task_dict: Dict) -> None:
-        self._tasks[task_dict["id"]] = task_dict
+        self._tasks[task_dict["id"]] = deepcopy(task_dict)
 
     def get_task(self, task_id: str) -> Optional[Dict]:
-        return self._tasks.get(task_id)
+        task = self._tasks.get(task_id)
+        return deepcopy(task) if task is not None else None
 
     def update_task(self, task_dict: Dict) -> None:
-        self._tasks[task_dict["id"]] = task_dict
+        self._tasks[task_dict["id"]] = deepcopy(task_dict)
 
     def list_tasks(self, *, status=None) -> List[Dict]:
         tasks = list(self._tasks.values())
         if status:
             tasks = [t for t in tasks if t.get("status") == status]
-        return tasks
+        return deepcopy(tasks)
 
     def get_due_tasks(self, now: str) -> List[Dict]:
-        return []
+        return [
+            deepcopy(task)
+            for task in self._tasks.values()
+            if task.get("status") == "active"
+            and task.get("next_run")
+            and task["next_run"] <= now
+            and not task.get("claim_token")
+        ]
+
+    def claim_due_task(self, now: str, claim_token: str) -> Optional[Dict]:
+        for task_id in sorted(self._tasks):
+            task = self._tasks[task_id]
+            if (
+                task.get("status") == "active"
+                and task.get("next_run")
+                and task["next_run"] <= now
+                and not task.get("claim_token")
+            ):
+                return self.claim_task(task_id, claim_token, now)
+        return None
+
+    def claim_task(
+        self,
+        task_id: str,
+        claim_token: str,
+        claimed_at: str,
+    ) -> Optional[Dict]:
+        task = self._tasks.get(task_id)
+        if task is None or task.get("status") != "active" or task.get("claim_token"):
+            return None
+        task["status"] = "running"
+        task["claim_token"] = claim_token
+        task["claim_started_at"] = claimed_at
+        return deepcopy(task)
+
+    def finish_claim(
+        self,
+        task_id: str,
+        claim_token: str,
+        *,
+        status: str,
+        next_run: Optional[str],
+        last_run: str,
+        consent: Dict,
+    ) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("status") != "running"
+            or task.get("claim_token") != claim_token
+        ):
+            return False
+        task.update(
+            {
+                "status": status,
+                "next_run": next_run,
+                "last_run": last_run,
+                "consent": deepcopy(consent),
+                "claim_token": None,
+                "claim_started_at": None,
+            }
+        )
+        return True
+
+    def pause_active_task(self, task_id: str, operator_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("operator_id") != operator_id
+            or task.get("status") != "active"
+            or task.get("claim_token")
+        ):
+            return False
+        task["status"] = "paused"
+        return True
+
+    def resume_paused_task(
+        self,
+        task_id: str,
+        operator_id: str,
+        *,
+        schedule_value: str,
+        next_run: Optional[str],
+    ) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("operator_id") != operator_id
+            or task.get("status") != "paused"
+            or task.get("claim_token")
+        ):
+            return False
+        task.update(
+            {
+                "status": "active",
+                "schedule_value": schedule_value,
+                "next_run": next_run,
+            }
+        )
+        return True
+
+    def cancel_unclaimed_task(self, task_id: str, operator_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("operator_id") != operator_id
+            or task.get("status") not in {"active", "paused", "completed"}
+            or task.get("claim_token")
+        ):
+            return False
+        task["status"] = "cancelled"
+        task["next_run"] = None
+        return True
 
     def log_run(self, **kwargs) -> None:
         self._runs.append(kwargs)
