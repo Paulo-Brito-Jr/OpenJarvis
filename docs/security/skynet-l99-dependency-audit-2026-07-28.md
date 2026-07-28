@@ -117,3 +117,25 @@ The unified lock still warns about the pre-existing yanked
 `grpcio==1.78.1` under disabled optional graphs and the pre-existing missing
 `zeus-ml` `apple` extra. Neither package is selected by the 64-package
 `--extra server --no-dev` dry-run, and neither was changed in this follow-up.
+
+## Follow-up: documentation compatibility
+
+The first fork CI run exposed a second security-relevant optional dependency:
+`pymdown-extensions==10.21` is affected by CVE-2026-46338 and passes
+`filename=None` to Pygments. Pygments 2.20.0 intentionally rejects that value,
+so the MkDocs build failed while rendering API signatures.
+
+`pymdown-extensions==11.0.1` is the accepted exact version:
+
+- uploaded to PyPI on 2026-07-02, outside the seven-day cooldown;
+- wheel SHA-256
+  `db3943a62bab7e03af1364f0c4083e64b91fb097675a4b6cceccfbe9a77e5eb2`;
+- zero findings from the OSV exact-version query;
+- includes the upstream fix that always supplies a non-`None` code-block
+  title to Pygments;
+- no package-specific compromise was found in the recent supply-chain search.
+
+Socket's exact package/version page again returned HTTP 403, so PyPI metadata,
+OSV, the verified upstream fix commit and recent compromise searches form the
+documented fallback. The dependency is constrained transitively and does not
+enter the 64-package `server` path unless the `docs` extra is requested.
