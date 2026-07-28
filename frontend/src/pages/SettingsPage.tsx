@@ -138,6 +138,178 @@ function ApiKeyInput({ keyName, placeholder }: { keyName: string; placeholder: s
   );
 }
 
+function LocalServerApiKeyInput({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const desktopKeyStorage = isTauri();
+  const [hasKey, setHasKey] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{
+    kind: 'success' | 'error';
+    message: string;
+  } | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!desktopKeyStorage) {
+      setHasKey(false);
+      return;
+    }
+    try {
+      const status = await getCloudKeyStatus();
+      setHasKey(!!status.OPENJARVIS_API_KEY);
+    } catch {
+      setHasKey(false);
+    }
+  }, [desktopKeyStorage]);
+
+  useEffect(() => {
+    void refresh();
+    window.addEventListener(CLOUD_KEY_STATUS_CHANGED, refresh);
+    return () => window.removeEventListener(CLOUD_KEY_STATUS_CHANGED, refresh);
+  }, [refresh]);
+
+  const save = async () => {
+    const next = value.trim();
+    if (!next) {
+      setFeedback({
+        kind: 'error',
+        message: 'Enter an API key before saving it to Keychain.',
+      });
+      return;
+    }
+
+    setBusy(true);
+    setFeedback(null);
+    try {
+      await saveCloudKey('OPENJARVIS_API_KEY', next);
+      onChange(next);
+      setHasKey(true);
+      setFeedback({
+        kind: 'success',
+        message: 'Saved securely in Keychain. Restart OpenJarvis to apply it.',
+      });
+      window.dispatchEvent(new Event(CLOUD_KEY_STATUS_CHANGED));
+    } catch (e: any) {
+      setFeedback({
+        kind: 'error',
+        message: e?.message || 'Failed to save the API key in Keychain.',
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      await saveCloudKey('OPENJARVIS_API_KEY', '');
+      onChange('');
+      setHasKey(false);
+      setFeedback({
+        kind: 'success',
+        message: 'Removed from Keychain and local settings. Restart OpenJarvis to apply it.',
+      });
+      window.dispatchEvent(new Event(CLOUD_KEY_STATUS_CHANGED));
+    } catch (e: any) {
+      setFeedback({
+        kind: 'error',
+        message: e?.message || 'Failed to remove the API key from Keychain.',
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const helpText = desktopKeyStorage
+    ? `${hasKey ? 'A key is stored in Keychain.' : 'No key is stored in Keychain.'} Restart OpenJarvis after saving or removing it.`
+    : 'Keychain sync is available in the OpenJarvis desktop app. This value remains in local app settings.';
+
+  return (
+    <div className="flex flex-col items-end gap-1.5" aria-busy={busy}>
+      <div className="flex flex-wrap justify-end gap-2">
+        <input
+          id="openjarvis-api-key"
+          type="password"
+          value={value}
+          onChange={(e) => {
+            onChange(e.target.value);
+            setFeedback(null);
+          }}
+          placeholder="OPENJARVIS_API_KEY"
+          autoComplete="off"
+          aria-label="OpenJarvis local server API key"
+          aria-describedby="openjarvis-api-key-help"
+          aria-invalid={feedback?.kind === 'error'}
+          disabled={busy}
+          className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+          style={{
+            background: 'var(--color-bg-secondary)',
+            color: 'var(--color-text)',
+            border: '1px solid var(--color-border)',
+          }}
+        />
+        {desktopKeyStorage && (
+          <>
+            <button
+              type="button"
+              onClick={() => void save()}
+              disabled={busy || !value.trim()}
+              aria-label="Save OpenJarvis API key to Keychain"
+              className="px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+              style={{
+                background: 'var(--color-accent)',
+                color: 'white',
+                border: '1px solid var(--color-accent)',
+              }}
+            >
+              {busy ? 'Working...' : 'Save to Keychain'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void remove()}
+              disabled={busy}
+              aria-label="Remove OpenJarvis API key from Keychain"
+              className="px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+              style={{
+                color: 'var(--color-error)',
+                border: '1px solid var(--color-error)',
+              }}
+            >
+              Remove
+            </button>
+          </>
+        )}
+      </div>
+      <p
+        id="openjarvis-api-key-help"
+        className="max-w-md text-right text-[10px]"
+        style={{ color: 'var(--color-text-tertiary)' }}
+      >
+        {helpText}
+      </p>
+      {feedback && (
+        <p
+          role={feedback.kind === 'error' ? 'alert' : 'status'}
+          aria-live={feedback.kind === 'error' ? 'assertive' : 'polite'}
+          className="max-w-md text-right text-[10px]"
+          style={{
+            color: feedback.kind === 'error'
+              ? 'var(--color-error)'
+              : 'var(--color-success)',
+          }}
+        >
+          {feedback.message}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function CloudProviderStatus({ label, keyName }: { label: string; keyName: string }) {
   const [hasKey, setHasKey] = useState(false);
   const desktopKeyStorage = isTauri();
@@ -436,19 +608,10 @@ export function SettingsPage() {
                 }}
               />
             </SettingRow>
-            <SettingRow label="API key" description="Required only if the server was started with an API key">
-              <input
-                type="password"
+            <SettingRow label="API key" description="Bearer token for the local server; desktop changes also need Keychain sync">
+              <LocalServerApiKeyInput
                 value={settings.apiKey}
-                onChange={(e) => { updateSettings({ apiKey: e.target.value }); showSaved(); }}
-                placeholder="OPENJARVIS_API_KEY"
-                autoComplete="off"
-                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                style={{
-                  background: 'var(--color-bg-secondary)',
-                  color: 'var(--color-text)',
-                  border: '1px solid var(--color-border)',
-                }}
+                onChange={(apiKey) => updateSettings({ apiKey })}
               />
             </SettingRow>
           </Section>

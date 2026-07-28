@@ -1,5 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { transcribeAudio, fetchSpeechHealth } from '../lib/api';
+import {
+  encodePcm16Wav,
+  isSupportedRecordingMimeType,
+} from '../lib/wav';
 
 export type SpeechState = 'idle' | 'recording' | 'transcribing';
 
@@ -21,7 +25,7 @@ export function useSpeech() {
   const startRecording = useCallback(async (): Promise<void> => {
     setError(null);
 
-    if (!navigator.mediaDevices?.getUserMedia) {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       setError('Microphone not supported in this browser');
       return;
     }
@@ -30,7 +34,20 @@ export function useSpeech() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      const recorder = new MediaRecorder(stream);
+      const preferredMimeType = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+      ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+      const recorder = preferredMimeType
+        ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+        : new MediaRecorder(stream);
+      if (!isSupportedRecordingMimeType(recorder.mimeType)) {
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        throw new Error(`Unsupported recording format: ${recorder.mimeType || 'unknown'}`);
+      }
       chunksRef.current = [];
 
       recorder.ondataavailable = (e) => {
@@ -41,7 +58,10 @@ export function useSpeech() {
       mediaRecorderRef.current = recorder;
       setState('recording');
     } catch (err) {
-      setError('Microphone access denied');
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      const message = err instanceof Error ? err.message : 'Microphone access denied';
+      setError(message);
       setState('idle');
     }
   }, []);
@@ -55,17 +75,41 @@ export function useSpeech() {
       }
 
       recorder.onstop = async () => {
+        mediaRecorderRef.current = null;
         setState('transcribing');
 
         // Stop all audio tracks
         streamRef.current?.getTracks().forEach((track) => track.stop());
         streamRef.current = null;
 
-        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        const recordedBlob = new Blob(chunksRef.current, { type: recorder.mimeType });
         chunksRef.current = [];
 
         try {
-          const result = await transcribeAudio(blob);
+          if (recordedBlob.size === 0) {
+            throw new Error('Recorded audio is empty');
+          }
+          const AudioContextConstructor = window.AudioContext
+            || (window as unknown as { webkitAudioContext?: typeof AudioContext })
+              .webkitAudioContext;
+          if (!AudioContextConstructor) {
+            throw new Error('Audio decoding is not supported in this browser');
+          }
+
+          const audioContext = new AudioContextConstructor();
+          let decodedAudio: AudioBuffer;
+          try {
+            decodedAudio = await audioContext.decodeAudioData(
+              await recordedBlob.arrayBuffer(),
+            );
+          } catch {
+            throw new Error('Recorded audio could not be decoded');
+          } finally {
+            await audioContext.close().catch(() => undefined);
+          }
+
+          const wavBlob = encodePcm16Wav(decodedAudio);
+          const result = await transcribeAudio(wavBlob, 'recording.wav');
           setState('idle');
           resolve(result.text);
         } catch (err) {

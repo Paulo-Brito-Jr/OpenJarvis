@@ -71,6 +71,7 @@ EXPECTED_TOOLS = {
     # skynet_home.py
     "skynet_casa_read",
     "skynet_agenda_read",
+    "skynet_agenda_reminder_plan",
     "skynet_frota_read",
     "skynet_casa_request_action",
     "skynet_casa_action_status",

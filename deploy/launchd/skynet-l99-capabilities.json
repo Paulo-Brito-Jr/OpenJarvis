@@ -20,6 +20,10 @@
           "pattern": "skynet://agenda/busy"
         },
         {
+          "capability": "skynet:agenda:reminder:plan",
+          "pattern": "skynet://agenda/reminder/plan"
+        },
+        {
           "capability": "skynet:frota:read",
           "pattern": "skynet://frota/*"
         },
@@ -41,6 +45,31 @@
         "file:*",
         "channel:*",
         "email:*",
+        "message:*",
+        "schedule:*",
+        "system:*"
+      ]
+    },
+    {
+      "agent_id": "api:l99-desktop",
+      "grants": [
+        {
+          "capability": "tool:invoke",
+          "pattern": "/v1/chat/completions"
+        },
+        {
+          "capability": "tool:invoke",
+          "pattern": "/v1/speech/transcribe"
+        }
+      ],
+      "deny": [
+        "approval:*",
+        "channel:*",
+        "code:*",
+        "connector:*",
+        "email:*",
+        "file:*",
+        "memory:*",
         "message:*",
         "schedule:*",
         "system:*"

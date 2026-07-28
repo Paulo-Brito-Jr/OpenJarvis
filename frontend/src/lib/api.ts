@@ -1,5 +1,6 @@
 import type { ModelInfo, SavingsData, ServerInfo } from '../types';
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from './supabase';
+import { readValidatedWav } from './wav';
 
 // ---------------------------------------------------------------------------
 // Supabase config
@@ -332,12 +333,12 @@ export interface SpeechHealth {
   reason?: string;
 }
 
-export async function transcribeAudio(audioBlob: Blob, filename = 'recording.webm'): Promise<TranscriptionResult> {
+export async function transcribeAudio(audioBlob: Blob, filename = 'recording.wav'): Promise<TranscriptionResult> {
+  const audioBytes = await readValidatedWav(audioBlob, filename);
   if (isTauri()) {
     try {
-      const buffer = await audioBlob.arrayBuffer();
       return await tauriInvoke<TranscriptionResult>('transcribe_audio', {
-        audioData: Array.from(new Uint8Array(buffer)),
+        audioData: Array.from(audioBytes),
         filename,
       });
     } catch (err) {

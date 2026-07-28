@@ -7,6 +7,7 @@ code; capability-specific credentials are loaded from the process environment.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -30,6 +32,10 @@ _SESSION_ID_RE = re.compile(r"^\d{4}-\d{4}-[a-z0-9]{2,8}$")
 _BINDING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
+_ISO_OFFSET_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
@@ -48,6 +54,21 @@ _CASA_OPERATIONS = ("resumo", "estado")
 _AGENDA_WINDOWS = ("today", "upcoming")
 _FLEET_HOSTS = ("all", "pro", "air", "pb7", "pc-casa")
 _DESIRED_STATES = ("on", "off")
+_APPROVAL_STATUSES = (
+    "pending",
+    "approved",
+    "denied",
+    "expired",
+    "consumed",
+)
+_ACTION_POLICY_VERSION = "jarvis-actions.v1"
+_REMINDER_POLICY_VERSION = "jarvis-agenda-reminder.v1"
+_REMINDER_GATE_REQUIREMENTS = [
+    "persistent_approval_lookup",
+    "atomic_idempotency_claim",
+    "durable_terminal_receipt",
+    "verified_cancel_undo",
+]
 
 _DROP_OUTPUT_KEYS = {
     "account",
@@ -244,6 +265,87 @@ def _valid_idempotency_key(value: Any) -> bool:
     return isinstance(value, str) and _IDEMPOTENCY_RE.fullmatch(value) is not None
 
 
+def _valid_scheduled_for(value: Any) -> bool:
+    if not isinstance(value, str) or _ISO_OFFSET_RE.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _valid_reminder_text(value: Any) -> bool:
+    if not isinstance(value, str) or not 1 <= len(value) <= 240:
+        return False
+    normalized = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value.strip())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return bool(normalized) and len(normalized) <= 240
+
+
+def _normalize_reminder_text(value: str) -> str:
+    normalized = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", value.strip())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _canonical_utc_millis(value: Any) -> str | None:
+    if not _valid_scheduled_for(value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _valid_iso_timestamp(value: Any) -> bool:
+    return _canonical_utc_millis(value) is not None
+
+
+def _valid_bound_identifier(value: Any) -> bool:
+    return isinstance(value, str) and _BINDING_RE.fullmatch(value) is not None
+
+
+def _identity_matches(
+    value: Any,
+    headers: Mapping[str, str],
+) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"actor", "channel", "device_id", "session_id"}
+        and value.get("actor") == "unverified"
+        and value.get("channel") == headers.get("x-skynet-channel")
+        and value.get("device_id") == headers.get("x-skynet-device-id")
+        and value.get("session_id") == headers.get("x-skynet-session-id")
+    )
+
+
+def _valid_approval_payload(
+    payload: Mapping[str, Any],
+    *,
+    approval_id: Any | None = None,
+    desired_state: Any | None = None,
+) -> bool:
+    if (
+        not _valid_uuid(payload.get("approval_id"))
+        or payload.get("action") != "casa.definir_estado"
+        or payload.get("target_alias") != "tomada_cozinha_backlight"
+        or payload.get("desired_state") not in _DESIRED_STATES
+        or payload.get("status") not in _APPROVAL_STATUSES
+        or not _valid_iso_timestamp(payload.get("expires_at"))
+        or payload.get("policy_version") != _ACTION_POLICY_VERSION
+        or not isinstance(payload.get("replayed"), bool)
+    ):
+        return False
+    if approval_id is not None and payload.get("approval_id") != approval_id:
+        return False
+    return desired_state is None or payload.get("desired_state") == desired_state
+
+
 def _only_keys(params: Mapping[str, Any], allowed: frozenset[str]) -> bool:
     return set(params).issubset(allowed)
 
@@ -273,6 +375,16 @@ class _SkynetBoundaryTool(BaseTool):
     ) -> None:
         self._environ = os.environ if environ is None else environ
         self._transport = transport
+
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        return True
 
     def _request(
         self,
@@ -369,6 +481,12 @@ class _SkynetBoundaryTool(BaseTool):
                 not isinstance(payload, dict)
                 or payload.get("ok") is not True
                 or payload.get("schema") not in self._schemas
+                or not self._valid_response_payload(
+                    payload,
+                    query=query or {},
+                    body=body or {},
+                    headers=headers,
+                )
             ):
                 failure_metadata["error_code"] = "invalid_response_contract"
                 return ToolResult(
@@ -452,6 +570,39 @@ class SkynetCasaReadTool(_SkynetBoundaryTool):
             alias = "invalid"
         return f"skynet://casa/read/{alias}"
 
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del body
+        snapshot = payload.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return False
+        entities = snapshot.get("entities")
+        health = snapshot.get("health")
+        source = snapshot.get("source")
+        return (
+            payload.get("alias") == query.get("alias")
+            and payload.get("operation") == query.get("operation")
+            and payload.get("audit_status") == "not_persisted"
+            and _valid_iso_timestamp(payload.get("captured_at"))
+            and _valid_bound_identifier(payload.get("receipt_id"))
+            and _identity_matches(payload.get("identity"), headers)
+            and isinstance(entities, list)
+            and len(entities) <= 200
+            and snapshot.get("total") == len(entities)
+            and isinstance(snapshot.get("truncated"), bool)
+            and isinstance(health, dict)
+            and isinstance(health.get("fresh"), bool)
+            and health.get("reachable") is True
+            and isinstance(source, dict)
+            and source.get("instance") == "ha-casa-proxmox"
+        )
+
     def execute(self, **params: Any) -> ToolResult:
         alias = params.get("alias")
         operation = params.get("operation")
@@ -514,6 +665,77 @@ class SkynetAgendaReadTool(_SkynetBoundaryTool):
     def authorization_resource(self, params: dict[str, Any]) -> str:
         return "skynet://agenda/busy"
 
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del body, headers
+        window = payload.get("window")
+        agenda = payload.get("agenda")
+        if not isinstance(window, dict) or not isinstance(agenda, dict):
+            return False
+        events = agenda.get("events")
+        policy = agenda.get("content_policy")
+        if not isinstance(events, list) or not isinstance(policy, dict):
+            return False
+
+        expected_days = 1 if query.get("window") == "today" else int(query["days"])
+        starts_at = _canonical_utc_millis(window.get("starts_at"))
+        ends_at = _canonical_utc_millis(window.get("ends_at"))
+        if (
+            starts_at is None
+            or ends_at is None
+            or datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+            >= datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+        ):
+            return False
+
+        for event in events:
+            if not isinstance(event, dict) or set(event) != {
+                "availability",
+                "starts_at",
+                "ends_at",
+                "all_day",
+            }:
+                return False
+            event_start = _canonical_utc_millis(event.get("starts_at"))
+            event_end = (
+                _canonical_utc_millis(event.get("ends_at"))
+                if event.get("ends_at") is not None
+                else None
+            )
+            if (
+                event.get("availability") != "busy"
+                or event_start is None
+                or not isinstance(event.get("all_day"), bool)
+                or event_start < starts_at
+                or event_start >= ends_at
+                or (event.get("ends_at") is not None and event_end is None)
+                or (event_end is not None and event_end < event_start)
+            ):
+                return False
+
+        return (
+            payload.get("audit_status") == "not_persisted"
+            and _valid_iso_timestamp(payload.get("captured_at"))
+            and _valid_bound_identifier(payload.get("receipt_id"))
+            and window.get("kind") == query.get("window")
+            and window.get("days") == expected_days
+            and window.get("timezone") == "America/Sao_Paulo"
+            and agenda.get("source") == "apple_calendar_mirror"
+            and agenda.get("reachable") is True
+            and agenda.get("freshness") == "not_observed"
+            and policy.get("event_titles_exposed") is False
+            and policy.get("executable") is False
+            and agenda.get("total") == len(events)
+            and len(events) <= int(query["limit"])
+            and isinstance(agenda.get("truncated"), bool)
+        )
+
     def execute(self, **params: Any) -> ToolResult:
         window = params.get("window", "today")
         days = params.get("days", 7)
@@ -532,6 +754,171 @@ class SkynetAgendaReadTool(_SkynetBoundaryTool):
         return self._request(
             method="GET",
             query={"window": window, "days": str(days), "limit": str(limit)},
+        )
+
+
+@ToolRegistry.register("skynet_agenda_reminder_plan")
+class SkynetAgendaReminderPlanTool(_SkynetBoundaryTool):
+    """Prepare a reminder plan without persisting or executing a reminder."""
+
+    tool_id = "skynet_agenda_reminder_plan"
+    _credential_prefix = "SKYNET_JARVIS_REMINDER_PLAN"
+    _path = "/api/agent/jarvis/agenda/reminder"
+    _schemas = frozenset({"jarvis.agenda.reminder.plan.v1"})
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.tool_id,
+            description=(
+                "Validate and return a dry-run plan for Paulo's reminder. "
+                "This never persists, schedules, or executes a reminder."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "approval_id": {"type": "string", "format": "uuid"},
+                    "scheduled_for": {"type": "string", "format": "date-time"},
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 240,
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 16,
+                        "maxLength": 128,
+                        "pattern": _IDEMPOTENCY_RE.pattern,
+                    },
+                },
+                "required": [
+                    "approval_id",
+                    "scheduled_for",
+                    "text",
+                    "idempotency_key",
+                ],
+                "additionalProperties": False,
+            },
+            category="skynet",
+            timeout_seconds=10.0,
+            required_capabilities=[
+                "network:fetch",
+                "skynet:agenda:reminder:plan",
+            ],
+        )
+
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        return "skynet://agenda/reminder/plan"
+
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del query
+        undo = payload.get("undo")
+        plan = payload.get("plan")
+        gate = payload.get("gate")
+        identity = payload.get("identity")
+        if (
+            not isinstance(plan, dict)
+            or not isinstance(undo, dict)
+            or not isinstance(gate, dict)
+            or not _identity_matches(identity, headers)
+        ):
+            return False
+
+        scheduled_for = _canonical_utc_millis(body.get("scheduled_for"))
+        text = body.get("text")
+        if scheduled_for is None or not isinstance(text, str):
+            return False
+        normalized_text = _normalize_reminder_text(text)
+        text_sha256 = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        digest_input = {
+            "action": "agenda.reminder.create",
+            "actor": "unverified",
+            "approval_id": body.get("approval_id"),
+            "channel": headers.get("x-skynet-channel"),
+            "device_id": headers.get("x-skynet-device-id"),
+            "idempotency_key": body.get("idempotency_key"),
+            "policy_version": _REMINDER_POLICY_VERSION,
+            "scheduled_for": scheduled_for,
+            "session_id": headers.get("x-skynet-session-id"),
+            "target_alias": "paulo_self",
+            "text_sha256": text_sha256,
+        }
+        action_digest = hashlib.sha256(
+            json.dumps(
+                digest_input,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        plan_text = plan.get("text")
+        idempotency = plan.get("idempotency")
+        return (
+            payload.get("dry_run") is True
+            and payload.get("mutation_executed") is False
+            and payload.get("audit_status") == "not_persisted"
+            and payload.get("plan_id") == f"plan_{action_digest[:32]}"
+            and plan.get("action") == "agenda.reminder.create"
+            and plan.get("target_alias") == "paulo_self"
+            and plan.get("scheduled_for") == scheduled_for
+            and isinstance(plan_text, dict)
+            and plan_text.get("length") == len(normalized_text)
+            and plan_text.get("sha256") == text_sha256
+            and plan_text.get("trust") == "untrusted_user_data"
+            and plan_text.get("echoed") is False
+            and plan.get("action_digest") == action_digest
+            and plan.get("policy_version") == _REMINDER_POLICY_VERSION
+            and plan.get("approval_binding") == "required_but_not_verified_in_dry_run"
+            and isinstance(idempotency, dict)
+            and idempotency.get("key_bound_to_digest") is True
+            and idempotency.get("atomic_claim") == "not_persisted"
+            and undo.get("action") == "agenda.reminder.cancel"
+            and undo.get("availability") == "blocked_until_durable_backend"
+            and gate.get("error_if_executed") == "reminder_backend_not_ready"
+            and gate.get("requirements") == _REMINDER_GATE_REQUIREMENTS
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        approval_id = params.get("approval_id")
+        scheduled_for = params.get("scheduled_for")
+        text = params.get("text")
+        idempotency_key = params.get("idempotency_key")
+        if (
+            not _only_keys(
+                params,
+                frozenset(
+                    {
+                        "approval_id",
+                        "scheduled_for",
+                        "text",
+                        "idempotency_key",
+                    }
+                ),
+            )
+            or not _valid_uuid(approval_id)
+            or not _valid_scheduled_for(scheduled_for)
+            or not _valid_reminder_text(text)
+            or not _valid_idempotency_key(idempotency_key)
+        ):
+            return _invalid(self.tool_id)
+
+        return self._request(
+            method="POST",
+            body={
+                "action": "agenda.reminder.create",
+                "approval_id": approval_id,
+                "dry_run": True,
+                "idempotency_key": idempotency_key,
+                "scheduled_for": scheduled_for,
+                "target_alias": "paulo_self",
+                "text": text,
+            },
         )
 
 
@@ -570,6 +957,81 @@ class SkynetFrotaReadTool(_SkynetBoundaryTool):
         if host not in _FLEET_HOSTS:
             host = "invalid"
         return f"skynet://frota/{host}"
+
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del body, headers
+        fleet = payload.get("fleet")
+        if not isinstance(fleet, dict):
+            return False
+        machines = fleet.get("machines")
+        if not isinstance(machines, list):
+            return False
+        expected_hosts = (
+            set(_FLEET_HOSTS[1:])
+            if query.get("host") == "all"
+            else {str(query.get("host"))}
+        )
+        seen: set[str] = set()
+        observed_hosts = 0
+        stale_hosts = 0
+        labels = {
+            "pro": "Pro",
+            "air": "Air",
+            "pb7": "PB7",
+            "pc-casa": "PC-Casa",
+        }
+        for machine in machines:
+            if not isinstance(machine, dict):
+                return False
+            host = machine.get("host")
+            observed_at = machine.get("observed_at")
+            age_seconds = machine.get("age_seconds")
+            health = machine.get("health")
+            online = machine.get("online")
+            stale = machine.get("stale")
+            if (
+                host not in expected_hosts
+                or host in seen
+                or machine.get("label") != labels.get(host)
+                or health not in {"healthy", "degraded", "offline", "unknown"}
+                or online not in {True, False, None}
+                or not isinstance(stale, bool)
+                or (observed_at is not None and not _valid_iso_timestamp(observed_at))
+                or (
+                    age_seconds is not None
+                    and (
+                        isinstance(age_seconds, bool)
+                        or not isinstance(age_seconds, int)
+                        or age_seconds < 0
+                    )
+                )
+                or ((observed_at is None) != (age_seconds is None))
+                or (health == "healthy" and online is not True)
+                or (health == "offline" and online is not False)
+                or (health in {"degraded", "unknown"} and online is not None)
+                or not _valid_bound_identifier(machine.get("reason"))
+            ):
+                return False
+            seen.add(str(host))
+            observed_hosts += observed_at is not None
+            stale_hosts += stale
+
+        return (
+            payload.get("audit_status") == "not_persisted"
+            and _valid_iso_timestamp(payload.get("captured_at"))
+            and _valid_bound_identifier(payload.get("receipt_id"))
+            and seen == expected_hosts
+            and fleet.get("expected_hosts") == len(machines)
+            and fleet.get("observed_hosts") == observed_hosts
+            and fleet.get("stale_hosts") == stale_hosts
+        )
 
     def execute(self, **params: Any) -> ToolResult:
         host = params.get("host", "all")
@@ -635,6 +1097,21 @@ class SkynetCasaRequestActionTool(_SkynetCasaActionTool):
             ],
         )
 
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del query, headers
+        args = body.get("args")
+        return isinstance(args, dict) and _valid_approval_payload(
+            payload,
+            desired_state=args.get("desired_state"),
+        )
+
     def execute(self, **params: Any) -> ToolResult:
         desired_state = params.get("desired_state")
         idempotency_key = params.get("idempotency_key")
@@ -685,6 +1162,20 @@ class SkynetCasaActionStatusTool(_SkynetCasaActionTool):
         if not _valid_uuid(approval_id):
             approval_id = "invalid"
         return f"skynet://casa/approval/{approval_id}"
+
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del body, headers
+        return _valid_approval_payload(
+            payload,
+            approval_id=query.get("approval_id"),
+        )
 
     def execute(self, **params: Any) -> ToolResult:
         approval_id = params.get("approval_id")
@@ -741,6 +1232,43 @@ class SkynetCasaExecuteActionTool(_SkynetCasaActionTool):
             required_capabilities=["network:fetch", "skynet:casa:write"],
         )
 
+    def _valid_response_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        query: Mapping[str, str],
+        body: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> bool:
+        del query, headers
+        args = body.get("args")
+        rollback = payload.get("rollback")
+        if not isinstance(args, dict) or not isinstance(rollback, dict):
+            return False
+        desired_state = args.get("desired_state")
+        status = payload.get("status")
+        result_code = payload.get("result_code")
+        return (
+            body.get("dry_run") is False
+            and payload.get("mode") == "execute"
+            and payload.get("action") == "casa.definir_estado"
+            and payload.get("target_alias") == "tomada_cozinha_backlight"
+            and payload.get("desired_state") == desired_state
+            and payload.get("observed_state") == desired_state
+            and status in {"noop", "succeeded"}
+            and (
+                (status == "noop" and result_code == "already_in_state")
+                or (
+                    status == "succeeded"
+                    and result_code in {"state_changed", "state_changed_recovered"}
+                )
+            )
+            and _valid_bound_identifier(payload.get("receipt_id"))
+            and isinstance(payload.get("replayed"), bool)
+            and rollback.get("attempted") is False
+            and rollback.get("succeeded") is None
+        )
+
     def execute(self, **params: Any) -> ToolResult:
         approval_id = params.get("approval_id")
         desired_state = params.get("desired_state")
@@ -767,6 +1295,7 @@ class SkynetCasaExecuteActionTool(_SkynetCasaActionTool):
 
 __all__ = [
     "SkynetAgendaReadTool",
+    "SkynetAgendaReminderPlanTool",
     "SkynetCasaActionStatusTool",
     "SkynetCasaExecuteActionTool",
     "SkynetCasaReadTool",
