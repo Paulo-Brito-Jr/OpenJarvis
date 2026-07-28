@@ -27,6 +27,7 @@ import {
   setInferenceSource,
   getCloudKeyStatus,
   saveCloudKey,
+  setRuntimeApiKey,
   isTauri,
   type InferenceSource,
 } from '../lib/api';
@@ -186,11 +187,11 @@ function LocalServerApiKeyInput({
     setFeedback(null);
     try {
       await saveCloudKey('OPENJARVIS_API_KEY', next);
-      onChange(next);
+      onChange('');
       setHasKey(true);
       setFeedback({
         kind: 'success',
-        message: 'Saved securely in Keychain. Restart OpenJarvis to apply it.',
+        message: 'Saved securely in Keychain. This session keeps using its current key; restart OpenJarvis to apply the new key.',
       });
       window.dispatchEvent(new Event(CLOUD_KEY_STATUS_CHANGED));
     } catch (e: any) {
@@ -212,7 +213,7 @@ function LocalServerApiKeyInput({
       setHasKey(false);
       setFeedback({
         kind: 'success',
-        message: 'Removed from Keychain and local settings. Restart OpenJarvis to apply it.',
+        message: 'Removed from Keychain. This session keeps using its current key until OpenJarvis restarts.',
       });
       window.dispatchEvent(new Event(CLOUD_KEY_STATUS_CHANGED));
     } catch (e: any) {
@@ -226,8 +227,8 @@ function LocalServerApiKeyInput({
   };
 
   const helpText = desktopKeyStorage
-    ? `${hasKey ? 'A key is stored in Keychain.' : 'No key is stored in Keychain.'} Restart OpenJarvis after saving or removing it.`
-    : 'Keychain sync is available in the OpenJarvis desktop app. This value remains in local app settings.';
+    ? `${hasKey ? 'A key is stored in Keychain.' : 'No key is stored in Keychain.'} Saving, rotating, or removing it does not change the current session; restart OpenJarvis to apply the Keychain state.`
+    : 'Keychain sync is available in the desktop app. This value stays in memory for this browser session only.';
 
   return (
     <div className="flex flex-col items-end gap-1.5" aria-busy={busy}>
@@ -237,10 +238,12 @@ function LocalServerApiKeyInput({
           type="password"
           value={value}
           onChange={(e) => {
-            onChange(e.target.value);
+            const next = e.target.value;
+            onChange(next);
+            if (!desktopKeyStorage) setRuntimeApiKey(next);
             setFeedback(null);
           }}
-          placeholder="OPENJARVIS_API_KEY"
+          placeholder={hasKey ? 'Stored in Keychain' : 'OPENJARVIS_API_KEY'}
           autoComplete="off"
           aria-label="OpenJarvis local server API key"
           aria-describedby="openjarvis-api-key-help"

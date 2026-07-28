@@ -439,6 +439,7 @@ impl Default for SetupStatus {
 }
 
 type SharedStatus = Arc<Mutex<SetupStatus>>;
+type SharedBootLock = Arc<Mutex<()>>;
 
 // ---------------------------------------------------------------------------
 // Health-check helpers
@@ -919,6 +920,14 @@ fn check_jarvis_port_available() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
+    // Fail before model/dependency work when the local server cannot be
+    // authenticated. A post-migration retry can then start promptly.
+    if let Err(error) = required_local_api_key() {
+        let mut s = status.lock().await;
+        s.error = Some(error);
+        return;
+    }
+
     // Decide the inference source (default Ollama) before launching anything.
     let cfg = read_inference_config();
     let plan = boot_plan(&cfg, total_ram_gb());
@@ -1557,6 +1566,21 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // `pull_model` command invoked from the UI).
 }
 
+/// Serialize auto-boot and explicit retries. The retry waits for the active
+/// attempt and only starts a new one when no healthy server was established.
+async fn boot_backend_serialized(
+    backend: SharedBackend,
+    status: SharedStatus,
+    boot_lock: SharedBootLock,
+) {
+    let _guard = boot_lock.lock().await;
+    if status.lock().await.server_ready {
+        return;
+    }
+    *status.lock().await = SetupStatus::default();
+    boot_backend(backend, status).await;
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -1579,11 +1603,22 @@ fn get_api_base() -> String {
 async fn start_backend(
     backend: tauri::State<'_, SharedBackend>,
     status: tauri::State<'_, SharedStatus>,
+    boot_lock: tauri::State<'_, SharedBootLock>,
 ) -> Result<(), String> {
     let b = backend.inner().clone();
     let s = status.inner().clone();
-    tauri::async_runtime::spawn(boot_backend(b, s));
-    Ok(())
+    let lock = boot_lock.inner().clone();
+    boot_backend_serialized(b, s.clone(), lock).await;
+
+    let final_status = s.lock().await;
+    if final_status.server_ready {
+        Ok(())
+    } else {
+        Err(final_status
+            .error
+            .clone()
+            .unwrap_or_else(|| "Backend startup ended before becoming ready".into()))
+    }
 }
 
 #[tauri::command]
@@ -2324,6 +2359,15 @@ async fn save_cloud_key(key_name: String, key_value: String) -> Result<(), Strin
     Ok(())
 }
 
+/// Load the local server API key into ephemeral WebView memory at startup.
+///
+/// The frontend needs the value to attach a Bearer header to streaming fetches;
+/// it must never persist or log the returned credential.
+#[tauri::command]
+fn get_local_api_key() -> Result<Option<String>, String> {
+    configured_local_api_key()
+}
+
 /// Get which cloud providers have keys configured (without exposing values).
 #[tauri::command]
 async fn get_cloud_key_status() -> Result<serde_json::Value, String> {
@@ -2932,13 +2976,16 @@ async fn hide_overlay() -> Result<(), String> {
 pub fn run() {
     let backend: SharedBackend = Arc::new(Mutex::new(BackendManager::default()));
     let status: SharedStatus = Arc::new(Mutex::new(SetupStatus::default()));
+    let boot_lock: SharedBootLock = Arc::new(Mutex::new(()));
 
     let boot_backend_ref = backend.clone();
     let boot_status_ref = status.clone();
+    let boot_lock_ref = boot_lock.clone();
 
     tauri::Builder::default()
         .manage(backend.clone())
         .manage(status.clone())
+        .manage(boot_lock.clone())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -3017,7 +3064,11 @@ pub fn run() {
             }
 
             // Auto-start backend services on launch
-            tauri::async_runtime::spawn(boot_backend(boot_backend_ref, boot_status_ref));
+            tauri::async_runtime::spawn(boot_backend_serialized(
+                boot_backend_ref,
+                boot_status_ref,
+                boot_lock_ref,
+            ));
 
             Ok(())
         })
@@ -3045,6 +3096,7 @@ pub fn run() {
             pull_ollama_model,
             delete_ollama_model,
             save_cloud_key,
+            get_local_api_key,
             get_cloud_key_status,
             get_inference_source,
             set_inference_source,

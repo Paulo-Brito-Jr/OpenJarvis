@@ -51,3 +51,69 @@ on 2026-07-26, inside the cooldown. The VLLM extra pins 8.0.2 instead.
 
 The dry-run and audit do not by themselves authorize a service start. Runtime
 installation and activation remain separate security gates.
+
+## Follow-up: base/server transitive findings
+
+The frozen environment scan also reported seven packages selected by the
+`server` extra. These were not seven independent advisory records: OSV returned
+55 records, of which 27 were duplicate PYSEC/GHSA aliases for the same CVE.
+After grouping by CVE there were 28 distinct vulnerabilities:
+
+| Package | Old | OSV records | Unique CVEs | Active server path | Accepted exact version |
+| --- | --- | ---: | ---: | --- | --- |
+| aiohttp | 3.13.3 | 42 | 21 | `datasets[http] -> fsspec -> aiohttp` | 3.14.1 |
+| click | 8.3.1 | 1 | 1 | direct OpenJarvis dependency | 8.3.3 |
+| idna | 3.11 | 2 | 1 | `httpx` / `requests` / `yarl` | 3.15 |
+| lxml | 6.0.2 | 2 | 1 | `ddgs -> lxml` | 6.1.0 |
+| pygments | 2.19.2 | 2 | 1 | `rich -> pygments` | 2.20.0 |
+| requests | 2.32.5 | 2 | 1 | `datasets` / `posthog` | 2.33.0 |
+| urllib3 | 2.6.3 | 4 | 2 | `requests -> urllib3` | 2.7.0 |
+
+There were therefore no package-level false positives in this set. Optional
+extras add more reverse paths, but `uv sync --extra server --no-dev --dry-run`
+selected all seven through the base/server graph.
+
+The accepted releases are the smallest later releases for which the exact
+OSV-version query returned no findings:
+
+| Package | Version | Uploaded (UTC) | PyPI vulns | OSV vulns | sdist SHA-256 |
+| --- | --- | --- | ---: | ---: | --- |
+| aiohttp | 3.14.1 | 2026-06-07 21:05:37 | 0 | 0 | `307f2cff90a764d329e77040603fa032db89c5c24fdad50c4c15334cba744035` |
+| click | 8.3.3 | 2026-04-22 15:11:25 | 0 | 0 | `398329ad4837b2ff7cbe1dd166a4c0f8900c3ca3a218de04466f38f6497f18a2` |
+| idna | 3.15 | 2026-05-12 22:45:55 | 0 | 0 | `ca962446ea538f7092a95e057da437618e886f4d349216d2b1e294abfdb65fdc` |
+| lxml | 6.1.0 | 2026-04-18 04:27:24 | 0 | 0 | `bfd57d8008c4965709a919c3e9a98f76c2c7cb319086b3d26858250620023b13` |
+| Pygments | 2.20.0 | 2026-03-29 13:29:30 | 0 | 0 | `6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f` |
+| Requests | 2.33.0 | 2026-03-25 15:10:40 | 0 | 0 | `c7ebc5e8b0f21837386ad0e1c8fe8b829fa5f544d8df3b2253bff14ef29d7652` |
+| urllib3 | 2.7.0 | 2026-05-07 16:13:17 | 0 | 0 | `231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c` |
+
+All seven releases were more than seven days old on 2026-07-28. Exact-version
+Socket pages were requested for every candidate; the direct client was denied
+with HTTP 403. Socket's indexed package analysis was available for aiohttp
+3.14.1 and urllib3 2.7.0, with package/version listings available for Click and
+Pygments. PyPI metadata, OSV exact-version queries, official repository release
+or changelog pages, and recent package-specific compromise searches were used
+as the documented fallback; none identified a compromise of an accepted
+release.
+
+`click` is exact-pinned as a direct dependency. The six transitive packages are
+exact-pinned in `[tool.uv].constraint-dependencies`, which restricts an existing
+dependency without causing an otherwise-unused package to be installed.
+
+The update sequence was:
+
+- exact candidate resolution with `uv lock --dry-run -P package==version`;
+- manifest constraints plus a second plain `uv lock --dry-run`;
+- `uv lock`, preserving the existing lockfile and its artifact hashes;
+- `uv lock --check`;
+- `uv sync --extra server --no-dev --dry-run`, selecting 64 packages and all
+  seven corrected versions without creating `.venv`;
+- a final OSV querybatch, which returned zero findings for all seven exact
+  versions;
+- an OSV querybatch generated from the complete exported server resolution
+  (70 platform-marked requirement records for the 64 selected packages), which
+  returned zero vulnerable records.
+
+The unified lock still warns about the pre-existing yanked
+`grpcio==1.78.1` under disabled optional graphs and the pre-existing missing
+`zeus-ml` `apple` extra. Neither package is selected by the 64-package
+`--extra server --no-dev` dry-run, and neither was changed in this follow-up.

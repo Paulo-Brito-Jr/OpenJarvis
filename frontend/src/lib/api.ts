@@ -1,4 +1,10 @@
 import type { ModelInfo, SavingsData, ServerInfo } from '../types';
+import {
+  commitLegacyApiKeyMigration,
+  getRuntimeApiKey,
+  inspectLegacyApiKeyStorage,
+  setRuntimeApiKey,
+} from './api-key-runtime';
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from './supabase';
 import { readValidatedWav } from './wav';
 
@@ -13,6 +19,8 @@ declare global {
 }
 
 export const isTauri = () => typeof window !== 'undefined' && !!window.__TAURI_INTERNALS__;
+
+const LOCAL_API_KEY_NAME = 'OPENJARVIS_API_KEY';
 
 export type CloudKeyStatus = Record<string, boolean>;
 
@@ -37,6 +45,171 @@ export async function saveCloudKey(keyName: string, keyValue: string): Promise<v
   } catch (e: any) {
     throw new Error(e?.message ?? e ?? 'Failed to save cloud key');
   }
+}
+
+export type ApiKeyInitFailureCode =
+  | 'legacy_storage_unavailable'
+  | 'legacy_cleanup_failed'
+  | 'legacy_conflict'
+  | 'keychain_unavailable'
+  | 'keychain_write_failed'
+  | 'keychain_verification_failed'
+  | 'backend_restart_failed';
+
+export type ApiKeyInitResult =
+  | { ok: true; migrated: boolean }
+  | {
+      ok: false;
+      code: ApiKeyInitFailureCode;
+      message: string;
+    };
+
+const API_KEY_INIT_MESSAGES: Record<ApiKeyInitFailureCode, string> = {
+  legacy_storage_unavailable:
+    'Secure startup could not inspect the legacy settings store.',
+  legacy_cleanup_failed:
+    'The API key was secured, but its legacy settings copy could not be removed.',
+  legacy_conflict:
+    'Keychain and legacy settings contain different local API keys.',
+  keychain_unavailable:
+    'Secure startup could not read the local API key from Keychain.',
+  keychain_write_failed:
+    'Secure startup could not save the local API key to Keychain.',
+  keychain_verification_failed:
+    'Secure startup could not verify the local API key in Keychain.',
+  backend_restart_failed:
+    'The API key was secured, but the local backend could not be restarted.',
+};
+
+let backendRestartRequired = false;
+
+function apiKeyInitFailure(
+  code: ApiKeyInitFailureCode,
+): ApiKeyInitResult {
+  return { ok: false, code, message: API_KEY_INIT_MESSAGES[code] };
+}
+
+async function invokeDesktop<T>(
+  command: string,
+  args: Record<string, unknown> = {},
+): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<T>(command, args);
+}
+
+async function restartBackendAfterMigration(): Promise<ApiKeyInitResult | null> {
+  if (!backendRestartRequired) return null;
+
+  try {
+    await invokeDesktop<void>('start_backend');
+    backendRestartRequired = false;
+    return null;
+  } catch {
+    return apiKeyInitFailure('backend_restart_failed');
+  }
+}
+
+/**
+ * Hydrate the local server Bearer token before the UI can issue HTTP or SSE
+ * requests. Legacy plaintext is removed only after its safe replacement is
+ * confirmed. Any failure blocks normal UI startup without exposing the key.
+ */
+export async function initApiKey(): Promise<ApiKeyInitResult> {
+  const legacy = inspectLegacyApiKeyStorage();
+  if (legacy.kind === 'error') {
+    return apiKeyInitFailure('legacy_storage_unavailable');
+  }
+
+  if (!isTauri()) {
+    if (legacy.kind === 'found') {
+      // Browser builds have no Keychain bridge. Move the value to process
+      // memory before committing deletion from persistent storage.
+      setRuntimeApiKey(legacy.apiKey);
+      if (!commitLegacyApiKeyMigration(legacy)) {
+        return apiKeyInitFailure('legacy_cleanup_failed');
+      }
+      return { ok: true, migrated: true };
+    }
+    return { ok: true, migrated: false };
+  }
+
+  let keychainApiKey: string | null;
+  try {
+    keychainApiKey = await invokeDesktop<string | null>('get_local_api_key');
+  } catch {
+    return apiKeyInitFailure('keychain_unavailable');
+  }
+
+  const canonicalApiKey = keychainApiKey?.trim() ?? '';
+  if (canonicalApiKey) {
+    setRuntimeApiKey(canonicalApiKey);
+    let migratedLegacy = false;
+
+    if (legacy.kind === 'found') {
+      if (legacy.apiKey && legacy.apiKey !== canonicalApiKey) {
+        // Preserve both copies for explicit reconciliation. Deleting the only
+        // copy of either value would make this migration lossy.
+        return apiKeyInitFailure('legacy_conflict');
+      }
+      if (legacy.apiKey) {
+        // The same value in both locations may be a retry after an IPC write
+        // completed but its response was lost. Restarting is idempotent and
+        // closes the auto-boot race in that partial-success case.
+        backendRestartRequired = true;
+        migratedLegacy = true;
+      }
+      if (!commitLegacyApiKeyMigration(legacy)) {
+        return apiKeyInitFailure('legacy_cleanup_failed');
+      }
+    }
+
+    const restartFailure = await restartBackendAfterMigration();
+    return restartFailure ?? {
+      ok: true,
+      migrated: migratedLegacy,
+    };
+  }
+
+  if (legacy.kind !== 'found' || !legacy.apiKey) {
+    setRuntimeApiKey('');
+    if (
+      legacy.kind === 'found'
+      && !commitLegacyApiKeyMigration(legacy)
+    ) {
+      return apiKeyInitFailure('legacy_cleanup_failed');
+    }
+    return { ok: true, migrated: legacy.kind === 'found' };
+  }
+
+  try {
+    await invokeDesktop<void>('save_cloud_key', {
+      keyName: LOCAL_API_KEY_NAME,
+      keyValue: legacy.apiKey,
+    });
+    backendRestartRequired = true;
+  } catch {
+    return apiKeyInitFailure('keychain_write_failed');
+  }
+
+  let verifiedApiKey: string | null;
+  try {
+    verifiedApiKey = await invokeDesktop<string | null>('get_local_api_key');
+  } catch {
+    return apiKeyInitFailure('keychain_verification_failed');
+  }
+
+  const canonicalMigratedApiKey = verifiedApiKey?.trim() ?? '';
+  if (canonicalMigratedApiKey !== legacy.apiKey) {
+    return apiKeyInitFailure('keychain_verification_failed');
+  }
+
+  setRuntimeApiKey(canonicalMigratedApiKey);
+  if (!commitLegacyApiKeyMigration(legacy)) {
+    return apiKeyInitFailure('legacy_cleanup_failed');
+  }
+
+  const restartFailure = await restartBackendAfterMigration();
+  return restartFailure ?? { ok: true, migrated: true };
 }
 
 // Cached API base URL fetched from the Tauri backend at startup.
@@ -76,24 +249,12 @@ export const getBase = (): string => {
   return '';
 };
 
-// Resolve the local server API key (OPENJARVIS_API_KEY). When `jarvis serve`
-// is started with a key, AuthMiddleware 401s every /v1 and /api request that
-// lacks a Bearer token — so the frontend must send it (#266). Sourced from the
-// same settings blob as the API URL, with an optional build-time env override.
-// Returns '' when unset, so a keyless local server keeps working unchanged.
-export const getApiKey = (): string => {
-  try {
-    const raw = localStorage.getItem('openjarvis-settings');
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed.apiKey) return String(parsed.apiKey);
-    }
-  } catch {}
-  if (import.meta.env.VITE_OPENJARVIS_API_KEY) {
-    return import.meta.env.VITE_OPENJARVIS_API_KEY as string;
-  }
-  return '';
-};
+// Resolve the local server API key synchronously for both regular fetches and
+// long-lived SSE requests. It is held only in WebView module memory; desktop
+// persistence is exclusively handled by Keychain.
+export const getApiKey = (): string => getRuntimeApiKey();
+
+export { setRuntimeApiKey };
 
 // Build request headers with the Bearer Authorization token when a local key
 // is configured, merging any caller-supplied headers. Adds no Authorization
