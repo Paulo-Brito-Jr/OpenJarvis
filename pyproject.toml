@@ -201,6 +201,7 @@ openjarvis-rust = { path = "rust/crates/openjarvis-python" }
 # package unless another first- or third-party dependency requests it.
 constraint-dependencies = [
     "aiohttp==3.14.1",
+    "grpcio==1.78.0",
     "idna==3.15",
     "lxml==6.1.0",
     "pymdown-extensions==11.0.1",
