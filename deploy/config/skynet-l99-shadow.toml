@@ -1,9 +1,9 @@
 # OpenJarvis L99 — perfil shadow read-only para o MacBook Air.
 # Não contém credenciais. O launcher injeta somente quatro segredos vindos
 # de contas exatas no Keychain e mantém o serviço desligado por padrão.
-# A identidade já é isolada por request. Como desconectar um stream ainda não
-# interrompe imediatamente a thread síncrona, este perfil permanece estritamente
-# read-only/default-deny e sem qualquer tool mutante.
+# A identidade é isolada por request e desconexões sinalizam cancelamento
+# cooperativo nos boundaries do agente e das tools. Mesmo assim, este perfil
+# permanece estritamente read-only/default-deny até os gates humanos de canário.
 
 [engine]
 default = "ollama"

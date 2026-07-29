@@ -106,9 +106,9 @@ def test_shadow_profile_is_local_only_and_read_only() -> None:
             section = section[name]
         assert section["enabled"] is False, ".".join(section_path)
     assert config["speech"]["backend"] == "disabled"
-    assert "identidade já é isolada por request" in profile_text
-    assert "não\n# interrompe imediatamente a thread síncrona" in profile_text
-    assert "read-only/default-deny e sem qualquer tool mutante" in profile_text
+    assert "identidade é isolada por request" in profile_text
+    assert "desconexões sinalizam cancelamento" in profile_text
+    assert "read-only/default-deny até os gates humanos de canário" in profile_text
 
 
 def test_shadow_policy_grants_only_three_read_boundaries() -> None:
