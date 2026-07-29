@@ -139,3 +139,53 @@ Socket's exact package/version page again returned HTTP 403, so PyPI metadata,
 OSV, the verified upstream fix commit and recent compromise searches form the
 documented fallback. The dependency is constrained transitively and does not
 enter the 64-package `server` path unless the `docs` extra is requested.
+
+## Follow-up: approved dependency hardening
+
+Paulo explicitly approved the three pending dependency changes on 2026-07-28.
+This approval covers the repository patch and isolated verification only. It
+does not authorize starting the L99 service, opening a physical-device
+capability, merging, deploying, or migrating data.
+
+The accepted changes are:
+
+| Package | Accepted version | Reason | Verification |
+| --- | --- | --- | --- |
+| pytest | 9.0.3 | first release after the advisory affecting versions through 9.0.2 | exact lock update; wheel SHA-256 `2c5efcc3e665e43485a1bd0e9d40f1b7e32fe0f716d58836e30e766dadcab5d9`; OSV 0 |
+| grpcio | 1.78.0 | 1.78.1 was yanked after a Google serverless outage | exact transitive constraint; sdist SHA-256 `7382b95189546f375c174f53a5fa873cef91c4b8005faa05cc5b3beea9c4f1c5`; OSV 0 |
+| zeus | 0.16.0 | replaces the invalid `zeus-ml[apple]` extra with the supported package and API | exact Apple-only extra; wheel SHA-256 `82f3a97cd8a2ce60d4a9b4335736039520984a32282b2663a2431ebd4ba8df7c`; OSV 0 |
+| zeus-apple-silicon | 1.1.0 | helper selected by `zeus[apple]` on Apple Silicon | exact lock artifact; OSV 0 |
+
+All four releases were outside the seven-day cooldown, none was yanked, and
+recent package-specific compromise searches found no direct compromise. Socket
+provided an exact pytest package page; its exact grpcio and Zeus pages were not
+retrievable, so PyPI provenance and hashes, OSV exact-version queries, official
+release documentation, and recent supply-chain searches form the documented
+fallback.
+
+The Apple adapter now uses `AppleSilicon.begin_window()` and
+`AppleSilicon.end_window()`. Its `cpu_total_mj`, `gpu_mj`, `gpu_sram_mj`,
+`dram_mj`, and `ane_mj` fields are converted from millijoules to joules; GPU
+SRAM is included in the GPU total. Because Zeus currently selects `amdsmi`
+transitively on macOS, OpenJarvis avoids invoking the ROCm native loader there
+and reports that AMD monitoring is unavailable on macOS.
+
+Checks completed:
+
+- `uv lock --check --offline`;
+- dry-run resolution for the OpenHands and Linux VLLM graphs at
+  `grpcio==1.78.0`;
+- dry-run resolution for `energy-apple` and `energy-all` at `zeus==0.16.0`
+  and `zeus-apple-silicon==1.1.0`;
+- isolated installation and import/API inspection without instantiating the
+  hardware adapter;
+- 72 focused telemetry, doctor, and evaluation tests passed;
+- `jarvis doctor --json` produced valid JSON on macOS with the isolated
+  OpenJarvis data path.
+
+The full local pytest run for the pytest update reported 7,570 passed, 78
+skipped, and 76 failures in the already-known environment-dependent groups
+(local native extension, live connectors/model access, and scanner output).
+That broad run is evidence of compatibility but is not recorded as a green
+integration gate. Remote CI remains required after the stacked branch reaches
+an eligible base.

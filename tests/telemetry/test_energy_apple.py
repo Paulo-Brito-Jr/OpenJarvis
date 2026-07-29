@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,29 +10,6 @@ import pytest
 from tests.telemetry.energy_test_helpers import (
     assert_sample_result_basics,
 )
-
-# ---------------------------------------------------------------------------
-# Helpers: build a fake zeus module
-# ---------------------------------------------------------------------------
-
-
-def _make_fake_zeus():
-    """Return a fake zeus.device.soc.apple module with AppleSiliconMonitor."""
-    # Build the nested module hierarchy
-    zeus = types.ModuleType("zeus")
-    zeus_device = types.ModuleType("zeus.device")
-    zeus_device_soc = types.ModuleType("zeus.device.soc")
-    zeus_device_soc_apple = types.ModuleType("zeus.device.soc.apple")
-
-    mock_monitor_cls = MagicMock()
-    zeus_device_soc_apple.AppleSiliconMonitor = mock_monitor_cls
-
-    zeus.device = zeus_device
-    zeus_device.soc = zeus_device_soc
-    zeus_device_soc.apple = zeus_device_soc_apple
-
-    return zeus, zeus_device, zeus_device_soc, zeus_device_soc_apple, mock_monitor_cls
-
 
 # ---------------------------------------------------------------------------
 # Tests: available()
@@ -79,6 +55,28 @@ class TestEnergyMethod:
         monitor._zeus_ok = True
         assert monitor.energy_method() == "zeus"
 
+    def test_initializes_official_apple_silicon_adapter(self):
+        import openjarvis.telemetry.energy_apple as mod
+
+        adapter = MagicMock()
+        with (
+            patch.object(mod, "_ZEUS_APPLE_AVAILABLE", True),
+            patch.object(
+                mod,
+                "AppleSilicon",
+                return_value=adapter,
+                create=True,
+            ) as adapter_cls,
+            patch("platform.system", return_value="Darwin"),
+            patch("platform.machine", return_value="arm64"),
+            patch.object(mod, "_detect_chip", return_value=("M4", 15.0)),
+        ):
+            monitor = mod.AppleEnergyMonitor()
+
+        adapter_cls.assert_called_once_with()
+        assert monitor._monitor is adapter
+        assert monitor.energy_method() == "zeus"
+
 
 # ---------------------------------------------------------------------------
 # Tests: sample() component breakdown
@@ -87,12 +85,13 @@ class TestEnergyMethod:
 
 class TestSampleComponentBreakdown:
     def test_component_energy_extraction(self):
-        """Mock begin_window/end_window and verify cpu/gpu/dram/ane extraction."""
+        """Convert the official Apple Silicon millijoule fields to joules."""
         mock_measurement = MagicMock()
-        mock_measurement.cpu_energy = 1.5
-        mock_measurement.gpu_energy = 3.0
-        mock_measurement.dram_energy = 0.5
-        mock_measurement.ane_energy = 2.0
+        mock_measurement.cpu_total_mj = 1500
+        mock_measurement.gpu_mj = 3000
+        mock_measurement.gpu_sram_mj = 250
+        mock_measurement.dram_mj = 500
+        mock_measurement.ane_mj = 2000
 
         mock_zeus_monitor = MagicMock()
         mock_zeus_monitor.begin_window = MagicMock()
@@ -113,7 +112,7 @@ class TestSampleComponentBreakdown:
         mock_zeus_monitor.end_window.assert_called_once()
 
         assert result.cpu_energy_joules == pytest.approx(1.5)
-        assert result.gpu_energy_joules == pytest.approx(3.0)
+        assert result.gpu_energy_joules == pytest.approx(3.25)
         assert result.dram_energy_joules == pytest.approx(0.5)
         assert result.ane_energy_joules == pytest.approx(2.0)
         assert_sample_result_basics(result, vendor="apple", energy_method="zeus")
@@ -121,10 +120,11 @@ class TestSampleComponentBreakdown:
     def test_total_energy_is_sum_of_components(self):
         """total = cpu + gpu + dram + ane."""
         mock_measurement = MagicMock()
-        mock_measurement.cpu_energy = 1.0
-        mock_measurement.gpu_energy = 2.0
-        mock_measurement.dram_energy = 0.3
-        mock_measurement.ane_energy = 0.7
+        mock_measurement.cpu_total_mj = 1000
+        mock_measurement.gpu_mj = 2000
+        mock_measurement.gpu_sram_mj = None
+        mock_measurement.dram_mj = 300
+        mock_measurement.ane_mj = 700
 
         mock_zeus_monitor = MagicMock()
         mock_zeus_monitor.begin_window = MagicMock()

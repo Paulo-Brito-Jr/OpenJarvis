@@ -101,8 +101,14 @@ desktop = [
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
 gpu-metrics = ["pynvml>=12.0"]
 energy-amd = ["amdsmi>=6.1"]
-energy-apple = ["zeus-ml[apple]"]
-energy-all = ["pynvml>=12.0", "amdsmi>=6.1", "zeus-ml[apple]"]
+energy-apple = [
+    "zeus[apple]==0.16.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+energy-all = [
+    "pynvml>=12.0",
+    "amdsmi>=6.1",
+    "zeus[apple]==0.16.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 orchestrator-training = ["torch>=2.0", "transformers>=4.40"]
 learning-dspy = ["dspy>=2.6"]
 learning-gepa = ["gepa>=0.1"]
