@@ -18,6 +18,7 @@ from openjarvis.agents.prompt_loader import (
     load_system_prompt_override,
 )
 from openjarvis.agents.rlm_repl import RLMRepl
+from openjarvis.core.cancellation import raise_if_cancelled
 from openjarvis.core.events import EventBus
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
@@ -155,6 +156,9 @@ class RLMAgent(ToolUsingAgent):
         **kwargs: Any,
     ) -> AgentResult:
         self._emit_turn_start(input)
+        raise_if_cancelled()
+        if context is not None:
+            context.cancellation_token.raise_if_cancelled()
 
         repl_resource = "code:rlm-repl"
         # Build system prompt with tool section
@@ -222,12 +226,17 @@ class RLMAgent(ToolUsingAgent):
         }
 
         for _turn in range(self._max_turns):
+            raise_if_cancelled()
             turns += 1
 
+            raise_if_cancelled()
             result = self._generate(messages)
             usage = result.get("usage", {})
             for k in total_usage:
                 total_usage[k] += usage.get(k, 0)
+            # Keep accounting for the completed provider response, then stop
+            # before parsing code, dispatching tools, or entering the REPL.
+            raise_if_cancelled()
             content = result.get("content", "")
 
             # Strip <think> tags
@@ -247,6 +256,7 @@ class RLMAgent(ToolUsingAgent):
                 )
 
             # Execute code in REPL
+            raise_if_cancelled()
             denied = self._executor.authorize(
                 repl_resource,
                 ["code:execute"],
@@ -282,7 +292,11 @@ class RLMAgent(ToolUsingAgent):
                     turns=turns,
                     metadata={**total_usage, "security_disabled": True},
                 )
+            raise_if_cancelled()
             output = repl.execute(code)
+            raise_if_cancelled()
+            if context is not None:
+                context.cancellation_token.raise_if_cancelled()
 
             if self._repl_tool_results:
                 all_tool_results.extend(self._repl_tool_results)
@@ -340,6 +354,7 @@ class RLMAgent(ToolUsingAgent):
         If the sub-LM returns tool_calls, execute one round of tool
         resolution before returning the final text.
         """
+        raise_if_cancelled()
         messages = [Message(role=Role.USER, content=prompt)]
         result = self._engine.generate(
             messages,
@@ -347,6 +362,9 @@ class RLMAgent(ToolUsingAgent):
             temperature=self._sub_temperature,
             max_tokens=self._sub_max_tokens,
         )
+        # A completed inference may still be trace-published by the engine,
+        # but cancellation must stop tool dispatch or a follow-up inference.
+        raise_if_cancelled()
 
         # Single-turn tool resolution
         raw_tool_calls = result.get("tool_calls", [])
@@ -368,6 +386,7 @@ class RLMAgent(ToolUsingAgent):
                 )
             )
             for tc in tool_calls:
+                raise_if_cancelled()
                 tr = self._executor.execute(tc)
                 messages.append(
                     Message(
@@ -377,12 +396,14 @@ class RLMAgent(ToolUsingAgent):
                         name=tc.name,
                     )
                 )
+            raise_if_cancelled()
             followup = self._engine.generate(
                 messages,
                 model=self._sub_model,
                 temperature=self._sub_temperature,
                 max_tokens=self._sub_max_tokens,
             )
+            raise_if_cancelled()
             return followup.get("content", "")
 
         return result.get("content", "")
@@ -392,7 +413,11 @@ class RLMAgent(ToolUsingAgent):
 
         Called from REPL code via ``llm_batch(prompts)``.
         """
-        return [self._make_sub_query(p) for p in prompts]
+        results: List[str] = []
+        for prompt in prompts:
+            raise_if_cancelled()
+            results.append(self._make_sub_query(prompt))
+        return results
 
     def _tool_arg_names(self) -> Dict[str, Optional[str]]:
         """Build a best-effort primary-arg map for injected tool helpers."""
@@ -410,6 +435,7 @@ class RLMAgent(ToolUsingAgent):
 
     def _execute_tool_from_repl(self, tool_name: str, params: Dict[str, Any]) -> str:
         """Execute a real OpenJarvis tool from within the REPL."""
+        raise_if_cancelled()
         if self._executor is None:
             raise RuntimeError(f"Tool '{tool_name}' is not available")
 

@@ -62,8 +62,14 @@ import os
 import random
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Optional, Tuple
 from urllib.parse import urlparse
+
+from openjarvis.core.cancellation import (
+    current_cancellation_token,
+    raise_if_cancelled,
+)
 
 # ---------------------------------------------------------------------------
 # Tunables (read once at module load, can be overridden via env)
@@ -89,6 +95,7 @@ _MAX_CONCURRENCY = _env_int("OPENJARVIS_OPENAI_MAX_CONCURRENCY", 4)
 _MAX_RETRIES = _env_int("OPENJARVIS_OPENAI_MAX_RETRIES", 8)
 _RETRY_BASE = _env_float("OPENJARVIS_OPENAI_RETRY_BASE", 2.0)
 _RETRY_CAP = _env_float("OPENJARVIS_OPENAI_RETRY_CAP", 60.0)
+_SEMAPHORE_POLL_INTERVAL = 0.05
 
 
 # Single process-wide semaphore. ``BoundedSemaphore(0)`` would block
@@ -205,6 +212,46 @@ def _sleep_for(attempt: int, exc: BaseException) -> float:
     return random.uniform(0.0, base)
 
 
+def _cooperative_sleep(delay: float) -> None:
+    """Sleep in bounded slices while honoring the active request token."""
+    token = current_cancellation_token()
+    if token is None:
+        time.sleep(delay)
+        return
+    deadline = time.monotonic() + max(delay, 0.0)
+    while True:
+        token.raise_if_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.1))
+
+
+@contextmanager
+def _cooperative_semaphore(sem: Any):
+    """Acquire a cloud slot without becoming blind to cancellation."""
+    if isinstance(sem, _NullSem):
+        yield
+        return
+
+    token = current_cancellation_token()
+    if token is None:
+        with sem:
+            yield
+        return
+
+    acquired = False
+    try:
+        while not acquired:
+            token.raise_if_cancelled()
+            acquired = sem.acquire(timeout=_SEMAPHORE_POLL_INTERVAL)
+        token.raise_if_cancelled()
+        yield
+    finally:
+        if acquired:
+            sem.release()
+
+
 # ---------------------------------------------------------------------------
 # Wrapping
 # ---------------------------------------------------------------------------
@@ -233,9 +280,11 @@ def _wrap_create(orig: Callable[..., Any]) -> Callable[..., Any]:
         if local:
             local_last_exc: Optional[BaseException] = None
             for attempt in range(3):
+                raise_if_cancelled()
                 try:
                     return orig(self, *args, **kwargs)
                 except BaseException as exc:  # noqa: BLE001
+                    raise_if_cancelled()
                     try:
                         import openai
                     except ImportError:
@@ -252,16 +301,19 @@ def _wrap_create(orig: Callable[..., Any]) -> Callable[..., Any]:
                     local_last_exc = exc
                     if attempt >= 2:
                         break
-                    time.sleep(2**attempt)
+                    _cooperative_sleep(2**attempt)
             assert local_last_exc is not None
             raise local_last_exc
 
         last_exc: Optional[BaseException] = None
         for attempt in range(_MAX_RETRIES + 1):
+            raise_if_cancelled()
             try:
-                with _SEM:
+                with _cooperative_semaphore(_SEM):
+                    raise_if_cancelled()
                     return orig(self, *args, **kwargs)
             except BaseException as exc:  # noqa: BLE001
+                raise_if_cancelled()
                 if not _is_retryable(exc):
                     raise
                 last_exc = exc
@@ -282,7 +334,7 @@ def _wrap_create(orig: Callable[..., Any]) -> Callable[..., Any]:
                     )
                 except Exception:
                     pass
-                time.sleep(delay)
+                _cooperative_sleep(delay)
         # Exhausted. Re-raise so the runner records the row as errored.
         assert last_exc is not None
         raise last_exc

@@ -10,6 +10,12 @@ import pytest
 
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.rlm import RLMAgent
+from openjarvis.agents.rlm_repl import RLMRepl
+from openjarvis.core.cancellation import (
+    AgentCancelledError,
+    CancellationToken,
+    cancellation_scope,
+)
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import ToolResult
@@ -28,6 +34,8 @@ def _isolated_test_executor(code, namespace, max_output_chars):
     try:
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
             exec(code, namespace)  # noqa: S102
+    except AgentCancelledError:
+        raise
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     output = stdout_buf.getvalue()
@@ -314,6 +322,128 @@ class TestRLMSubLMCalls:
         assert result.content == "4"
         # engine.generate should be called at least twice (root + sub)
         assert engine.generate.call_count >= 2
+
+
+class TestRLMCancellation:
+    def test_repl_re_raises_cancellation_from_real_callback(self):
+        token = CancellationToken()
+
+        def cancel_callback(_prompt):
+            token.cancel()
+            token.raise_if_cancelled()
+
+        repl = RLMRepl(
+            llm_query_fn=cancel_callback,
+            sandbox_executor=_isolated_test_executor,
+        )
+
+        with pytest.raises(AgentCancelledError):
+            repl.execute("llm_query('cancel now')")
+
+    def test_cancelled_real_repl_callback_cannot_return_final_answer(self):
+        token = CancellationToken()
+        engine = _make_engine(
+            "```python\nFINAL(llm_query('cancel during callback'))\n```"
+        )
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
+
+        def cancel_callback(_prompt):
+            token.cancel()
+            return "must not become final"
+
+        agent._make_sub_query = MagicMock(side_effect=cancel_callback)
+
+        with cancellation_scope(token), pytest.raises(AgentCancelledError):
+            agent.run("question")
+
+        agent._make_sub_query.assert_called_once_with("cancel during callback")
+        engine.generate.assert_called_once()
+
+    def test_cancelled_context_prevents_root_inference(self):
+        token = CancellationToken()
+        token.cancel()
+        engine = _make_engine("must not run")
+        agent = RLMAgent(engine, "test-model")
+
+        with pytest.raises(AgentCancelledError):
+            agent.run(
+                "question",
+                context=AgentContext(cancellation_token=token),
+            )
+
+        engine.generate.assert_not_called()
+
+    def test_cancelled_root_result_never_reaches_repl(self):
+        token = CancellationToken()
+        engine = _make_engine()
+        agent = _allow_repl(RLMAgent(engine, "test-model"))
+
+        def complete_root_inference(messages):
+            token.cancel()
+            return {
+                "content": "```python\nFINAL('must not execute')\n```",
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+            }
+
+        agent._generate = MagicMock(side_effect=complete_root_inference)
+
+        with (
+            patch("openjarvis.agents.rlm.RLMRepl.execute", autospec=True) as execute,
+            cancellation_scope(token),
+            pytest.raises(AgentCancelledError),
+        ):
+            agent.run("question")
+
+        execute.assert_not_called()
+        agent._generate.assert_called_once()
+
+    def test_cancelled_subquery_result_prevents_tool_and_followup(self):
+        token = CancellationToken()
+        engine = MagicMock(engine_id="mock")
+
+        def complete_subquery(*args, **kwargs):
+            token.cancel()
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "sub_0",
+                        "name": "calculator",
+                        "arguments": '{"expression":"2+2"}',
+                    }
+                ],
+            }
+
+        engine.generate.side_effect = complete_subquery
+        agent = _allow_test_tools(RLMAgent(engine, "test-model", tools=[_CalcStub()]))
+        execute = MagicMock()
+        agent._executor.execute = execute
+
+        with cancellation_scope(token), pytest.raises(AgentCancelledError):
+            agent._make_sub_query("calculate")
+
+        assert engine.generate.call_count == 1
+        execute.assert_not_called()
+
+    def test_cancelled_batch_query_never_starts_second_subquery(self):
+        token = CancellationToken()
+        engine = MagicMock(engine_id="mock")
+
+        def complete_first(*args, **kwargs):
+            token.cancel()
+            return {"content": "first"}
+
+        engine.generate.side_effect = complete_first
+        agent = RLMAgent(engine, "test-model")
+
+        with cancellation_scope(token), pytest.raises(AgentCancelledError):
+            agent._make_batch_query(["first", "second"])
+
+        assert engine.generate.call_count == 1
 
 
 class TestRLMMultiTurn:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
+from openjarvis.core.cancellation import AgentCancelledError
+
 # Safe stdlib modules pre-injected into the REPL namespace
 _SAFE_MODULES = [
     "json",
@@ -221,6 +223,8 @@ class RLMRepl:
                 self._namespace,
                 self._max_output_chars,
             )
+        except AgentCancelledError:
+            raise
         except Exception as exc:
             return f"{type(exc).__name__}: {exc}"
         if not isinstance(output, str):

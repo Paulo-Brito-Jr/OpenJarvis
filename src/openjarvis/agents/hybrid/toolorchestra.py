@@ -54,6 +54,7 @@ import json
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,6 +66,7 @@ from openjarvis.agents.hybrid._base import (
     WEB_SEARCH_COST_PER_CALL,
     LocalCloudAgent,
     _guard_provider_text,
+    _record_event,
     _require_action_authorized,
     tavily_search_context,
 )
@@ -77,6 +79,11 @@ from openjarvis.agents.hybrid.mini_swe_agent import (
     _clone_repo,
     _extract_diff,
     run_swe_agent_loop,
+)
+from openjarvis.core.cancellation import (
+    AgentCancelledError,
+    current_cancellation_token,
+    raise_if_cancelled,
 )
 from openjarvis.core.registry import AgentRegistry
 
@@ -380,6 +387,7 @@ def _call_tavily_search(
     accounting layer separately tallies tool-call counts. Falls back to
     DuckDuckGo if Tavily is unreachable (see ``WebSearchTool``).
     """
+    raise_if_cancelled()
     res = tavily_search_context(
         query,
         max_results=max_results,
@@ -404,6 +412,7 @@ def _call_modal_python(
     the returned string with a non-zero rc — we never raise back to the
     orchestrator loop. The sandbox is torn down at the end via ``terminate()``.
     """
+    raise_if_cancelled()
     destination = "https://api.modal.com"
     _require_action_authorized(
         action_authorizer,
@@ -419,13 +428,23 @@ def _call_modal_python(
         )
         or ""
     )
+    raise_if_cancelled()
     try:
         import modal
 
+        raise_if_cancelled()
         app = modal.App.lookup(_MODAL_APP_NAME, create_if_missing=True)
+        _record_event(
+            {
+                "kind": "modal_app_lookup",
+                "app_name": _MODAL_APP_NAME,
+                "success": True,
+            }
+        )
         # python:3.12-slim is small + boots fast; the paper uses a generic
         # Python image too. We rely on stdlib only — no extra pip installs.
         image = modal.Image.debian_slim(python_version="3.12")
+        raise_if_cancelled()
         sb = modal.Sandbox.create(
             "python",
             "-c",
@@ -434,24 +453,77 @@ def _call_modal_python(
             image=image,
             timeout=int(timeout_s),
         )
-        sb.wait()
+        termination_lock = threading.Lock()
+        terminated = False
+
+        def terminate_once() -> None:
+            nonlocal terminated
+            with termination_lock:
+                if terminated:
+                    return
+                terminated = True
+            try:
+                sb.terminate()
+            except Exception:
+                pass
+
         try:
-            out = sb.stdout.read() or ""
-        except Exception:
-            out = ""
-        try:
-            err = sb.stderr.read() or ""
-        except Exception:
-            err = ""
-        rc = sb.returncode if sb.returncode is not None else -1
-        try:
-            sb.terminate()
-        except Exception:
-            pass
-        combined = out + (("\n" + err) if err else "")
-        if len(combined) > 8192:
-            combined = combined[:8192] + "\n... (output truncated)"
-        return combined, int(rc)
+            raise_if_cancelled()
+            token = current_cancellation_token()
+            if token is None:
+                sb.wait()
+            else:
+                wait_finished = threading.Event()
+                wait_errors: list[BaseException] = []
+
+                def wait_for_sandbox() -> None:
+                    try:
+                        sb.wait()
+                    except BaseException as exc:  # noqa: BLE001
+                        wait_errors.append(exc)
+                    finally:
+                        wait_finished.set()
+
+                wait_thread = threading.Thread(
+                    target=wait_for_sandbox,
+                    name="openjarvis-modal-wait",
+                    daemon=True,
+                )
+                wait_thread.start()
+                while not wait_finished.wait(timeout=0.05):
+                    try:
+                        token.raise_if_cancelled()
+                    except AgentCancelledError:
+                        terminate_once()
+                        raise
+                if wait_errors:
+                    raise wait_errors[0]
+            try:
+                out = sb.stdout.read() or ""
+            except Exception:
+                out = ""
+            try:
+                err = sb.stderr.read() or ""
+            except Exception:
+                err = ""
+            rc = sb.returncode if sb.returncode is not None else -1
+            combined = out + (("\n" + err) if err else "")
+            if len(combined) > 8192:
+                combined = combined[:8192] + "\n... (output truncated)"
+            _record_event(
+                {
+                    "kind": "modal_python",
+                    "app_name": _MODAL_APP_NAME,
+                    "returncode": int(rc),
+                    "response": combined,
+                }
+            )
+            raise_if_cancelled()
+            return combined, int(rc)
+        finally:
+            terminate_once()
+    except AgentCancelledError:
+        raise
     except Exception as exc:
         return f"[modal-python error: {type(exc).__name__}: {exc}]", -1
 
@@ -486,6 +558,7 @@ def _call_orchestrator_with_tool_calls(
     observed 2026-05-19 on the paper-match smoke; same path was buggy on
     the default pool too, just less reproducibly.)
     """
+    raise_if_cancelled()
     from openai import OpenAI
 
     client = OpenAI(base_url=endpoint, api_key="EMPTY", timeout=timeout)
@@ -493,6 +566,7 @@ def _call_orchestrator_with_tool_calls(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    raise_if_cancelled()
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -981,6 +1055,7 @@ def _call_worker(
     action_authorizer: Any = None,
 ) -> Tuple[str, int, int, bool, float, int]:
     """Returns (text, p_tok, c_tok, is_local, extra_cost, n_web_searches)."""
+    raise_if_cancelled()
     wtype = worker.get("type", "openai")
     max_tok = int(cfg.get("worker_max_tokens", 4096))
     temp = float(cfg.get("worker_temperature", 0.2))
@@ -1115,6 +1190,7 @@ def _swe_call_worker(
     Trailing ``bash_turns`` (last element) counts agent-loop turns so the
     caller can surface ``tool_calls`` per row. Fallbacks to one-shot
     workers return 0 bash turns (no agent loop ran)."""
+    raise_if_cancelled()
     wtype = worker.get("type", "openai")
     if wtype in _TOOLORCH_SEARCH_TYPES:
         # Search workers stay one-shot.
@@ -1142,6 +1218,7 @@ def _swe_call_worker(
             action_authorizer=action_authorizer,
         )
         return text, p, c, is_local, extra, n_searches, 0
+    raise_if_cancelled()
     out = run_swe_agent_loop(
         task,
         backbone=backbone,
@@ -1156,6 +1233,7 @@ def _swe_call_worker(
         trace_prefix=f"toolorch_turn{turn}",
         workdir=workdir,
     )
+    raise_if_cancelled()
     is_local = backbone == "local"
     return (
         out["final_summary"] or out["answer"],
@@ -1220,6 +1298,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
         context: Optional[AgentContext],
         **kwargs: Any,
     ) -> Tuple[str, Dict[str, Any]]:
+        raise_if_cancelled()
         cfg = self._cfg
         question = input
         # Resolution order (strict replace, no merge):
@@ -1291,6 +1370,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
             parse_failures = 0
 
             for turn in range(1, max_turns + 1):
+                raise_if_cancelled()
                 sys_prompt = ORCHESTRATOR_SYS
                 if turn == max_turns and final_answer is None:
                     sys_prompt = ORCHESTRATOR_SYS + "\n\n" + FORCE_FINAL_PROMPT
@@ -1323,6 +1403,9 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         "raw": text,
                     }
                 )
+                # The orchestrator response is durable in the trace before a
+                # disconnect can suppress the next worker dispatch.
+                raise_if_cancelled()
 
                 if action is None:
                     parse_failures += 1
@@ -1345,6 +1428,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
                             break
                         continue
                     worker = workers[wid]
+                    raise_if_cancelled()
                     if swe_mode and shared_workdir is not None:
                         (
                             w_text,
@@ -1393,11 +1477,13 @@ class ToolOrchestraAgent(LocalCloudAgent):
                             "n_web_searches": n_searches,
                         }
                     )
+                    raise_if_cancelled()
                     continue
                 # Unknown action kind — treat as parse failure.
                 parse_failures += 1
 
             if final_answer is None:
+                raise_if_cancelled()
                 # Hard fallback: call the strongest non-search worker directly.
                 # "Strongest" = highest output-token price in `_prices.PRICES`,
                 # which tracks model capability tier closely enough for this.
@@ -1448,6 +1534,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         "fallback": True,
                     }
                 )
+                raise_if_cancelled()
                 final_answer = ans
 
             # In SWE mode, the authoritative output is the working-tree diff —
@@ -1494,6 +1581,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
         context: Optional[AgentContext],
         **kwargs: Any,
     ) -> Tuple[str, Dict[str, Any]]:
+        raise_if_cancelled()
         cfg = self._cfg
         question = input
 
@@ -1567,6 +1655,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
         # the diff-extraction step. Matches the prompted path's pattern.
         try:
             for turn in range(1, max_turns + 1):
+                raise_if_cancelled()
                 user = (
                     f"Problem: {question}\n\n{context_str}\n\n"
                     "Choose an appropriate tool."
@@ -1622,6 +1711,9 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         "tokens_out": o_out,
                     }
                 )
+                # `_call_orchestrator_with_tool_calls` intentionally returns
+                # first so the in-flight SDK result can be audited here.
+                raise_if_cancelled()
                 tokens_local += o_in + o_out
 
                 action = _parse_rl_tool_call(text, sdk_tool_calls)
@@ -1753,6 +1845,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
                 # one-shot fallbacks (openai-typed workers, search) return
                 # bash_turns=0; vllm/anthropic-typed workers run the loop.
                 bash_turns = 0
+                raise_if_cancelled()
                 if swe_mode and shared_workdir is not None and name != "search":
                     (
                         w_text,
@@ -1806,6 +1899,14 @@ class ToolOrchestraAgent(LocalCloudAgent):
                             timeout_s=timeout_s,
                             action_authorizer=self._action_authorizer,
                         )
+                        self.record_trace_event(
+                            {
+                                "kind": "toolorchestra_modal_python",
+                                "turn": turn,
+                                "returncode": modal_exec_rc,
+                                "output": modal_exec_output,
+                            }
+                        )
                         tool_calls += 1
                         w_text = (
                             f"{w_text}\n\n[modal-python stdout/stderr "
@@ -1828,6 +1929,9 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         "modal_exec_rc": modal_exec_rc,
                     }
                 )
+                # Worker/Modal output is retained in the audit history before
+                # cancellation blocks context mutation and the next inference.
+                raise_if_cancelled()
 
                 # Update accumulated context for the next turn.
                 if name == "search":
@@ -1846,6 +1950,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
                     break
 
             if final_answer is None:
+                raise_if_cancelled()
                 # Hard fallback: ask the frontier worker directly. In SWE
                 # mode route this final call through the agent loop too so
                 # it can still touch the workdir and emit a diff.
@@ -1898,6 +2003,7 @@ class ToolOrchestraAgent(LocalCloudAgent):
                         "fallback": True,
                     }
                 )
+                raise_if_cancelled()
                 final_answer = ans
 
             # In SWE mode, the authoritative output is the working-tree diff —

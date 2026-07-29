@@ -58,6 +58,7 @@ from openjarvis.agents.hybrid._prices import (
     cost as _cost_cloud,
 )
 from openjarvis.agents.hybrid.mini_swe_agent import run_swe_agent_loop
+from openjarvis.core.cancellation import AgentCancelledError, raise_if_cancelled
 from openjarvis.core.registry import AgentRegistry
 
 ARCHON_SWE_RANKER_SYS = (
@@ -176,6 +177,7 @@ def _make_local_generator(local_endpoint: str, local_model: str):
     def local_gen(model, messages, max_tokens=2048, temperature=0.7, **_kw):  # type: ignore[no-untyped-def]
         import time as _time
 
+        raise_if_cancelled()
         t0 = _time.time()
         try:
             resp = client.chat.completions.create(
@@ -185,6 +187,8 @@ def _make_local_generator(local_endpoint: str, local_model: str):
                 temperature=temperature,
             )
             _bump_local_calls()
+        except AgentCancelledError:
+            raise
         except Exception as e:
             _record_event(
                 {
@@ -215,6 +219,7 @@ def _make_local_generator(local_endpoint: str, local_model: str):
                 "ts": _time.time(),
             }
         )
+        raise_if_cancelled()
         return text
 
     return local_gen
@@ -230,6 +235,7 @@ def _wrap_archon_cloud_generators() -> None:
     def gen_openai(model, messages, max_tokens=2048, temperature=0.7, **_kw):  # type: ignore[no-untyped-def]
         import time as _time
 
+        raise_if_cancelled()
         client = _OAI()
         kwargs: Dict[str, Any] = dict(
             model=model,
@@ -262,11 +268,13 @@ def _wrap_archon_cloud_generators() -> None:
                 "ts": _time.time(),
             }
         )
+        raise_if_cancelled()
         return text
 
     def gen_anthropic(model, messages, max_tokens=2048, temperature=0.7, **_kw):  # type: ignore[no-untyped-def]
         import time as _time
 
+        raise_if_cancelled()
         client = _anth.Anthropic(timeout=600.0)
         system = ""
         msgs = []
@@ -312,6 +320,7 @@ def _wrap_archon_cloud_generators() -> None:
                 "ts": _time.time(),
             }
         )
+        raise_if_cancelled()
         return text.strip()
 
     from archon.completions.components.Generator import (
@@ -460,6 +469,7 @@ class ArchonAgent(LocalCloudAgent):
         context: Optional[AgentContext],
         **kwargs: Any,
     ) -> Tuple[str, Dict[str, Any]]:
+        raise_if_cancelled()
         if "OPENAI_API_KEY" not in os.environ and "ANTHROPIC_API_KEY" not in os.environ:
             raise RuntimeError("Archon needs OPENAI_API_KEY and/or ANTHROPIC_API_KEY")
 
@@ -530,6 +540,7 @@ class ArchonAgent(LocalCloudAgent):
         archon = Archon(archon_cfg)
 
         try:
+            raise_if_cancelled()
             answer = archon.generate(
                 [
                     {"role": "system", "content": "You are a helpful assistant."},
@@ -591,6 +602,7 @@ class ArchonAgent(LocalCloudAgent):
         task: Dict[str, Any],
         cfg: Dict[str, Any],
     ) -> Tuple[str, Dict[str, Any]]:
+        raise_if_cancelled()
         if not self._local_endpoint or not self._local_model:
             raise ValueError(
                 "ArchonAgent (swe mode) needs local_model + local_endpoint"
@@ -608,6 +620,7 @@ class ArchonAgent(LocalCloudAgent):
         total_tokens_cloud = 0
         total_cost = 0.0
         for k in range(K):
+            raise_if_cancelled()
             out = run_swe_agent_loop(
                 task,
                 backbone="local",
@@ -651,6 +664,7 @@ class ArchonAgent(LocalCloudAgent):
                 for c in candidates
             )
         )
+        raise_if_cancelled()
         ranker_text, r_in, r_out = self._call_cloud(
             user=ranker_user,
             system=ARCHON_SWE_RANKER_SYS,

@@ -56,6 +56,13 @@ from openjarvis.agents.hybrid._openai_retry import (
 )
 from openjarvis.agents.hybrid._prices import NO_TEMP_PREFIXES, default_max_output_tokens
 from openjarvis.agents.hybrid.mini_swe_agent import run_swe_agent_loop
+from openjarvis.core.cancellation import (
+    AgentCancelledError,
+    CancellationToken,
+    cancellation_scope,
+    current_cancellation_token,
+    raise_if_cancelled,
+)
 from openjarvis.core.registry import AgentRegistry
 
 MINIONS_SWE_PLANNER_SYS = (
@@ -206,6 +213,7 @@ def _patch_anthropic_globally() -> None:
 
         def make_patched(orig):  # type: ignore[no-untyped-def]
             def patched(self, **kwargs):  # type: ignore[no-untyped-def]
+                raise_if_cancelled()
                 # External Minions's AnthropicClient.chat passes
                 # `cache_control={"type":"ephemeral"}` as a top-level kwarg
                 # (clients/anthropic.py:207). Newer Anthropic SDKs reject that
@@ -220,7 +228,9 @@ def _patch_anthropic_globally() -> None:
                         kwargs
                     ):
                         kwargs["output_config"] = _minions_turn_schema(kwargs)
-                return orig(self, **kwargs)
+                result = orig(self, **kwargs)
+                raise_if_cancelled()
+                return result
 
             patched._hybrid_patched = True  # type: ignore[attr-defined]
             return patched
@@ -261,7 +271,10 @@ def _patch_gemini_client_usage() -> None:
         # Mirror the upstream "native" branch by hand, but defensively.
         # Skip the OpenAI-compat branch — Minions paradigm never sets that.
         if self.use_openai_api:
-            return _orig_schat(self, messages, **kwargs)
+            raise_if_cancelled()
+            result = _orig_schat(self, messages, **kwargs)
+            raise_if_cancelled()
+            return result
         if isinstance(messages, dict):
             messages = [messages]
         contents, system_instruction = self._format_content(messages)
@@ -284,11 +297,13 @@ def _patch_gemini_client_usage() -> None:
         config_kwargs["system_instruction"] = system_instruction
         config = self.types.GenerateContentConfig(**config_kwargs)
 
+        raise_if_cancelled()
         response = self.client.models.generate_content(
             model=self.model_name,
             contents=contents,
             config=config,
         )
+        raise_if_cancelled()
 
         # Defensive text accessor — upstream `response.text` can raise when
         # the model only emitted a non-text part.
@@ -316,6 +331,43 @@ def _patch_gemini_client_usage() -> None:
 
     patched_schat._hybrid_patched = True  # type: ignore[attr-defined]
     GeminiClient.schat = patched_schat  # type: ignore[assignment]
+
+
+def _bind_client_cancellation(
+    client: Any,
+    token: Optional[CancellationToken],
+) -> None:
+    """Carry the request token into Minions worker threads.
+
+    ``contextvars`` do not automatically cross the thread pools used by the
+    multi-worker protocol. Instance wrappers bind the captured request token
+    around each client round so SDK-level guards can still see it.
+    """
+    if token is None:
+        return
+    for method_name in ("chat", "schat"):
+        original = getattr(client, method_name, None)
+        if not callable(original) or getattr(original, "_hybrid_cancel_patched", False):
+            continue
+
+        def guarded(*args, __original=original, **kwargs):  # type: ignore[no-untyped-def]
+            with cancellation_scope(token):
+                token.raise_if_cancelled()
+                result = __original(*args, **kwargs)
+                token.raise_if_cancelled()
+                return result
+
+        guarded._hybrid_cancel_patched = True  # type: ignore[attr-defined]
+        setattr(client, method_name, guarded)
+
+
+def _request_cancellation_token(
+    context: Optional[AgentContext],
+) -> Optional[CancellationToken]:
+    """Prefer the live execution scope over a context's default token."""
+    return current_cancellation_token() or (
+        context.cancellation_token if context is not None else None
+    )
 
 
 def _patch_minions_extract_json() -> None:
@@ -384,6 +436,7 @@ def _prefetch_context(
         "cost_usd": 0.0,
         "n_searches": 0,
     }
+    raise_if_cancelled()
     if search_backend == "tavily":
         try:
             res = tavily_search_context(
@@ -401,7 +454,7 @@ def _prefetch_context(
             )
             if res.get("error"):
                 out["error"] = res["error"]
-        except PermissionError:
+        except (AgentCancelledError, PermissionError):
             raise
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
@@ -433,7 +486,7 @@ def _prefetch_context(
             + n_searches * WEB_SEARCH_COST_PER_CALL,
             n_searches=n_searches,
         )
-    except PermissionError:
+    except (AgentCancelledError, PermissionError):
         raise
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
@@ -486,6 +539,7 @@ class MinionsAgent(LocalCloudAgent):
         context: Optional[AgentContext],
         **kwargs: Any,
     ) -> Tuple[str, Dict[str, Any]]:
+        raise_if_cancelled()
         cfg = self._cfg
         task_meta: Dict[str, Any] = {}
         if context is not None:
@@ -564,6 +618,10 @@ class MinionsAgent(LocalCloudAgent):
         else:
             raise ValueError(f"unsupported cloud endpoint: {self._cloud_endpoint!r}")
 
+        request_token = _request_cancellation_token(context)
+        _bind_client_cancellation(local_client, request_token)
+        _bind_client_cancellation(cloud_client, request_token)
+
         cls = Minions if mode == "minions" else Minion
         log_dir = cfg.get("log_dir") or "/tmp/minions_logs"
         protocol = cls(
@@ -599,6 +657,7 @@ class MinionsAgent(LocalCloudAgent):
             or ws_enabled
         )
         if task_meta.get("question") and prefetch_on:
+            raise_if_cancelled()
             prefetch = _prefetch_context(
                 task_meta["question"],
                 self._cloud_endpoint,
@@ -621,6 +680,7 @@ class MinionsAgent(LocalCloudAgent):
                 }
             )
 
+        raise_if_cancelled()
         out = protocol(
             task=input,  # full formatted prompt (with bench instruction)
             context=_context_for(task_meta, prefetched=prefetch["text"]),
@@ -642,6 +702,9 @@ class MinionsAgent(LocalCloudAgent):
                 "final_answer": out.get("final_answer", ""),
             }
         )
+        # Preserve the completed protocol transcript before cancellation
+        # prevents any later supervisor/worker round.
+        raise_if_cancelled()
 
         local_usage = out.get("local_usage")
         remote_usage = out.get("remote_usage")
@@ -686,6 +749,7 @@ class MinionsAgent(LocalCloudAgent):
         task: Dict[str, Any],
         cfg: Dict[str, Any],
     ) -> Tuple[str, Dict[str, Any]]:
+        raise_if_cancelled()
         if not self._local_endpoint or not self._local_model:
             raise ValueError(
                 "MinionsAgent (swe mode) still needs local_model + local_endpoint"
@@ -720,6 +784,7 @@ class MinionsAgent(LocalCloudAgent):
             f"for you. Use it as guidance, but verify everything with the "
             f"actual code via your bash tool:\n\n{plan_text}"
         )
+        raise_if_cancelled()
         out = run_swe_agent_loop(
             task,
             backbone="local",
@@ -732,6 +797,7 @@ class MinionsAgent(LocalCloudAgent):
             turn_max_tokens=int(cfg.get("swe_turn_max_tokens", 4096)),
             trace_prefix="minions_worker",
         )
+        raise_if_cancelled()
 
         meta = {
             "tokens_local": out["tokens_in"] + out["tokens_out"],
