@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openjarvis.connectors.hybrid_search import HybridSearch, SearchHit
+from openjarvis.core.cancellation import AgentCancelledError, raise_if_cancelled
 from openjarvis.core.types import Message, Role, ToolCall
 from openjarvis.engine._base import InferenceEngine
 
@@ -517,8 +518,20 @@ class ResearchAgent:
         # KnowledgeStore on each run() call so the prompt stays accurate
         # even as the user connects new connectors mid-session.
         self._available_sources_override = available_sources
+        self._last_usage: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    @property
+    def last_usage(self) -> Dict[str, int]:
+        """Return provider usage accumulated before completion or cancellation."""
+
+        return dict(self._last_usage)
 
     def _authorize(self, capability: str, resource: str) -> None:
+        raise_if_cancelled()
         if not self._enabled:
             raise PermissionError("ResearchAgent is disabled.")
         try:
@@ -527,8 +540,11 @@ class ResearchAgent:
                 capability,
                 resource,
             )
+        except AgentCancelledError:
+            raise
         except Exception as exc:
             raise PermissionError("Research authorization failed.") from exc
+        raise_if_cancelled()
         if not allowed:
             raise PermissionError(f"Research capability denied: {capability}")
 
@@ -565,6 +581,7 @@ class ResearchAgent:
         return (start, end)
 
     def _execute_search(self, args: Dict[str, Any]) -> ToolInvocation:
+        raise_if_cancelled()
         query = str(args.get("query", "") or "")
         person = args.get("person") or None
         time_range = self._parse_time_range(args.get("time_range"))
@@ -580,6 +597,7 @@ class ResearchAgent:
         limit = int(args.get("limit", 20) or 20)
         limit = max(1, min(limit, 20))
 
+        raise_if_cancelled()
         hits = self._search.search(
             query,
             person=person,
@@ -587,6 +605,7 @@ class ResearchAgent:
             sources=sources,
             limit=limit,
         )
+        raise_if_cancelled()
         titles = [h.title or (h.content_snippet[:60] + "…") for h in hits[:5]]
         return ToolInvocation(
             tool_name="search",
@@ -614,6 +633,7 @@ class ResearchAgent:
         )
 
     def _execute_clarify(self, args: Dict[str, Any]) -> ToolInvocation:
+        raise_if_cancelled()
         question = str(args.get("question", "") or "").strip()
         if not question:
             return ToolInvocation(
@@ -622,6 +642,7 @@ class ResearchAgent:
                 response="(no question provided by agent — skipping clarify)",
             )
         answer = self._clarify_handler(question)
+        raise_if_cancelled()
         return ToolInvocation(
             tool_name="clarify",
             arguments={"question": question},
@@ -652,9 +673,12 @@ class ResearchAgent:
 
     def run(self, query: str) -> ResearchResult:
         """Run the loop end-to-end and return the synthesis plus a trace."""
+        raise_if_cancelled()
         self._authorize("tool:invoke", "research:planner")
         self._authorize("memory:read", "research:corpus:*")
+        raise_if_cancelled()
         sources_list = self._resolve_available_sources()
+        raise_if_cancelled()
         if sources_list:
             sources_blurb = ", ".join(sources_list)
         else:
@@ -673,6 +697,7 @@ class ResearchAgent:
 
         invocations: List[ToolInvocation] = []
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self._last_usage = total_usage
 
         # Global ref counter: each search increments by the number of hits
         # it returned so the planner sees unique refs across calls. The
@@ -692,6 +717,7 @@ class ResearchAgent:
                 if len(invocations) < self._max_iterations
                 else None
             )
+            raise_if_cancelled()
             result = self._engine.generate(
                 messages,
                 model=self._model,
@@ -702,6 +728,7 @@ class ResearchAgent:
             )
             for k in total_usage:
                 total_usage[k] += int(result.get("usage", {}).get(k, 0))
+            raise_if_cancelled()
 
             content = result.get("content", "") or ""
             tool_calls_raw = result.get("tool_calls", []) or []
@@ -759,6 +786,7 @@ class ResearchAgent:
             messages.append(assistant_msg)
 
             for tc in tool_calls_raw:
+                raise_if_cancelled()
                 name = tc.get("name", "")
                 raw_args = tc.get("arguments", "{}") or "{}"
                 try:
@@ -879,6 +907,7 @@ class ResearchAgent:
             )
         )
         iterations += 1
+        raise_if_cancelled()
         final = self._engine.generate(
             messages,
             model=self._model,
@@ -889,6 +918,7 @@ class ResearchAgent:
         )
         for k in total_usage:
             total_usage[k] += int(final.get("usage", {}).get(k, 0))
+        raise_if_cancelled()
         answer = (final.get("content", "") or "").strip()
         if not answer:
             answer = (

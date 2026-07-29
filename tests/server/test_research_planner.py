@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from openjarvis.agents.research_loop import DEFAULT_PLANNER_MODEL
+from openjarvis.core.cancellation import CancellationToken
 from openjarvis.core.config import JarvisConfig
 from openjarvis.server import research_router
 
@@ -249,6 +250,10 @@ def test_research_route_uses_governed_model_and_authenticated_principal(
     )
 
     assert response.media_type == "text/event-stream"
+    cancellation_token = captured.pop("cancellation_token")
+    assert isinstance(cancellation_token, CancellationToken)
+    register_close_callback = captured.pop("register_close_callback")
+    assert callable(register_close_callback)
     assert captured == {
         "query": "find notes",
         "active_engine": active_engine,
