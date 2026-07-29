@@ -13,8 +13,10 @@ import uuid
 from typing import AsyncGenerator
 
 from fastapi.responses import StreamingResponse
+from starlette.types import Send
 
 from openjarvis.agents._stubs import AgentContext, BaseAgent
+from openjarvis.core.cancellation import CancellationToken, cancellation_scope
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.engine._base import looks_like_context_length_error
 from openjarvis.server.models import (
@@ -82,6 +84,7 @@ class AgentStreamBridge:
         self._chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._queue: asyncio.Queue = asyncio.Queue()
         self._callbacks: dict[EventType, object] = {}
+        self._cancellation_token = CancellationToken()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -114,7 +117,7 @@ class AgentStreamBridge:
 
     def _run_agent(self) -> object:
         """Execute the agent synchronously (called via asyncio.to_thread)."""
-        ctx = AgentContext()
+        ctx = AgentContext(cancellation_token=self._cancellation_token)
         # Build conversation context from prior messages
         if len(self._request.messages) > 1:
             from openjarvis.core.types import Message, Role
@@ -139,13 +142,18 @@ class AgentStreamBridge:
         if self._model:
             self._agent._model = self._model
         try:
-            return self._agent.run(input_text, context=ctx)
+            with cancellation_scope(ctx.cancellation_token):
+                return self._agent.run(input_text, context=ctx)
         finally:
             self._agent._model = original_model
 
     # ------------------------------------------------------------------
     # Public streaming interface
     # ------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Signal that the response consumer has gone away."""
+        self._cancellation_token.cancel()
 
     async def stream(self) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE-formatted strings."""
@@ -156,7 +164,13 @@ class AgentStreamBridge:
         agent_task = asyncio.ensure_future(asyncio.to_thread(self._run_agent))
 
         def _on_done(fut):
-            loop.call_soon_threadsafe(self._queue.put_nowait, _DONE)
+            # Retrieve an exception even if the client has already gone away;
+            # this prevents an abandoned worker from producing an unhandled
+            # task warning.  ``result()`` below can still retrieve it later.
+            if not fut.cancelled():
+                fut.exception()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(self._queue.put_nowait, _DONE)
 
         agent_task.add_done_callback(_on_done)
 
@@ -293,13 +307,42 @@ class AgentStreamBridge:
 
             yield "data: [DONE]\n\n"
 
-        except Exception:
-            # On error, cancel the agent task if still running
+        finally:
+            # Cancelling an asyncio task does not stop ``to_thread`` work.
+            # Signal the cooperative token first; the agent and executor will
+            # refuse every later inference/tool boundary.
+            self.cancel()
             if not agent_task.done():
                 agent_task.cancel()
-            raise
-        finally:
             self._unsubscribe_all()
+
+
+class AgentStreamingResponse(StreamingResponse):
+    """Streaming response that always closes its request-scoped agent.
+
+    ASGI 2.4 reports a disconnected client as ``OSError`` from ``send()``.
+    That error occurs in the response loop while the async generator is
+    suspended at ``yield``; Python does not guarantee that the generator is
+    closed at that point.  Owning cleanup at the response boundary ensures the
+    synchronous worker sees cancellation even when Starlette retains the body
+    iterator after the failed send.
+    """
+
+    def __init__(self, bridge: AgentStreamBridge) -> None:
+        self._bridge = bridge
+        self._agent_stream = bridge.stream()
+        super().__init__(
+            self._agent_stream,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            self._bridge.cancel()
+            await self._agent_stream.aclose()
 
 
 async def create_agent_stream(
@@ -310,11 +353,7 @@ async def create_agent_stream(
 ) -> StreamingResponse:
     """Create an AgentStreamBridge and return a FastAPI StreamingResponse."""
     bridge = AgentStreamBridge(agent, bus, model, request)
-    return StreamingResponse(
-        bridge.stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
+    return AgentStreamingResponse(bridge)
 
 
-__all__ = ["AgentStreamBridge", "create_agent_stream"]
+__all__ = ["AgentStreamBridge", "AgentStreamingResponse", "create_agent_stream"]

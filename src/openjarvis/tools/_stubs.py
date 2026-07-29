@@ -15,8 +15,14 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event as ThreadEvent
 from typing import Any, Callable, Dict, List, Optional
 
+from openjarvis.core.cancellation import (
+    AgentCancelledError,
+    cancellation_scope,
+    current_cancellation_token,
+)
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import ToolCall, ToolResult
 from openjarvis.tools._execution_context import (
@@ -228,6 +234,10 @@ class ToolExecutor:
 
     def execute(self, tool_call: ToolCall) -> ToolResult:
         """Parse arguments, dispatch to tool, measure latency, emit events."""
+        cancellation_token = current_cancellation_token()
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
+
         tool = self._tools.get(tool_call.name)
         if tool is None:
             return ToolResult(
@@ -352,6 +362,12 @@ class ToolExecutor:
             if confirmation_denied is not None:
                 return confirmation_denied
 
+        # Authorization and confirmation can take time.  Re-check at the last
+        # dispatch boundary so disconnecting clients cannot start a later
+        # action with a decision made for an abandoned request.
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
+
         # Emit start event. ``agent`` carries the managed-agent UUID so the
         # AgentExecutor's trace subscriber (which filters by agent_id) can
         # actually match this event — without it, every tool call is silently
@@ -371,6 +387,7 @@ class ToolExecutor:
         t0 = time.time()
         pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
         receipt = None
+        invocation_started = ThreadEvent()
         try:
             receipt = _new_authorized_execution(
                 tool_call.name,
@@ -381,11 +398,55 @@ class ToolExecutor:
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
             def execute_authorized() -> ToolResult:
-                with _authorized_execution(receipt):
-                    return tool.execute(**params)
+                if cancellation_token is None:
+                    with _authorized_execution(receipt):
+                        invocation_started.set()
+                        return tool.execute(**params)
+
+                # ThreadPoolExecutor does not propagate ContextVars.  Bind the
+                # same request token in the tool worker and check immediately
+                # before the side-effecting implementation.
+                with cancellation_scope(cancellation_token):
+                    cancellation_token.raise_if_cancelled()
+                    with _authorized_execution(receipt):
+                        cancellation_token.raise_if_cancelled()
+                        invocation_started.set()
+                        return tool.execute(**params)
 
             future = pool.submit(execute_authorized)
             result = future.result(timeout=timeout)
+        except AgentCancelledError:
+            if receipt is not None:
+                _revoke_authorized_execution(receipt)
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+            if self._bus:
+                if invocation_started.is_set():
+                    cancellation_result = (
+                        "Tool cancellation requested during execution; "
+                        "outcome is unknown."
+                    )
+                    cancellation_metadata = {
+                        "cancellation_during_execution": True,
+                        "outcome": "unknown",
+                        "reconcile_required": True,
+                        "resource": resource,
+                    }
+                else:
+                    cancellation_result = "Tool execution cancelled before invocation."
+                    cancellation_metadata = {"cancelled_before_invocation": True}
+                self._bus.publish(
+                    EventType.TOOL_CALL_END,
+                    {
+                        "tool": tool_call.name,
+                        "success": False,
+                        "latency": time.time() - t0,
+                        "result": cancellation_result,
+                        "metadata": cancellation_metadata,
+                        "agent": self._agent_id,
+                    },
+                )
+            raise
         except concurrent.futures.TimeoutError:
             if receipt is not None:
                 _revoke_authorized_execution(receipt)
@@ -430,6 +491,12 @@ class ToolExecutor:
         latency = time.time() - t0
         result.latency_seconds = latency
         result.metadata["arguments"] = params
+        if cancellation_token is not None and cancellation_token.is_cancelled:
+            # The invocation crossed its final cancellation check before the
+            # disconnect.  It is no longer safe to pretend it was aborted;
+            # retain the completed result and stamp the audit trail.  The
+            # agent's next inference boundary will still stop.
+            result.metadata["cancellation_requested_after_dispatch"] = True
 
         # Auto-detect taints in results
         if result.success:

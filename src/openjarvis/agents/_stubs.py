@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from openjarvis.core.cancellation import CancellationToken, raise_if_cancelled
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolResult
@@ -27,6 +28,7 @@ class AgentContext:
     tools: List[str] = field(default_factory=list)
     memory_results: List[Any] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    cancellation_token: CancellationToken = field(default_factory=CancellationToken)
 
 
 @dataclass(slots=True)
@@ -186,6 +188,11 @@ class BaseAgent(ABC):
         Publishes INFERENCE_START/END events on the bus when the engine
         does not publish its own (i.e. non-instrumented engines).
         """
+        # ``engine.generate`` may be the long-running boundary during which a
+        # streaming client disconnects.  Check on both sides so a late model
+        # response can never flow into a subsequent tool call.
+        raise_if_cancelled()
+
         if self._bus and not getattr(self._engine, "_publishes_events", False):
             engine_id = getattr(self._engine, "engine_id", "")
             self._bus.publish(
@@ -200,6 +207,8 @@ class BaseAgent(ABC):
             max_tokens=self._max_tokens,
             **extra_kwargs,
         )
+
+        raise_if_cancelled()
 
         if self._bus and not getattr(self._engine, "_publishes_events", False):
             usage = result.get("usage", {})
