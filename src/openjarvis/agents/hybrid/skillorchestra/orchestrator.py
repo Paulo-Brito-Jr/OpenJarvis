@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+from openjarvis.core.cancellation import raise_if_cancelled
+
 from .._prices import is_gpt5_family, supports_temperature
 from .pool import ModelSpec, build_pool
 from .prompts import build_skill_orchestrator_prompt
@@ -71,6 +73,7 @@ def _orchestrate_step(
 
     ``tool_calls`` is a list of ``{"name", "input"}`` dicts.
     """
+    raise_if_cancelled()
     endpoint = endpoint.lower()
     if endpoint == "anthropic":
         import anthropic
@@ -84,6 +87,7 @@ def _orchestrate_step(
         )
         if supports_temperature(model):
             kwargs["temperature"] = 1.0
+        raise_if_cancelled()
         msg = client.messages.create(**kwargs)
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         tool_calls = [
@@ -110,6 +114,7 @@ def _orchestrate_step(
         else:
             kwargs["max_tokens"] = max_tokens
             kwargs["temperature"] = 1.0
+        raise_if_cancelled()
         resp = client.chat.completions.create(**kwargs)
         choice = resp.choices[0].message
         text = choice.content or ""
@@ -133,6 +138,7 @@ def _orchestrate_step(
             max_output_tokens=max_tokens,
             tools=[types.Tool(function_declarations=gemini_tools())],
         )
+        raise_if_cancelled()
         resp = client.models.generate_content(
             model=model,
             contents=user,
@@ -180,6 +186,9 @@ def _orchestrate_step(
             "tokens_out": c,
         }
     )
+    # The provider response is trace-recorded before a disconnect stops the
+    # next tool dispatch or orchestration round.
+    raise_if_cancelled()
     return text, tool_calls, p, c, cost
 
 
@@ -294,6 +303,7 @@ def run_orchestrator(
         return tool_alias or _STAGE_DEFAULT_ALIAS[stage]
 
     for step in range(max_rounds):
+        raise_if_cancelled()
         used_rounds = step + 1
         is_last = step == max_rounds - 1
         context_str = _build_context(
@@ -343,6 +353,7 @@ def run_orchestrator(
 
         finish = False
         for tc in tcalls:
+            raise_if_cancelled()
             tool = tc["name"]
             tool_alias = (tc.get("input") or {}).get("model")
             stage = _TOOL_STAGE.get(tool, "answer")
@@ -403,6 +414,7 @@ def run_orchestrator(
             else:
                 tokens_cloud += res["tokens_in"] + res["tokens_out"]
             cost_usd += res["cost_usd"]
+            raise_if_cancelled()
 
         if finish:
             break

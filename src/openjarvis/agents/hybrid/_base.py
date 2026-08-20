@@ -57,6 +57,10 @@ from openjarvis.agents.hybrid._prices import (
 from openjarvis.agents.hybrid._prices import (
     cost as estimate_cost,
 )
+from openjarvis.core.cancellation import (
+    current_cancellation_token,
+    raise_if_cancelled,
+)
 from openjarvis.engine._stubs import InferenceEngine
 from openjarvis.tools._stubs import ToolExecutor
 
@@ -195,6 +199,7 @@ def tavily_search_context(
     """Run OpenJarvis WebSearchTool and return accounting-friendly metadata."""
     from openjarvis.tools.web_search import WebSearchTool
 
+    raise_if_cancelled()
     _require_action_authorized(
         action_authorizer,
         "https://api.tavily.com",
@@ -207,7 +212,9 @@ def tavily_search_context(
         "https://api.tavily.com",
     )
     assert guarded_query is not None
+    raise_if_cancelled()
     tool = WebSearchTool(max_results=max_results)
+    raise_if_cancelled()
     res = tool.execute(query=guarded_query, max_results=max_results)
     meta = dict(res.metadata or {})
     engine = str(meta.get("engine") or "unknown")
@@ -222,7 +229,7 @@ def tavily_search_context(
     text = res.content or ""
     if not res.success and not text:
         text = "(no search results)"
-    return {
+    result = {
         "text": text,
         "success": bool(res.success),
         "engine": engine,
@@ -231,6 +238,22 @@ def tavily_search_context(
         "n_searches": 1 if guarded_query.strip() else 0,
         "error": None if res.success else text,
     }
+    _record_event(
+        {
+            "kind": "web_search",
+            "engine": engine,
+            "query": guarded_query,
+            "success": bool(res.success),
+            "credits": credits,
+            "cost_usd": cost_usd,
+            "response": text,
+            "ts": time.time(),
+        }
+    )
+    # Preserve the completed result in the audit trace before honoring a
+    # disconnect that arrived while the request was in flight.
+    raise_if_cancelled()
+    return result
 
 
 def web_search_cfg(method_cfg: Optional[Dict[str, Any]]) -> Tuple[bool, int]:
@@ -369,6 +392,8 @@ _OPENROUTER_LIMITER: Optional["_OpenRouterLimiter"] = None
 class _OpenRouterLimiter:
     """Process-wide concurrency + sliding-window RPM gate for OpenRouter."""
 
+    _POLL_INTERVAL_S = 0.05
+
     def __init__(self, max_concurrent: int, rpm: int) -> None:
         self.max_concurrent = int(max_concurrent)
         self.rpm = int(rpm)
@@ -377,14 +402,31 @@ class _OpenRouterLimiter:
         self._window_lock = threading.Lock()
 
     def acquire_concurrency(self) -> None:
-        self._sem.acquire()
+        token = current_cancellation_token()
+        if token is None:
+            self._sem.acquire()
+            return
+
+        acquired = False
+        try:
+            while not acquired:
+                token.raise_if_cancelled()
+                acquired = self._sem.acquire(timeout=self._POLL_INTERVAL_S)
+            token.raise_if_cancelled()
+        except BaseException:
+            if acquired:
+                self._sem.release()
+            raise
 
     def release_concurrency(self) -> None:
         self._sem.release()
 
     def wait_for_rpm_slot(self) -> None:
         """Block until making one more call would not exceed RPM in 60s."""
+        token = current_cancellation_token()
         while True:
+            if token is not None:
+                token.raise_if_cancelled()
             with self._window_lock:
                 now = time.time()
                 cutoff = now - 60.0
@@ -395,7 +437,10 @@ class _OpenRouterLimiter:
                 # Sleep until the oldest in-window call ages out, then recheck.
                 sleep_s = 60.0 - (now - self._window[0]) + 0.01
             if sleep_s > 0:
-                time.sleep(sleep_s)
+                if token is None:
+                    time.sleep(sleep_s)
+                else:
+                    time.sleep(min(sleep_s, self._POLL_INTERVAL_S))
 
     def record_call(self) -> None:
         with self._window_lock:
@@ -627,6 +672,7 @@ class LocalCloudAgent(BaseAgent):
                 ["network:fetch"],
                 tool_name="web_search",
             )
+        raise_if_cancelled()
 
         import anthropic
 
@@ -646,6 +692,7 @@ class LocalCloudAgent(BaseAgent):
             kwargs["tool_choice"] = tool_choice
         if output_config:
             kwargs["output_config"] = output_config
+        raise_if_cancelled()
         t0 = time.time()
         msg = client.messages.create(**kwargs)
         _bump_cloud_calls()
@@ -694,6 +741,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, msg.usage.input_tokens, msg.usage.output_tokens, n_searches
 
     @staticmethod
@@ -732,6 +780,7 @@ class LocalCloudAgent(BaseAgent):
             system,
             "https://api.openai.com",
         )
+        raise_if_cancelled()
         from openai import OpenAI
 
         client = OpenAI(timeout=timeout)
@@ -751,6 +800,7 @@ class LocalCloudAgent(BaseAgent):
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
+        raise_if_cancelled()
         t0 = time.time()
         resp = client.chat.completions.create(**kwargs)
         _bump_cloud_calls()
@@ -785,6 +835,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, p, c
 
     @staticmethod
@@ -848,6 +899,7 @@ class LocalCloudAgent(BaseAgent):
             system,
             "https://openrouter.ai/api/v1",
         )
+        raise_if_cancelled()
         from openai import OpenAI
 
         if model.startswith("openrouter/"):
@@ -873,14 +925,20 @@ class LocalCloudAgent(BaseAgent):
         if extra_body:
             kwargs["extra_body"] = extra_body
         limiter = _openrouter_limiter()
+        raise_if_cancelled()
         limiter.wait_for_rpm_slot()
+        raise_if_cancelled()
         limiter.acquire_concurrency()
+        dispatched = False
         try:
+            raise_if_cancelled()
             t0 = time.time()
+            dispatched = True
             resp = client.chat.completions.create(**kwargs)
         finally:
             limiter.release_concurrency()
-            limiter.record_call()
+            if dispatched:
+                limiter.record_call()
         _bump_cloud_calls()
         latency = time.time() - t0
         choice = resp.choices[0]
@@ -910,6 +968,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, p, c
 
     @staticmethod
@@ -955,6 +1014,7 @@ class LocalCloudAgent(BaseAgent):
             system,
             "https://generativelanguage.googleapis.com",
         )
+        raise_if_cancelled()
         from google import genai
         from google.genai import types
 
@@ -967,6 +1027,7 @@ class LocalCloudAgent(BaseAgent):
         )
         if system:
             cfg.system_instruction = system
+        raise_if_cancelled()
         t0 = time.time()
         resp = client.models.generate_content(
             model=model,
@@ -1004,6 +1065,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, p, c
 
     @staticmethod
@@ -1035,6 +1097,7 @@ class LocalCloudAgent(BaseAgent):
         )
         user = _guard_provider_text(action_authorizer, user, endpoint) or ""
         system = _guard_provider_text(action_authorizer, system, endpoint)
+        raise_if_cancelled()
         from openai import OpenAI
 
         client = OpenAI(base_url=endpoint, api_key="EMPTY", timeout=timeout)
@@ -1053,6 +1116,7 @@ class LocalCloudAgent(BaseAgent):
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
+        raise_if_cancelled()
         t0 = time.time()
         resp = client.chat.completions.create(**kwargs)
         _bump_local_calls()
@@ -1090,6 +1154,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, p, c
 
     @staticmethod
@@ -1147,6 +1212,7 @@ class LocalCloudAgent(BaseAgent):
                 ["network:fetch"],
                 tool_name="web_search",
             )
+        raise_if_cancelled()
 
         import anthropic
 
@@ -1163,6 +1229,7 @@ class LocalCloudAgent(BaseAgent):
         last_text = ""
         turns = 0
         for turn in range(max(1, max_turns)):
+            raise_if_cancelled()
             turns = turn + 1
             kwargs: Dict[str, Any] = {
                 "model": model,
@@ -1220,6 +1287,9 @@ class LocalCloudAgent(BaseAgent):
             n_searches_total += n_searches
             if text:
                 last_text = text
+            # The response is trace-recorded above before cancellation is
+            # surfaced, so an in-flight provider result remains auditable.
+            raise_if_cancelled()
             # If the model wants a client-side tool we don't dispatch
             # here — break and let the caller (or future loop variant)
             # handle it. Only ``server_tool_use`` blocks (web_search)
@@ -1299,6 +1369,7 @@ class LocalCloudAgent(BaseAgent):
             system,
             "https://api.openai.com",
         )
+        raise_if_cancelled()
 
         from openai import OpenAI
 
@@ -1323,6 +1394,7 @@ class LocalCloudAgent(BaseAgent):
         used_tool_name = search_tool_names[0]
         t0 = time.time()
         for tool_name in search_tool_names:
+            raise_if_cancelled()
             try:
                 resp = client.responses.create(
                     **kwargs_base,
@@ -1334,6 +1406,7 @@ class LocalCloudAgent(BaseAgent):
                 # Only fall through to the legacy name on what looks like a
                 # tool-type rejection; re-raise anything else immediately.
                 last_exc = exc
+                raise_if_cancelled()
                 msg = str(exc).lower()
                 if "web_search" in msg or "tool" in msg or "unsupported" in msg:
                     continue
@@ -1397,6 +1470,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, p, c, n_searches, 1
 
     @staticmethod
@@ -1454,6 +1528,7 @@ class LocalCloudAgent(BaseAgent):
             system,
             "https://generativelanguage.googleapis.com",
         )
+        raise_if_cancelled()
 
         from google import genai
         from google.genai import types
@@ -1469,6 +1544,7 @@ class LocalCloudAgent(BaseAgent):
         )
         if system:
             cfg.system_instruction = system
+        raise_if_cancelled()
         t0 = time.time()
         resp = client.models.generate_content(
             model=model,
@@ -1515,6 +1591,7 @@ class LocalCloudAgent(BaseAgent):
                 "ts": time.time(),
             }
         )
+        raise_if_cancelled()
         return text, p, c, n_searches, 1
 
     def _call_cloud(
@@ -1607,6 +1684,9 @@ class LocalCloudAgent(BaseAgent):
         **kwargs: Any,
     ) -> AgentResult:
         self._emit_turn_start(input)
+        raise_if_cancelled()
+        if context is not None:
+            context.cancellation_token.raise_if_cancelled()
         endpoint_resources = {
             "anthropic": "https://api.anthropic.com",
             "openai": "https://api.openai.com",
@@ -1652,6 +1732,7 @@ class LocalCloudAgent(BaseAgent):
                     tools=context.tools,
                     memory_results=context.memory_results,
                     metadata=guarded_metadata,
+                    cancellation_token=context.cancellation_token,
                 )
         except PermissionError as exc:
             self._emit_turn_end(turns=0, error=True)

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from openjarvis.core.cancellation import AgentCancelledError, raise_if_cancelled
 from openjarvis.tools.http_request import HttpRequestTool
 
 from .._base import (
@@ -162,6 +163,7 @@ def run_code(
     isolation boundary, so execution remains disabled until a verified
     sandbox adapter is wired.
     """
+    raise_if_cancelled()
     del bash_timeout_s
     agent._require_action(
         "code:skillorchestra",
@@ -230,6 +232,7 @@ def run_answer(
     in-tool LLM correctness check is dropped — OpenJarvis scores
     downstream.
     """
+    raise_if_cancelled()
     base = context_str.strip() + "\n\n" + problem
     model_l = spec.model.lower()
     system: Optional[str] = None
@@ -313,6 +316,7 @@ def run_search(
     otherwise we fall back to Anthropic ``web_search`` (the documented
     OpenJarvis substitution for the missing FAISS wiki index).
     """
+    raise_if_cancelled()
     prompt = (
         context_str.strip()
         + "\n\n"
@@ -327,6 +331,9 @@ def run_search(
         max_tokens=8000,
         temperature=1.0,
     )
+    # Query generation is a separate inference boundary.  Do not start a
+    # search after its caller has disconnected.
+    raise_if_cancelled()
     if "<query>" in text:
         query = text.split("<query>")[-1].split("</query>")[0].strip()
     else:
@@ -365,12 +372,14 @@ def run_search(
             query[:390],
             endpoint,
         )
+        raise_if_cancelled()
         payload = {
             "queries": [guarded_query],
             "topk": topk,
             "return_scores": True,
         }
         try:
+            raise_if_cancelled()
             response = HttpRequestTool().execute(
                 url=endpoint,
                 method="POST",
@@ -390,6 +399,20 @@ def run_search(
                     contents.append(doc["content"])
                 elif "contents" in doc:
                     contents.append(doc["contents"])
+            agent.record_trace_event(
+                {
+                    "kind": "skillorchestra_retriever",
+                    "endpoint": endpoint,
+                    "status_code": status_code,
+                    "success": bool(response.success),
+                    "result_count": len(contents),
+                }
+            )
+            # The HTTP result is now represented in the trace and accumulated
+            # context; only then surface cancellation from an in-flight call.
+            raise_if_cancelled()
+        except AgentCancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
             contents.append(f"[retriever error: {exc}]")
     else:
@@ -450,7 +473,7 @@ def run_search(
             search_uses = n_searches
             cost += agent.cost_usd(agent._cloud_model, wp, wc)
             cost += n_searches * ws_cost_per_call
-        except PermissionError:
+        except (AgentCancelledError, PermissionError):
             raise
         except Exception as exc:  # noqa: BLE001
             contents.append(f"[web_search error: {exc}]")

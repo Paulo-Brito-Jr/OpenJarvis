@@ -594,6 +594,7 @@ def test_skillorchestra_retriever_uses_ssrf_safe_transport_and_dlp(
         _call_vllm=MagicMock(
             return_value=("<query>private lookup value</query>", 2, 1)
         ),
+        record_trace_event=MagicMock(),
     )
     spec = ModelSpec(
         alias="search-3",
