@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 
@@ -267,6 +268,7 @@ def serve(
 
     # Resolve agent
     agent = None
+    request_agent_factory = None
     agent_key = agent_name or config.server.agent
     # Tool instances resolved for the primary agent are reused below to build
     # the scheduler's ToolExecutor — avoiding a second full SystemBuilder.build()
@@ -281,13 +283,13 @@ def serve(
             if AgentRegistry.contains(agent_key):
                 agent_cls = AgentRegistry.get(agent_key)
                 agent_kwargs = {"bus": bus}
-                if sec.capability_policy is not None:
-                    agent_kwargs["capability_policy"] = sec.capability_policy
 
                 # MCP transports persisted on the agent at the bottom of
                 # this block — initialise here so the reference is valid
                 # even when accepts_tools is False (#461).
                 mcp_clients: list = []
+                request_tool_factories: list = []
+                request_tool_blockers: list[str] = []
 
                 # Load tools for agents that support them
                 if getattr(agent_cls, "accepts_tools", False):
@@ -319,9 +321,16 @@ def serve(
                         if isinstance(tool_cls, type) and issubclass(
                             tool_cls, BaseTool
                         ):
-                            tools.append(tool_cls())
+                            tool = tool_cls()
+                            tools.append(tool)
+                            request_tool_factories.append((tool, tool_cls))
                         elif isinstance(tool_cls, BaseTool):
                             tools.append(tool_cls)
+                            # A pre-built registry value may carry mutable,
+                            # caller-specific state that cannot be reproduced
+                            # safely. Keep it available to the service agent,
+                            # but fail closed for authenticated API requests.
+                            request_tool_blockers.append(name)
 
                     # MCP server tools from config.tools.mcp.servers
                     # (#461 — these were silently dropped).
@@ -334,9 +343,16 @@ def serve(
                     if mcp_tools:
                         existing = {t.spec.name for t in tools}
                         for t in mcp_tools:
-                            if t.spec.name not in existing:
-                                tools.append(t)
-                                existing.add(t.spec.name)
+                            if t.spec.name in existing:
+                                raise RuntimeError(
+                                    f"Duplicate tool name rejected: {t.spec.name}"
+                                )
+                            tools.append(t)
+                            # MCPClient transports are sessionful and are not
+                            # concurrency-isolated. A request-scoped agent must
+                            # never share one across principals/requests.
+                            request_tool_blockers.append(t.spec.name)
+                            existing.add(t.spec.name)
 
                     if tools:
                         agent_kwargs["tools"] = tools
@@ -347,10 +363,98 @@ def serve(
                     agent_kwargs["max_turns"] = config.agent.max_turns
 
                 agent = agent_cls(engine, model_name, **agent_kwargs)
+                needs_security = bool(
+                    getattr(agent_cls, "accepts_tools", False)
+                    or getattr(agent_cls, "requires_security_context", False)
+                )
+                if needs_security:
+                    bind_security = getattr(agent, "bind_security", None)
+                    if not callable(bind_security):
+                        raise RuntimeError(
+                            f"Agent '{agent_key}' cannot bind the required "
+                            "security policy"
+                        )
+                    bind_security(
+                        sec.capability_policy,
+                        agent_key,
+                        sec.boundary_guard,
+                    )
                 # Pin MCP transports to the agent's lifetime so HTTP
                 # connections don't close mid-request (#461).
                 if mcp_clients:
                     agent._mcp_clients = mcp_clients
+
+                # External API requests must never mutate or rebind the
+                # service-level agent above. Construct a fresh agent,
+                # ToolExecutor, EventBus, and built-in tool set for every
+                # authenticated principal.
+                _request_agent_kwargs = {
+                    key: value
+                    for key, value in agent_kwargs.items()
+                    if key not in {"bus", "tools"}
+                }
+                _request_tool_factories = tuple(request_tool_factories)
+                _request_tool_blockers = tuple(request_tool_blockers)
+                _request_needs_security = needs_security
+
+                def _build_request_agent_scope(principal: str):
+                    from openjarvis.server.request_agent import RequestAgentScope
+                    from openjarvis.tools._stubs import BaseTool
+
+                    request_principal = (
+                        principal.strip() if isinstance(principal, str) else ""
+                    )
+                    if not request_principal:
+                        raise RuntimeError(
+                            "Authenticated request principal is required"
+                        )
+                    if _request_tool_blockers:
+                        raise RuntimeError(
+                            "Request-scoped execution is unavailable for "
+                            "shared tool registrations"
+                        )
+                    request_bus = EventBus()
+                    request_kwargs = dict(_request_agent_kwargs)
+                    if _request_tool_factories:
+                        request_tools = []
+                        for service_tool, tool_factory in _request_tool_factories:
+                            request_tool = tool_factory()
+                            if (
+                                not isinstance(request_tool, BaseTool)
+                                or request_tool is service_tool
+                            ):
+                                raise RuntimeError(
+                                    "Tool factory did not return a fresh tool"
+                                )
+                            request_tools.append(request_tool)
+                        request_kwargs["tools"] = request_tools
+                    request_kwargs["bus"] = request_bus
+                    request_agent = agent_cls(
+                        engine,
+                        model_name,
+                        **request_kwargs,
+                    )
+                    if _request_needs_security:
+                        bind_request_security = getattr(
+                            request_agent,
+                            "bind_security",
+                            None,
+                        )
+                        if not callable(bind_request_security):
+                            raise RuntimeError(
+                                f"Agent '{agent_key}' cannot bind request security"
+                            )
+                        bind_request_security(
+                            sec.capability_policy,
+                            request_principal,
+                            sec.boundary_guard,
+                        )
+                    return RequestAgentScope(
+                        agent=request_agent,
+                        bus=request_bus,
+                    )
+
+                request_agent_factory = _build_request_agent_scope
         except Exception as exc:
             import traceback
 
@@ -458,8 +562,18 @@ def serve(
             model=model_name,
             agent_name=channel_agent,
             tools=_channel_tools,
+            capability_policy=sec.capability_policy,
+            audit_logger=sec.audit_logger,
+            boundary_guard=sec.boundary_guard,
         )
-        _wire_system.wire_channel(channel_bridge)
+        # Do not register the legacy generic handler here.  It has no
+        # request-scoped sender principal and would execute with the service
+        # agent's grants.  The authenticated ChannelBridge configured below is
+        # the only supported inbound channel path.
+        logger.warning(
+            "Legacy generic channel execution is disabled; "
+            "using authenticated ChannelBridge routing only"
+        )
 
     # Set up speech backend
     speech_backend = None
@@ -574,7 +688,15 @@ def serve(
                     logger.debug("Scheduler session store init failed: %s", exc)
 
             _sched_tool_executor = (
-                ToolExecutor(resolved_tools, bus) if resolved_tools else None
+                ToolExecutor(
+                    resolved_tools,
+                    bus,
+                    capability_policy=sec.capability_policy,
+                    agent_id=agent_key or config.agent.default_agent,
+                    boundary_guard=sec.boundary_guard,
+                )
+                if resolved_tools
+                else None
             )
 
             system = JarvisSystem(
@@ -592,6 +714,8 @@ def serve(
                 trace_store=_trace_store,
                 session_store=_sched_session_store,
                 capability_policy=sec.capability_policy,
+                audit_logger=sec.audit_logger,
+                boundary_guard=sec.boundary_guard,
                 agent_manager=agent_manager,
                 agent_executor=executor,
             )
@@ -602,15 +726,13 @@ def serve(
                 executor=executor,
                 event_bus=bus,
             )
-            for ag in agent_manager.list_agents():
-                sched_type = ag.get("config", {}).get("schedule_type", "manual")
-                if sched_type in ("cron", "interval") and ag["status"] not in (
-                    "archived",
-                    "error",
-                ):
-                    agent_scheduler.register_agent(ag["id"])
-            agent_scheduler.start()
-            console.print("  Scheduler: [cyan]active[/cyan]")
+            logger.warning(
+                "Managed agent scheduler is disabled until durable "
+                "multi-process claims are available"
+            )
+            console.print(
+                "  Scheduler: [yellow]disabled (durable claims pending)[/yellow]"
+            )
         except Exception as exc:
             logger.debug("Agent scheduler init failed: %s", exc)
 
@@ -632,6 +754,39 @@ def serve(
     from openjarvis.server.auth_middleware import check_bind_safety
 
     check_bind_safety(bind_host, api_key=api_key)
+    api_principal = (
+        _os.environ.get("OPENJARVIS_API_PRINCIPAL", "api:server").strip()
+        or "api:server"
+    )
+    api_principal_allowlist = {
+        value.strip()
+        for value in _os.environ.get(
+            "OPENJARVIS_API_PRINCIPAL_ALLOWLIST",
+            api_principal,
+        ).split(",")
+        if value.strip()
+    }
+
+    raw_sender_allowlist = _os.environ.get(
+        "OPENJARVIS_CHANNEL_SENDER_ALLOWLIST",
+        "{}",
+    )
+    try:
+        parsed_sender_allowlist = json.loads(raw_sender_allowlist)
+        if not isinstance(parsed_sender_allowlist, dict):
+            raise ValueError("top-level value must be an object")
+        channel_sender_allowlist = {
+            str(channel): tuple(senders)
+            for channel, senders in parsed_sender_allowlist.items()
+            if isinstance(senders, list)
+        }
+        if len(channel_sender_allowlist) != len(parsed_sender_allowlist):
+            raise ValueError("every channel value must be an array")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(
+            "OPENJARVIS_CHANNEL_SENDER_ALLOWLIST must be a JSON object "
+            "mapping channel names to arrays of exact sender IDs"
+        ) from exc
 
     # Log credential status at startup
     from openjarvis.core.credentials import TOOL_CREDENTIALS, get_credential_status
@@ -671,6 +826,8 @@ def serve(
                 bus=bus,
                 system=None,
                 agent_manager=agent_manager,
+                sender_allowlist=channel_sender_allowlist,
+                capability_policy=sec.capability_policy,
             )
         except Exception as exc:
             logger.debug("ChannelBridge init skipped: %s", exc)
@@ -679,6 +836,7 @@ def serve(
         engine,
         model_name,
         agent=agent,
+        request_agent_factory=request_agent_factory,
         bus=bus,
         engine_name=engine_name,
         agent_name=agent_key or "",
@@ -689,11 +847,15 @@ def serve(
         speech_backend=speech_backend,
         agent_manager=agent_manager,
         agent_scheduler=agent_scheduler,
+        capability_policy=sec.capability_policy,
+        audit_logger=sec.audit_logger,
+        boundary_guard=sec.boundary_guard,
         api_key=api_key,
+        api_principal=api_principal,
+        api_principal_allowlist=api_principal_allowlist,
         webhook_config=webhook_config,
         cors_origins=config.server.cors_origins,
     )
-
     console.print(
         f"[green]Starting OpenJarvis API server[/green]\n"
         f"  Engine: [cyan]{engine_name}[/cyan]\n"

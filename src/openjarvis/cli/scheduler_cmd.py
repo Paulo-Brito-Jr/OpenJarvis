@@ -10,6 +10,12 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+_SCHEDULER_CLI_AUTH_ERROR = (
+    "Direct scheduler CLI access is disabled because this process has no "
+    "authenticated operator identity, explicit capability grants, or durable "
+    "consent. Use an integration that supplies all three security inputs."
+)
+
 
 def _get_store() -> "SchedulerStore":  # noqa: F821
     """Build a SchedulerStore from user config."""
@@ -23,11 +29,31 @@ def _get_store() -> "SchedulerStore":  # noqa: F821
     return SchedulerStore(db_path)
 
 
-def _get_scheduler(store: "SchedulerStore") -> "TaskScheduler":  # noqa: F821
-    """Build a TaskScheduler from a store."""
+def _get_scheduler(
+    store: "SchedulerStore",  # noqa: F821
+    *,
+    capability_policy=None,  # noqa: ANN001
+    operator_id: str = "",
+    capabilities: Optional[list[str]] = None,
+    poll_interval: int = 60,
+) -> "TaskScheduler":  # noqa: F821
+    """Build a scheduler only from an explicit authenticated context."""
     from openjarvis.scheduler.scheduler import TaskScheduler
 
-    return TaskScheduler(store)
+    if (
+        capability_policy is None
+        or not operator_id.strip()
+        or not capabilities
+        or "schedule:create" not in capabilities
+    ):
+        raise click.ClickException(_SCHEDULER_CLI_AUTH_ERROR)
+    return TaskScheduler(
+        store,
+        capability_policy=capability_policy,
+        default_operator_id=operator_id,
+        default_capabilities=capabilities,
+        poll_interval=poll_interval,
+    )
 
 
 @click.group()
@@ -186,6 +212,7 @@ def scheduler_logs(task_id: str, limit: int) -> None:
     console = Console()
     store = _get_store()
     try:
+        _get_scheduler(store)
         logs = store.get_run_logs(task_id, limit=limit)
         if not logs:
             console.print(f"[dim]No run logs for task {task_id}[/dim]")
@@ -307,9 +334,7 @@ def scheduler_start(poll_interval: int) -> None:
     console = Console()
     store = _get_store()
 
-    from openjarvis.scheduler.scheduler import TaskScheduler
-
-    sched = TaskScheduler(store, poll_interval=poll_interval)
+    sched = _get_scheduler(store, poll_interval=poll_interval)
     sched.start()
     console.print(
         f"[green]Scheduler running (poll every {poll_interval}s). "

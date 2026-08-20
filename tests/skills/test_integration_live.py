@@ -6,6 +6,8 @@ Mark: live
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from openjarvis.core.events import EventBus, EventType
@@ -17,6 +19,13 @@ from openjarvis.system import SystemBuilder
 @pytest.mark.live
 class TestSkillSystemIntegration:
     """Integration tests verifying skills flow end-to-end with a real engine."""
+
+    @pytest.fixture(autouse=True)
+    def _require_live_opt_in(self):
+        if os.environ.get("OPENJARVIS_RUN_LIVE_TESTS") != "1":
+            pytest.skip(
+                "set OPENJARVIS_RUN_LIVE_TESTS=1 to use local Ollama and skills"
+            )
 
     def test_system_builder_discovers_skills(self):
         """SystemBuilder.build() discovers installed skills and adds them to tools."""
@@ -127,6 +136,7 @@ class TestSkillEventsAndTracing:
     def test_skill_execution_emits_events(self):
         """Running a structured skill emits SKILL_EXECUTE_START/END events."""
         from openjarvis.core.types import ToolResult
+        from openjarvis.security.capabilities import CapabilityPolicy
         from openjarvis.skills.executor import SkillExecutor
         from openjarvis.skills.types import SkillManifest, SkillStep
         from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
@@ -146,7 +156,13 @@ class TestSkillEventsAndTracing:
                 )
 
         bus = EventBus(record_history=True)
-        te = ToolExecutor([EchoTool()])
+        policy = CapabilityPolicy()
+        policy.grant("live-skill-test-agent", "tool:invoke")
+        te = ToolExecutor(
+            [EchoTool()],
+            capability_policy=policy,
+            agent_id="live-skill-test-agent",
+        )
         executor = SkillExecutor(te, bus=bus)
 
         manifest = SkillManifest(

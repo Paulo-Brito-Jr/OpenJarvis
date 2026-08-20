@@ -1,13 +1,9 @@
-"""OpenCodeAgent -- wraps the `opencode` coding agent via its headless HTTP server.
+"""Security-disabled OpenCode headless-server adapter.
 
-Spawns ``opencode serve`` (https://opencode.ai) and drives a session over its
-HTTP API, configured to use OpenJarvis's local engine through an
-OpenAI-compatible provider. This keeps coding-agent work local-first: opencode
-handles the agentic loop / tools, OpenJarvis supplies the model.
-
-opencode is an external binary (install: ``npm i -g opencode-ai`` or
-``brew install anomalyco/tap/opencode``). It is not bundled; :meth:`run`
-raises a clear error if it is not on ``PATH``.
+The legacy implementation spawned an external coding agent with authority
+outside OpenJarvis's capability and confirmation boundary. Construction and
+``run`` now avoid credentials and external processes until a verified isolated
+sandbox bridge exists.
 """
 
 from __future__ import annotations
@@ -113,6 +109,7 @@ class OpenCodeAgent(BaseAgent):
 
     agent_id = "opencode"
     accepts_tools = False
+    requires_security_context = True
     _default_temperature = 0.7
     _default_max_tokens = 1024
 
@@ -149,18 +146,34 @@ class OpenCodeAgent(BaseAgent):
         self._provider_id = provider_id
         self._provider_base_url = provider_base_url or _derive_openai_base_url(engine)
         self._model_id = model_id or model
-        self._api_key = api_key
+        # The adapter is disabled, so retaining provider/server credentials in
+        # this object has no legitimate purpose.
+        del api_key, server_password
+        self._api_key = ""
         self._permission = permission
         self._hostname = hostname
         self._port = port
-        self._server_password = server_password or os.environ.get(
-            "OPENCODE_SERVER_PASSWORD", ""
-        )
+        self._server_password = ""
         self._timeout = timeout
         self._opencode_bin = opencode_bin or shutil.which("opencode") or "opencode"
         self._proc: Optional[subprocess.Popen] = None
         self._base: str = ""
         self._config_dir: Optional[str] = None
+        self._capability_policy = None
+        self._security_agent_id = ""
+
+    def bind_security(
+        self,
+        capability_policy: Optional[Any],
+        agent_id: Optional[str] = None,
+        boundary_guard: Optional[Any] = None,
+    ) -> None:
+        self._capability_policy = capability_policy
+        self._security_agent_id = agent_id if isinstance(agent_id, str) else ""
+        self._boundary_guard = boundary_guard
+
+    def bind_boundary_guard(self, boundary_guard: Optional[Any]) -> None:
+        self._boundary_guard = boundary_guard
 
     # ------------------------------------------------------------------
     # Server lifecycle
@@ -176,15 +189,16 @@ class OpenCodeAgent(BaseAgent):
         - ``build``: allow edits + bash (a coding agent the user invoked).
         - ``plan``: deny edits + bash (read-only), matching opencode's intent.
         """
-        if self._agent == "plan":
-            return {"edit": "deny", "bash": "deny", "webfetch": "allow"}
-        return {"edit": "allow", "bash": "allow", "webfetch": "allow"}
+        return {"edit": "deny", "bash": "deny", "webfetch": "deny"}
 
     def _build_config(self) -> dict:
         """Build the opencode config (provider wiring + permission policy)."""
         cfg: dict = {
             "$schema": "https://opencode.ai/config.json",
-            "permission": self._permission or self._default_permission(),
+            # The adapter is disabled until an enforceable sandbox bridge
+            # exists.  Never serialize a caller-provided allow policy that
+            # could be reused by invoking the binary out of band.
+            "permission": self._default_permission(),
         }
         if self._provider_base_url:
             options: dict = {"baseURL": self._provider_base_url}
@@ -202,6 +216,13 @@ class OpenCodeAgent(BaseAgent):
 
     def _ensure_server(self) -> str:
         """Spawn ``opencode serve`` (once) and return its base URL."""
+        raise RuntimeError(
+            "OpenCode adapter disabled: no verified isolated sandbox and "
+            "OpenJarvis capability bridge is available."
+        )
+
+        # Kept below for an eventual audited adapter implementation.  It is
+        # unreachable while the fail-closed guard above is in force.
         if self._base and self._proc and self._proc.poll() is None:
             return self._base
         if not is_opencode_available() and not Path(self._opencode_bin).exists():
@@ -302,92 +323,17 @@ class OpenCodeAgent(BaseAgent):
     ) -> AgentResult:
         """Run a coding task through opencode and return the assistant result."""
         self._emit_turn_start(input)
-
-        # Resolve which opencode provider/model to address. Fail clearly rather
-        # than letting opencode 500 on an unregistered provider.
-        if self._provider_base_url:
-            model_spec = {"providerID": self._provider_id, "modelID": self._model_id}
-        elif "/" in self._model_id:
-            prov, _, mid = self._model_id.partition("/")
-            model_spec = {"providerID": prov, "modelID": mid}
-        else:
-            self._emit_turn_end(turns=1, error=True)
-            return AgentResult(
-                content=(
-                    f"OpenCodeAgent could not determine an opencode provider for "
-                    f"model {self._model_id!r}: no OpenAI-compatible base URL could "
-                    f"be derived from the engine. Pass provider_base_url=..., or use "
-                    f"a 'provider/model' that opencode already knows."
-                ),
-                turns=1,
-                metadata={"error": True},
-            )
-
-        try:
-            self._ensure_server()
-        except RuntimeError as exc:
-            self._emit_turn_end(turns=1, error=True)
-            return AgentResult(content=str(exc), turns=1, metadata={"error": True})
-
-        data: dict = {}
-        turn_parts: List[dict] = []
-        try:
-            with self._client() as c:
-                ses = c.post("/session", json={"title": input[:80]})
-                ses.raise_for_status()
-                session_id = ses.json()["id"]
-
-                body: dict = {
-                    "agent": self._agent,
-                    "model": model_spec,
-                    "parts": [{"type": "text", "text": input}],
-                }
-
-                resp = c.post(f"/session/{session_id}/message", json=body)
-                resp.raise_for_status()
-                data = resp.json()
-
-                # The prompt POST returns only the final assistant message;
-                # tool executions live in intermediate messages of the turn, so
-                # pull the whole session to recover them (verified against a
-                # live opencode session). Falls back to the final message.
-                turn_parts = list(data.get("parts", []))
-                try:
-                    msgs = c.get(f"/session/{session_id}/message").json()
-                    if isinstance(msgs, list):
-                        turn_parts = [
-                            part
-                            for mm in msgs
-                            if isinstance(mm, dict)
-                            for part in mm.get("parts", [])
-                        ]
-                except Exception as get_exc:
-                    logger.debug("opencode message fetch failed: %s", get_exc)
-        except Exception as exc:
-            logger.error("opencode run failed: %s", exc, exc_info=True)
-            self._emit_turn_end(turns=1, error=True)
-            return AgentResult(
-                content=f"opencode agent failed: {exc}",
-                turns=1,
-                metadata={"error": True},
-            )
-
-        info = data.get("info", {}) if isinstance(data, dict) else {}
-        content = _extract_text(data.get("parts", []))
-        tool_results = _extract_tool_results(turn_parts)
-
-        self._emit_turn_end(turns=1)
+        self._emit_turn_end(turns=0, error=True)
         return AgentResult(
-            content=content,
-            tool_results=tool_results,
-            turns=1,
+            content=(
+                "OpenCode adapter disabled: no verified isolated sandbox and "
+                "OpenJarvis capability bridge is available."
+            ),
+            turns=0,
             metadata={
-                "finish": info.get("finish"),
-                "tokens": info.get("tokens"),
-                "provider_id": info.get("providerID", self._provider_id),
-                "model_id": info.get("modelID", self._model_id),
-                "session_id": info.get("sessionID", ""),
-                "agent": self._agent,
+                "error": True,
+                "security_disabled": True,
+                "reason": "unverified_external_sandbox",
             },
         )
 

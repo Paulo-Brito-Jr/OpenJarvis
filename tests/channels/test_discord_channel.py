@@ -143,12 +143,20 @@ class TestWireChannelEndToEnd:
         from openjarvis.channels._stubs import ChannelMessage
         from openjarvis.core.config import JarvisConfig
         from openjarvis.core.events import EventBus
+        from openjarvis.security.capabilities import CapabilityPolicy
         from openjarvis.system import JarvisSystem
+        from openjarvis.system.core import channel_operator_id
 
         config = JarvisConfig()
         config.sessions.db_path = str(tmp_path / "sessions.db")
         from unittest.mock import MagicMock as _MM
 
+        policy = CapabilityPolicy()
+        policy.grant(
+            channel_operator_id("discord", "user-1"),
+            "tool:invoke",
+            "agent:system",
+        )
         system = JarvisSystem(
             config=config,
             bus=EventBus(record_history=False),
@@ -156,11 +164,15 @@ class TestWireChannelEndToEnd:
             engine_key="mock",
             model="test-model",
             agent_name="",
+            capability_policy=policy,
         )
         system.ask = _MM(return_value={"content": "pong"})
 
         channel = DiscordChannel(bot_token="my-bot-token")
-        system.wire_channel(channel)
+        system.wire_channel(
+            channel,
+            sender_allowlist={"discord": {"user-1"}},
+        )
 
         # Exactly the ChannelMessage shape DiscordChannel._gateway_loop emits:
         # channel = "discord" (TYPE label), conversation_id = numeric channel

@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import StepType, Trace, TraceStep
+from openjarvis.security.taint import redact_sensitive_text
+from openjarvis.traces.redaction import sanitize_trace
 from openjarvis.traces.store import TraceStore
 
 
@@ -19,8 +21,8 @@ class TraceCollector:
     ``TraceStep`` objects.  When the agent finishes, the complete ``Trace``
     is persisted to the ``TraceStore`` and published on the bus.
 
-    Enhanced to capture full model response content, tool call arguments and
-    results, and the complete conversation message history.
+    Content is redacted before persistence. Tool arguments and results are
+    retained only as non-reversible summaries.
 
     Usage::
 
@@ -97,6 +99,7 @@ class TraceCollector:
             trace.total_latency_seconds += step.duration_seconds
             trace.total_tokens += step.output.get("tokens", 0)
 
+        trace = sanitize_trace(trace)
         self._last_trace = trace
 
         if self._store is not None:
@@ -217,7 +220,7 @@ class TraceCollector:
                 step_type=StepType.RETRIEVE,
                 timestamp=event.timestamp,
                 duration_seconds=event.data.get("latency", 0.0),
-                input={"query": event.data.get("query", "")},
+                input={"query": redact_sensitive_text(event.data.get("query", ""))},
                 output={
                     "num_results": event.data.get("num_results", 0),
                 },
@@ -269,6 +272,7 @@ def record_response_trace(
             ],
         )
         trace.total_latency_seconds = duration
+        trace = sanitize_trace(trace)
         store.save(trace)
         return trace
     except Exception:

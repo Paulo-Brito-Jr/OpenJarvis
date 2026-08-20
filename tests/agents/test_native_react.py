@@ -11,6 +11,7 @@ from openjarvis.agents.native_react import NativeReActAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Conversation, Message, Role, ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,13 @@ def _engine_response(content, **extra):
     }
     base.update(extra)
     return base
+
+
+def _allow_test_tools(agent):
+    policy = CapabilityPolicy()
+    policy.grant("native-react-test-agent", "*")
+    agent.bind_security(policy, "native-react-test-agent")
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +220,7 @@ class TestNativeReActAgent:
             tools=[_CalculatorStub()],
             bus=bus,
         )
+        agent = _allow_test_tools(agent)
         result = agent.run("What is 2+2?")
         assert result.content == "4"
         assert result.turns == 2
@@ -231,6 +240,7 @@ class TestNativeReActAgent:
             _engine_response("Thought: Done.\nFinal Answer: 21"),
         ]
         agent = NativeReActAgent(engine, "test-model", tools=[_CalculatorStub()])
+        agent = _allow_test_tools(agent)
         result = agent.run("3 times 7")
         assert result.tool_results[0].content == "21"
         assert result.tool_results[0].success is True
@@ -333,6 +343,7 @@ class TestNativeReActAgent:
             tools=[_CalculatorStub()],
             bus=bus,
         )
+        agent = _allow_test_tools(agent)
         agent.run("Calc")
         event_types = [e.event_type for e in bus.history]
         assert EventType.TOOL_CALL_START in event_types
@@ -373,6 +384,7 @@ class TestNativeReActAgent:
             _engine_response("Thought: Now I know.\nFinal Answer: Greetings!"),
         ]
         agent = NativeReActAgent(engine, "test-model", tools=[_ThinkStub()])
+        agent = _allow_test_tools(agent)
         result = agent.run("Say hi")
         assert result.content == "Greetings!"
         assert result.tool_results[0].tool_name == "think"
@@ -411,6 +423,7 @@ class TestNativeReActAgent:
             _engine_response("Thought: Got it.\nFinal Answer: 10"),
         ]
         agent = NativeReActAgent(engine, "test-model", tools=[_CalculatorStub()])
+        agent = _allow_test_tools(agent)
         agent.run("What is 5+5?")
         # Check second call messages
         second_call = engine.generate.call_args_list[1]

@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_call() {
+    fn test_tools_call_without_security_context_fails_closed() {
         let server = make_server();
         let req = McpRequest::new(
             "tools/call",
@@ -147,7 +147,10 @@ mod tests {
         );
         let resp = server.handle_request(&req);
         let result = resp.result.unwrap();
-        assert_eq!(result["isError"], false);
-        assert!(result["content"][0]["text"].as_str().unwrap().contains("4"));
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Capability denied"));
     }
 }

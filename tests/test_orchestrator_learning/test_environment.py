@@ -9,6 +9,7 @@ from openjarvis.learning.intelligence.orchestrator.environment import (
     OrchestratorEnvironment,
 )
 from openjarvis.learning.intelligence.orchestrator.types import OrchestratorAction
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # -- Mock tool ---------------------------------------------------------------
@@ -53,28 +54,51 @@ class _MockCalculator(BaseTool):
 # -- Tests -------------------------------------------------------------------
 
 
+def _environment(max_turns: int = 10) -> OrchestratorEnvironment:
+    policy = CapabilityPolicy()
+    policy.grant("orchestrator-environment-test", "*", "*")
+    return OrchestratorEnvironment(
+        tools=[_MockCalculator()],
+        max_turns=max_turns,
+        capability_policy=policy,
+        agent_id="orchestrator-environment-test",
+    )
+
+
 class TestOrchestratorEnvironment:
     def test_reset_creates_clean_state(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()])
+        env = _environment()
         state = env.reset("What is 2+2?")
         assert state.initial_prompt == "What is 2+2?"
         assert state.num_turns() == 0
         assert state.final_answer is None
 
     def test_step_executes_tool(self):
+        env = _environment()
+        state = env.reset("q")
+        action = OrchestratorAction(
+            thought="calc",
+            tool_name="calculator",
+            tool_input='{"expression": "2+2"}',
+        )
+        state, obs = env.step(state, action)
+        assert state.num_turns() == 1
+        assert obs.content == "4"
+        assert obs.latency_seconds >= 0
+
+    def test_step_without_security_binding_denies(self):
         env = OrchestratorEnvironment(tools=[_MockCalculator()])
         state = env.reset("q")
         action = OrchestratorAction(
             thought="calc",
             tool_name="calculator",
-            tool_input="2+2",
+            tool_input='{"expression": "2+2"}',
         )
-        state, obs = env.step(state, action)
-        assert state.num_turns() == 1
-        assert obs.latency_seconds >= 0
+        _, obs = env.step(state, action)
+        assert "policy unavailable" in obs.content.lower()
 
     def test_is_done_on_final_answer(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()])
+        env = _environment()
         state = env.reset("q")
         action = OrchestratorAction(
             thought="done",
@@ -86,7 +110,7 @@ class TestOrchestratorEnvironment:
         assert env.is_done(state) is True
 
     def test_is_done_on_max_turns(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()], max_turns=2)
+        env = _environment(max_turns=2)
         state = env.reset("q")
         for _ in range(2):
             action = OrchestratorAction(
@@ -96,7 +120,7 @@ class TestOrchestratorEnvironment:
         assert env.is_done(state) is True
 
     def test_invalid_tool_raises(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()])
+        env = _environment()
         state = env.reset("q")
         action = OrchestratorAction(
             thought="t", tool_name="nonexistent", tool_input="x"
@@ -105,7 +129,7 @@ class TestOrchestratorEnvironment:
             env.step(state, action)
 
     def test_max_turns_exceeded_raises(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()], max_turns=1)
+        env = _environment(max_turns=1)
         state = env.reset("q")
         action = OrchestratorAction(
             thought="go", tool_name="calculator", tool_input="1+1"
@@ -115,10 +139,10 @@ class TestOrchestratorEnvironment:
             env.step(state, action)
 
     def test_get_available_tools(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()])
+        env = _environment()
         assert env.get_available_tools() == ["calculator"]
 
     def test_not_done_initially(self):
-        env = OrchestratorEnvironment(tools=[_MockCalculator()])
+        env = _environment()
         state = env.reset("q")
         assert env.is_done(state) is False

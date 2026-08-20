@@ -9,6 +9,7 @@ from openjarvis.agents.native_openhands import NativeOpenHandsAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Conversation, Message, Role, ToolCall, ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,13 @@ def _engine_response(content, **extra):
     return base
 
 
+def _allow_test_tools(agent):
+    policy = CapabilityPolicy()
+    policy.grant("native-openhands-test-agent", "*")
+    agent.bind_security(policy, "native-openhands-test-agent")
+    return agent
+
+
 # ---------------------------------------------------------------------------
 # Registration tests
 # ---------------------------------------------------------------------------
@@ -156,6 +164,7 @@ class TestNativeOpenHandsAgent:
             "test-model",
             tools=[_CalculatorStub()],
         )
+        agent = _allow_test_tools(agent)
 
         result = agent.run("What is 2+2?")
 
@@ -257,6 +266,7 @@ class TestNativeOpenHandsAgent:
             tools=[_CodeInterpreterStub()],
             bus=bus,
         )
+        agent = _allow_test_tools(agent)
         agent.run("Run code")
         event_types = [e.event_type for e in bus.history]
         assert EventType.TOOL_CALL_START in event_types
@@ -294,6 +304,7 @@ class TestNativeOpenHandsAgent:
             "test-model",
             tools=[_CalculatorStub()],
         )
+        agent = _allow_test_tools(agent)
         result = agent.run("What is 7 times 6?")
         assert result.content == "The answer is 42."
         assert result.turns == 2
@@ -454,6 +465,7 @@ class TestNativeOpenHandsAgent:
             "test-model",
             tools=[_CalculatorStub()],
         )
+        agent = _allow_test_tools(agent)
         result = agent.run("What is 7 times 6?")
         assert result.content == "The answer is 42."
         assert len(result.tool_results) == 1
@@ -481,6 +493,7 @@ class TestNativeOpenHandsAgent:
 
         long_calc.execute = _long_execute
         agent = NativeOpenHandsAgent(engine, "test-model", tools=[long_calc])
+        agent = _allow_test_tools(agent)
         agent.run("Compute")
         # Check the observation message sent to the engine
         second_call = engine.generate.call_args_list[1]
@@ -547,13 +560,18 @@ class TestUrlExpansion:
         assert expanded is False
 
     def test_url_detected_returns_true(self, monkeypatch):
-        import httpx
+        from openjarvis.tools.http_request import HttpRequestTool
 
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body>Page content</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(
+            HttpRequestTool,
+            "execute",
+            lambda self, **kwargs: ToolResult(
+                tool_name="http_request",
+                content="<html><body>Page content</body></html>",
+                success=True,
+                metadata={"content_type": "text/html"},
+            ),
+        )
 
         text, expanded = NativeOpenHandsAgent._expand_urls(
             "Summarize: https://example.com/article"
@@ -563,12 +581,16 @@ class TestUrlExpansion:
         assert "Content from" in text
 
     def test_url_expansion_failure_returns_false(self, monkeypatch):
-        import httpx
+        from openjarvis.tools.http_request import HttpRequestTool
 
         monkeypatch.setattr(
-            httpx,
-            "get",
-            MagicMock(side_effect=Exception("Connection error")),
+            HttpRequestTool,
+            "execute",
+            lambda self, **kwargs: ToolResult(
+                tool_name="http_request",
+                content="Request failed.",
+                success=False,
+            ),
         )
         text, expanded = NativeOpenHandsAgent._expand_urls(
             "Read https://example.com/broken"
@@ -577,13 +599,18 @@ class TestUrlExpansion:
 
     def test_url_expanded_uses_direct_path(self, monkeypatch):
         """When URL is expanded, agent bypasses tool loop."""
-        import httpx
+        from openjarvis.tools.http_request import HttpRequestTool
 
-        mock_resp = MagicMock()
-        mock_resp.text = "<html><body>Article text here</body></html>"
-        mock_resp.headers = {"content-type": "text/html"}
-        mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(
+            HttpRequestTool,
+            "execute",
+            lambda self, **kwargs: ToolResult(
+                tool_name="http_request",
+                content="<html><body>Article text here</body></html>",
+                success=True,
+                metadata={"content_type": "text/html"},
+            ),
+        )
 
         engine = MagicMock()
         engine.engine_id = "mock"

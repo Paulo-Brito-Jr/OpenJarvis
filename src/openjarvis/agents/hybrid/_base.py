@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tempfile
 import threading
 import time
 from abc import abstractmethod
@@ -56,6 +58,7 @@ from openjarvis.agents.hybrid._prices import (
     cost as estimate_cost,
 )
 from openjarvis.engine._stubs import InferenceEngine
+from openjarvis.tools._stubs import ToolExecutor
 
 # Install OpenAI SDK retry + per-org concurrency cap at import time so
 # every paradigm (advisors, conductor, minions, mini_swe_agent's cloud
@@ -94,6 +97,81 @@ ANTHROPIC_WEB_SEARCH_TOOL = {
 }
 
 
+def _require_action_authorized(
+    action_authorizer: Optional[ToolExecutor],
+    resource: str,
+    required_capabilities: Optional[List[str]] = None,
+    *,
+    tool_name: str = "hybrid_action",
+) -> None:
+    """Require the normal tool policy for a provider-side action."""
+    if action_authorizer is None:
+        action_authorizer = _current_action_authorizer()
+    if action_authorizer is None:
+        raise PermissionError("Capability policy unavailable; tool execution denied.")
+    denied = action_authorizer.authorize(
+        resource,
+        required_capabilities,
+        tool_name=tool_name,
+    )
+    if denied is not None:
+        raise PermissionError(denied.content)
+
+
+def _guard_provider_text(
+    action_authorizer: Optional[ToolExecutor],
+    content: Optional[str],
+    destination: str,
+) -> Optional[str]:
+    """Scan provider-bound text through the same mandatory DLP boundary."""
+    if content is None:
+        return None
+    if action_authorizer is None:
+        action_authorizer = _current_action_authorizer()
+    if action_authorizer is None:
+        raise PermissionError(
+            "Capability policy and boundary guard unavailable; outbound content denied."
+        )
+    return action_authorizer.guard_outbound_content(content, destination)
+
+
+def _guard_provider_payload(
+    action_authorizer: Optional[ToolExecutor],
+    payload: Any,
+    destination: str,
+) -> Any:
+    """Recursively scan task metadata before a hybrid adapter can export it."""
+    if isinstance(payload, str):
+        return _guard_provider_text(action_authorizer, payload, destination)
+    if isinstance(payload, dict):
+        return {
+            key: _guard_provider_payload(action_authorizer, value, destination)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [
+            _guard_provider_payload(action_authorizer, value, destination)
+            for value in payload
+        ]
+    if isinstance(payload, tuple):
+        return tuple(
+            _guard_provider_payload(action_authorizer, value, destination)
+            for value in payload
+        )
+    return payload
+
+
+def _contains_web_search_tool(tools: Optional[list]) -> bool:
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type", ""))
+        tool_name = str(tool.get("name", ""))
+        if "web_search" in tool_type or tool_name == "web_search":
+            return True
+    return False
+
+
 def build_web_search_tool(max_uses: int = 8) -> Dict[str, Any]:
     """Build an Anthropic server-side web_search tool block with a custom cap.
 
@@ -112,12 +190,25 @@ def tavily_search_context(
     query: str,
     *,
     max_results: int = 5,
+    action_authorizer: Optional[ToolExecutor] = None,
 ) -> Dict[str, Any]:
     """Run OpenJarvis WebSearchTool and return accounting-friendly metadata."""
     from openjarvis.tools.web_search import WebSearchTool
 
+    _require_action_authorized(
+        action_authorizer,
+        "https://api.tavily.com",
+        ["network:fetch"],
+        tool_name="web_search",
+    )
+    guarded_query = _guard_provider_text(
+        action_authorizer,
+        query,
+        "https://api.tavily.com",
+    )
+    assert guarded_query is not None
     tool = WebSearchTool(max_results=max_results)
-    res = tool.execute(query=query, max_results=max_results)
+    res = tool.execute(query=guarded_query, max_results=max_results)
     meta = dict(res.metadata or {})
     engine = str(meta.get("engine") or "unknown")
     credits = 0
@@ -137,7 +228,7 @@ def tavily_search_context(
         "engine": engine,
         "credits": credits,
         "cost_usd": cost_usd,
-        "n_searches": 1 if (query or "").strip() else 0,
+        "n_searches": 1 if guarded_query.strip() else 0,
         "error": None if res.success else text,
     }
 
@@ -166,6 +257,19 @@ def web_search_cfg(method_cfg: Optional[Dict[str, Any]]) -> Tuple[bool, int]:
 # tasks in the runner's ThreadPoolExecutor don't stomp each other's trace.
 
 _TRACE_STATE = threading.local()
+
+
+def _current_action_authorizer() -> Optional[ToolExecutor]:
+    return getattr(_TRACE_STATE, "action_authorizer", None)
+
+
+def _open_action_authorizer(authorizer: ToolExecutor) -> None:
+    _TRACE_STATE.action_authorizer = authorizer
+
+
+def _close_action_authorizer() -> None:
+    if hasattr(_TRACE_STATE, "action_authorizer"):
+        delattr(_TRACE_STATE, "action_authorizer")
 
 
 def _trace_events() -> Optional[List[Dict[str, Any]]]:
@@ -403,6 +507,7 @@ class LocalCloudAgent(BaseAgent):
     """
 
     accepts_tools: bool = False
+    requires_security_context: bool = True
 
     def __init__(
         self,
@@ -429,6 +534,44 @@ class LocalCloudAgent(BaseAgent):
         self._local_model = local_model
         self._local_endpoint = local_endpoint
         self._cfg: Dict[str, Any] = dict(cfg or {})
+        # Provider-side tools are not BaseTool instances, but they use the
+        # same fail-closed authorization boundary through this executor.
+        self._action_authorizer = ToolExecutor([], bus=bus)
+
+    def bind_security(
+        self,
+        capability_policy: Optional[Any],
+        agent_id: Optional[str] = None,
+        boundary_guard: Optional[Any] = None,
+    ) -> None:
+        """Bind the policy principal for provider-side tool actions."""
+        resolved_agent_id = agent_id if isinstance(agent_id, str) else ""
+        self._action_authorizer.bind_security(
+            capability_policy,
+            resolved_agent_id,
+        )
+        # Rebinding replaces the complete context, including clearing a stale
+        # guard when the caller does not provide one.
+        self._action_authorizer.bind_boundary_guard(boundary_guard)
+
+    def bind_boundary_guard(self, boundary_guard: Optional[Any]) -> None:
+        """Bind outbound scanning for provider SDK calls."""
+        self._action_authorizer.bind_boundary_guard(boundary_guard)
+
+    def _require_action(
+        self,
+        resource: str,
+        required_capabilities: Optional[List[str]] = None,
+        *,
+        tool_name: str = "hybrid_action",
+    ) -> None:
+        """Raise when a provider-side action is not explicitly authorized."""
+        _require_action_authorized(
+            self._action_authorizer,
+            resource,
+            required_capabilities,
+            tool_name=tool_name,
+        )
 
     # ------------------------------------------------------------------
     # SDK call helpers — raw clients, paradigm-shaped quirks applied
@@ -448,6 +591,7 @@ class LocalCloudAgent(BaseAgent):
         timeout: float = 600.0,
         max_retries: int = 12,
         trace_role: str = "cloud",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int, int]:
         """Single Anthropic call. Returns (text, p_tok, c_tok, n_web_searches).
 
@@ -457,6 +601,33 @@ class LocalCloudAgent(BaseAgent):
         sustained Anthropic 529 "Overloaded" windows when many cells share
         Opus quota.
         """
+        _require_action_authorized(
+            action_authorizer,
+            "https://api.anthropic.com",
+            ["network:fetch"],
+            tool_name="anthropic_sdk",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.anthropic.com",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://api.anthropic.com",
+        )
+        if _contains_web_search_tool(tools):
+            _require_action_authorized(
+                action_authorizer,
+                "https://api.anthropic.com/v1/messages:web_search",
+                ["network:fetch"],
+                tool_name="web_search",
+            )
+
         import anthropic
 
         client = anthropic.Anthropic(timeout=timeout, max_retries=max_retries)
@@ -538,9 +709,29 @@ class LocalCloudAgent(BaseAgent):
         tool_choice: Optional[Any] = None,
         timeout: float = 600.0,
         trace_role: str = "cloud",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int]:
         """Single OpenAI call. Returns (text, p_tok, c_tok). Trace-captured;
         also records any tool_calls the model emits."""
+        _require_action_authorized(
+            action_authorizer,
+            "https://api.openai.com",
+            ["network:fetch"],
+            tool_name="openai_sdk",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.openai.com",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://api.openai.com",
+        )
         from openai import OpenAI
 
         client = OpenAI(timeout=timeout)
@@ -607,6 +798,7 @@ class LocalCloudAgent(BaseAgent):
         timeout: float = 600.0,
         trace_role: str = "cloud",
         extra_body: Optional[Dict[str, Any]] = None,
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int]:
         """Single OpenRouter call. Returns (text, p_tok, c_tok).
 
@@ -637,6 +829,25 @@ class LocalCloudAgent(BaseAgent):
         Trace events use ``"kind": "openrouter"`` so the dashboard can
         distinguish them from native OpenAI calls.
         """
+        _require_action_authorized(
+            action_authorizer,
+            "https://openrouter.ai/api/v1",
+            ["network:fetch"],
+            tool_name="openrouter_sdk",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://openrouter.ai/api/v1",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://openrouter.ai/api/v1",
+        )
         from openai import OpenAI
 
         if model.startswith("openrouter/"):
@@ -711,6 +922,7 @@ class LocalCloudAgent(BaseAgent):
         temperature: float = 0.0,
         timeout: float = 600.0,
         trace_role: str = "cloud",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int]:
         """Single Gemini Developer-API call. Returns (text, p_tok, c_tok).
 
@@ -724,6 +936,25 @@ class LocalCloudAgent(BaseAgent):
         Captures the call into the active per-task trace via the
         ``"gemini"`` kind so the dashboard's trace renderer picks it up.
         """
+        _require_action_authorized(
+            action_authorizer,
+            "https://generativelanguage.googleapis.com",
+            ["network:fetch"],
+            tool_name="gemini_sdk",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://generativelanguage.googleapis.com",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://generativelanguage.googleapis.com",
+        )
         from google import genai
         from google.genai import types
 
@@ -789,12 +1020,21 @@ class LocalCloudAgent(BaseAgent):
         tool_choice: Optional[Any] = None,
         timeout: float = 600.0,
         trace_role: str = "local",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int]:
         """Local vLLM (OpenAI-compatible) call. Returns (text, p_tok, c_tok).
         Captures the full response into the trace — including any tool_calls
         the local model emits (vLLM exposes them in
         ``resp.choices[0].message.tool_calls`` when ``--enable-auto-tool-choice``
         is on)."""
+        _require_action_authorized(
+            action_authorizer,
+            endpoint,
+            ["network:fetch"],
+            tool_name="vllm_sdk",
+        )
+        user = _guard_provider_text(action_authorizer, user, endpoint) or ""
+        system = _guard_provider_text(action_authorizer, system, endpoint)
         from openai import OpenAI
 
         client = OpenAI(base_url=endpoint, api_key="EMPTY", timeout=timeout)
@@ -865,6 +1105,7 @@ class LocalCloudAgent(BaseAgent):
         timeout: float = 600.0,
         max_retries: int = 5,
         trace_role: str = "cloud",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int, int, int]:
         """Multi-turn Anthropic loop with optional tools.
 
@@ -880,6 +1121,33 @@ class LocalCloudAgent(BaseAgent):
         (paradigms that want client tools should call ``_call_anthropic``
         directly and handle their own dispatch).
         """
+        _require_action_authorized(
+            action_authorizer,
+            "https://api.anthropic.com",
+            ["network:fetch"],
+            tool_name="anthropic_sdk",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.anthropic.com",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://api.anthropic.com",
+        )
+        if _contains_web_search_tool(tools):
+            _require_action_authorized(
+                action_authorizer,
+                "https://api.anthropic.com/v1/messages:web_search",
+                ["network:fetch"],
+                tool_name="web_search",
+            )
+
         import anthropic
 
         client = anthropic.Anthropic(timeout=timeout, max_retries=max_retries)
@@ -985,6 +1253,7 @@ class LocalCloudAgent(BaseAgent):
         max_turns: int = 8,
         timeout: float = 600.0,
         trace_role: str = "cloud",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int, int, int]:
         """OpenAI hosted-web-search call via the Responses API.
 
@@ -1005,6 +1274,32 @@ class LocalCloudAgent(BaseAgent):
         output. Token usage is summed from ``response.usage``
         (``input_tokens`` / ``output_tokens``).
         """
+        _require_action_authorized(
+            action_authorizer,
+            "https://api.openai.com",
+            ["network:fetch"],
+            tool_name="openai_sdk",
+        )
+        _require_action_authorized(
+            action_authorizer,
+            "https://api.openai.com/v1/responses:web_search",
+            ["network:fetch"],
+            tool_name="web_search",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://api.openai.com",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://api.openai.com",
+        )
+
         from openai import OpenAI
 
         del max_turns  # Responses API resolves search server-side in one call.
@@ -1116,6 +1411,7 @@ class LocalCloudAgent(BaseAgent):
         max_turns: int = 8,
         timeout: float = 600.0,
         trace_role: str = "cloud",
+        action_authorizer: Optional[ToolExecutor] = None,
     ) -> Tuple[str, int, int, int, int]:
         """Gemini call grounded with Google Search.
 
@@ -1133,6 +1429,32 @@ class LocalCloudAgent(BaseAgent):
         0 when no grounding metadata is present (the model answered without
         searching).
         """
+        _require_action_authorized(
+            action_authorizer,
+            "https://generativelanguage.googleapis.com",
+            ["network:fetch"],
+            tool_name="gemini_sdk",
+        )
+        _require_action_authorized(
+            action_authorizer,
+            "https://generativelanguage.googleapis.com:google_search",
+            ["network:fetch"],
+            tool_name="web_search",
+        )
+        user = (
+            _guard_provider_text(
+                action_authorizer,
+                user,
+                "https://generativelanguage.googleapis.com",
+            )
+            or ""
+        )
+        system = _guard_provider_text(
+            action_authorizer,
+            system,
+            "https://generativelanguage.googleapis.com",
+        )
+
         from google import genai
         from google.genai import types
 
@@ -1285,16 +1607,80 @@ class LocalCloudAgent(BaseAgent):
         **kwargs: Any,
     ) -> AgentResult:
         self._emit_turn_start(input)
+        endpoint_resources = {
+            "anthropic": "https://api.anthropic.com",
+            "openai": "https://api.openai.com",
+            "gemini": "https://generativelanguage.googleapis.com",
+        }
+        resource = (
+            self._local_endpoint
+            or endpoint_resources.get(self._cloud_endpoint)
+            or f"hybrid:{self._cloud_endpoint}:{self._cloud_model}"
+        )
+        try:
+            trace_target = self._trace_log_target(context)
+            if trace_target is not None:
+                self._require_action(
+                    str(trace_target),
+                    ["file:write"],
+                    tool_name="hybrid_trace",
+                )
+            self._require_action(
+                resource,
+                ["network:fetch", "code:execute"],
+                tool_name="hybrid_run",
+            )
+            guarded_input = _guard_provider_text(
+                self._action_authorizer,
+                input,
+                resource,
+            )
+            if guarded_input is None:
+                raise PermissionError(
+                    "Boundary guard returned invalid content; outbound content denied."
+                )
+            guarded_context = context
+            if context is not None and "task" in context.metadata:
+                guarded_metadata = dict(context.metadata)
+                guarded_metadata["task"] = _guard_provider_payload(
+                    self._action_authorizer,
+                    guarded_metadata["task"],
+                    resource,
+                )
+                guarded_context = AgentContext(
+                    conversation=context.conversation,
+                    tools=context.tools,
+                    memory_results=context.memory_results,
+                    metadata=guarded_metadata,
+                )
+        except PermissionError as exc:
+            self._emit_turn_end(turns=0, error=True)
+            return AgentResult(
+                content=str(exc),
+                metadata={
+                    "security_denied": True,
+                    "resource": resource,
+                    "n_cloud_calls": 0,
+                    "n_local_calls": 0,
+                },
+                turns=0,
+            )
+
         t0 = time.time()
         events = _open_trace()
         counts = _open_call_counts()
+        _open_action_authorizer(self._action_authorizer)
         meta: Dict[str, Any]
         answer: str = ""
         soft_reason: Optional[str] = None
         exc_obj: Optional[BaseException] = None
         try:
             try:
-                answer, meta = self._run_paradigm(input, context, **kwargs)
+                answer, meta = self._run_paradigm(
+                    guarded_input,
+                    guarded_context,
+                    **kwargs,
+                )
             except Exception as exc:
                 soft = self._is_soft_failure(exc)
                 if soft is None:
@@ -1316,8 +1702,8 @@ class LocalCloudAgent(BaseAgent):
             # Persist the trace before the trace state is closed (and even on
             # hard failure, so we get a record of what we did before it broke).
             self._write_trace_log(
-                context,
-                input,
+                guarded_context,
+                guarded_input,
                 answer,
                 meta if "meta" in locals() else {},
                 events,
@@ -1326,6 +1712,7 @@ class LocalCloudAgent(BaseAgent):
             )
             _close_trace()
             _close_call_counts()
+            _close_action_authorizer()
         meta.setdefault("latency_s", time.time() - t0)
         if soft_reason is not None:
             self._emit_turn_end(soft_error=soft_reason)
@@ -1355,16 +1742,19 @@ class LocalCloudAgent(BaseAgent):
         soft_reason: Optional[str],
         exc: Optional[BaseException],
     ) -> None:
-        log_dir = None
-        task_id = "unknown"
-        if context is not None:
-            log_dir = context.metadata.get("log_dir")
-            task_id = context.metadata.get("task_id") or task_id
-        if not log_dir:
-            return
+        temp_path: Optional[Path] = None
         try:
-            out_dir = Path(log_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
+            target = self._trace_log_target(context)
+            if target is None:
+                return
+            self._require_action(
+                str(target),
+                ["file:write"],
+                tool_name="hybrid_trace",
+            )
+            out_dir = target.parent
+            out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            task_id = target.stem
             blob = {
                 "task_id": task_id,
                 "agent": self.agent_id,
@@ -1380,12 +1770,56 @@ class LocalCloudAgent(BaseAgent):
                 "soft_error": soft_reason,
                 "error": (f"{type(exc).__name__}: {exc}" if exc is not None else None),
             }
-            (out_dir / f"{task_id}.json").write_text(
-                json.dumps(blob, indent=2, default=str)
-            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=out_dir,
+                prefix=".trace-",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                json.dump(blob, handle, indent=2, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp_path.chmod(0o600)
+            os.replace(temp_path, target)
+            temp_path = None
         except Exception:
             # Logging must never break a run.
             pass
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _trace_log_target(context: Optional[AgentContext]) -> Optional[Path]:
+        """Return a canonical safe trace path or deny malformed metadata."""
+        if context is None:
+            return None
+        log_dir = context.metadata.get("log_dir")
+        if not log_dir:
+            return None
+        task_id = context.metadata.get("task_id")
+        if not isinstance(log_dir, (str, os.PathLike)):
+            raise PermissionError("Trace configuration invalid; execution denied.")
+        raw_dir = Path(log_dir).expanduser()
+        if not raw_dir.is_absolute():
+            raise PermissionError("Trace configuration invalid; execution denied.")
+        if (
+            not isinstance(task_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id)
+            or task_id in {".", ".."}
+        ):
+            raise PermissionError("Trace configuration invalid; execution denied.")
+        out_dir = raw_dir.resolve(strict=False)
+        target = (out_dir / f"{task_id}.json").resolve(strict=False)
+        if target.parent != out_dir:
+            raise PermissionError("Trace configuration invalid; execution denied.")
+        return target
 
     @abstractmethod
     def _run_paradigm(

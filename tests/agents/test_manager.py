@@ -242,6 +242,16 @@ class TestMessageQueue:
         messages = manager.list_messages(agent["id"])
         assert messages[0]["status"] == "delivered"
 
+    def test_quarantine_pending_messages_retains_audit_record(self, manager):
+        agent = manager.create_agent(name="test", agent_type="simple")
+        manager.send_message(agent["id"], "legacy one", mode="queued")
+        manager.send_message(agent["id"], "legacy two", mode="queued")
+
+        assert manager.quarantine_pending_messages(agent["id"]) == 2
+        assert manager.get_pending_messages(agent["id"]) == []
+        messages = manager.list_messages(agent["id"])
+        assert all(message["status"] == "quarantined" for message in messages)
+
     def test_add_agent_response(self, manager):
         agent = manager.create_agent(name="test", agent_type="simple")
         manager.send_message(agent["id"], "What did you find?", mode="immediate")

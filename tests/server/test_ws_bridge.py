@@ -7,6 +7,7 @@ import time
 import pytest
 
 from openjarvis.core.events import EventBus, EventType
+from openjarvis.security.capabilities import CapabilityPolicy
 
 try:
     from fastapi import FastAPI
@@ -29,6 +30,13 @@ def app(event_bus):
     from openjarvis.server.ws_bridge import create_ws_router
 
     app = FastAPI()
+    principal = "api:test"
+    policy = CapabilityPolicy()
+    policy.grant(principal, "system:admin", "/v1/agents/events")
+    app.state.api_key = None
+    app.state.api_principal = principal
+    app.state.api_principal_allowlist = frozenset({principal})
+    app.state.capability_policy = policy
     router = create_ws_router(event_bus)
     app.include_router(router)
     return app

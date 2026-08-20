@@ -1015,6 +1015,7 @@ class ServerConfig:
     port: int = 8000
     agent: str = "orchestrator"
     model: str = ""
+    cloud_enabled: bool = True
     workers: int = 1
     cors_origins: list = field(
         default_factory=lambda: [
@@ -1264,7 +1265,8 @@ class ChannelConfig:
 class CapabilitiesConfig:
     """RBAC capability system settings."""
 
-    enabled: bool = False
+    enabled: bool = True
+    default_deny: bool = True
     policy_path: str = ""
 
 
@@ -1442,7 +1444,7 @@ class OperatorsConfig:
 class SpeechConfig:
     """Speech-to-text settings."""
 
-    backend: str = "auto"  # "auto", "faster-whisper", "openai", "deepgram"
+    backend: str = "auto"  # "auto", "disabled", "faster-whisper", "openai", "deepgram"
     model: str = "base"  # Whisper model size: tiny, base, small, medium, large-v3
     language: str = ""  # Empty = auto-detect
     device: str = "auto"  # "auto", "cpu", "cuda"
@@ -2055,6 +2057,7 @@ enabled = true
 host = "0.0.0.0"
 port = 8000
 agent = "orchestrator"
+cloud_enabled = true
 
 [learning]
 enabled = false
@@ -2140,7 +2143,7 @@ default_agent = "simple"
 
 [security]
 enabled = true
-mode = "warn"
+mode = "redact"
 scan_input = true
 scan_output = true
 secret_scanner = true
@@ -2150,6 +2153,11 @@ ssrf_protection = true
 # rate_limit_enabled = false
 # rate_limit_rpm = 60
 # rate_limit_burst = 10
+
+[security.capabilities]
+enabled = true
+default_deny = true
+# policy_path = "~/.openjarvis/capabilities.json"
 
 # [sandbox]
 # enabled = false

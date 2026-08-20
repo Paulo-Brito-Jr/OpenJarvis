@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
+from fastapi import HTTPException
 
 from openjarvis.agents.research_loop import DEFAULT_PLANNER_MODEL
 from openjarvis.core.config import JarvisConfig
@@ -205,11 +207,13 @@ def test_build_planner_engine_honors_explicit_deep_research_engine(
     assert model == "planner-model"
 
 
-def test_research_route_passes_live_engine_and_selected_model(
+def test_research_route_uses_governed_model_and_authenticated_principal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
     active_engine = _DummyEngine()
+    policy = MagicMock()
+    policy.check.return_value = True
 
     def fake_stream(query: str, **kwargs: object):
         captured["query"] = query
@@ -221,13 +225,15 @@ def test_research_route_passes_live_engine_and_selected_model(
         return gen()
 
     request = SimpleNamespace(
+        state=SimpleNamespace(api_principal="api:test"),
         app=SimpleNamespace(
             state=SimpleNamespace(
                 engine=active_engine,
                 engine_name="lmstudio",
                 model="server-model",
+                capability_policy=policy,
             )
-        )
+        ),
     )
 
     monkeypatch.setattr(research_router, "_stream_research", fake_stream)
@@ -248,8 +254,58 @@ def test_research_route_passes_live_engine_and_selected_model(
         "active_engine": active_engine,
         "active_engine_key": "lmstudio",
         "active_model": "server-model",
-        "request_model": "selected-model",
+        "request_model": "",
+        "capability_policy": policy,
+        "agent_id": "api:test",
     }
+    assert policy.check.call_args_list == [
+        call("api:test", "tool:invoke", "research:planner"),
+        call("api:test", "memory:read", "research:corpus:*"),
+    ]
+
+
+def test_research_route_rejects_app_level_principal_fallback() -> None:
+    policy = MagicMock()
+    policy.check.return_value = True
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                api_principal="api:global",
+                capability_policy=policy,
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            research_router.research(
+                research_router.ResearchRequest(query="find notes"),
+                request,  # type: ignore[arg-type]
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    policy.check.assert_not_called()
+
+
+def test_research_route_denies_missing_capabilities() -> None:
+    policy = MagicMock()
+    policy.check.return_value = False
+    request = SimpleNamespace(
+        state=SimpleNamespace(api_principal="api:test"),
+        app=SimpleNamespace(state=SimpleNamespace(capability_policy=policy)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            research_router.research(
+                research_router.ResearchRequest(query="find notes"),
+                request,  # type: ignore[arg-type]
+            )
+        )
+
+    assert exc_info.value.status_code == 403
 
 
 def test_build_planner_engine_rejects_fallback_engine(

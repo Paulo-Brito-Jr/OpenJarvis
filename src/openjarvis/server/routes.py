@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import uuid
 from typing import Any
 
@@ -25,8 +27,100 @@ from openjarvis.server.models import (
     StreamChoice,
     UsageInfo,
 )
+from openjarvis.server.request_agent import RequestAgentScope
 
 router = APIRouter()
+
+_MAX_CHAT_MESSAGES = 128
+_MAX_CHAT_INPUT_BYTES = 262_144
+_MAX_CHAT_MESSAGE_BYTES = 65_536
+_MAX_CHAT_TOOLS = 64
+_MAX_CHAT_TOOL_BYTES = 131_072
+_MAX_CHAT_OUTPUT_TOKENS = 32_768
+
+
+def _server_cloud_enabled(request: Request) -> bool:
+    """Return the configured cloud policy, defaulting on for compatibility."""
+    config = getattr(request.app.state, "config", None)
+    server_config = getattr(config, "server", None)
+    return bool(getattr(server_config, "cloud_enabled", True))
+
+
+def _reject_disabled_cloud_model(request: Request, model: str) -> None:
+    """Fail before any engine or cloud credential path can run."""
+    if _server_cloud_enabled(request):
+        return
+    from openjarvis.server.cloud_router import is_cloud_model
+
+    if is_cloud_model(model):
+        raise HTTPException(
+            status_code=403,
+            detail="Cloud models are disabled by server configuration.",
+        )
+
+
+def _validate_chat_request(request_body: ChatCompletionRequest) -> None:
+    """Reject oversized or nonsensical chat work before model dispatch."""
+    if not request_body.messages:
+        raise HTTPException(status_code=422, detail="At least one message is required")
+    if len(request_body.messages) > _MAX_CHAT_MESSAGES:
+        raise HTTPException(status_code=413, detail="Too many chat messages")
+    total_bytes = 0
+    for message in request_body.messages:
+        content_bytes = len((message.content or "").encode("utf-8"))
+        if content_bytes > _MAX_CHAT_MESSAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Chat message is too large")
+        total_bytes += content_bytes
+        total_bytes += len((message.name or "").encode("utf-8"))
+        total_bytes += len((message.tool_call_id or "").encode("utf-8"))
+    if total_bytes > _MAX_CHAT_INPUT_BYTES:
+        raise HTTPException(status_code=413, detail="Chat input is too large")
+    if (
+        not isinstance(request_body.max_tokens, int)
+        or isinstance(request_body.max_tokens, bool)
+        or not 1 <= request_body.max_tokens <= _MAX_CHAT_OUTPUT_TOKENS
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="max_tokens must be between 1 and 32768",
+        )
+    if (
+        not isinstance(request_body.temperature, (int, float))
+        or isinstance(request_body.temperature, bool)
+        or not math.isfinite(float(request_body.temperature))
+        or not 0 <= float(request_body.temperature) <= 2
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="temperature must be between 0 and 2",
+        )
+    tools = request_body.tools or []
+    if len(tools) > _MAX_CHAT_TOOLS:
+        raise HTTPException(status_code=413, detail="Too many chat tools")
+    if len(json.dumps(tools, separators=(",", ":")).encode("utf-8")) > (
+        _MAX_CHAT_TOOL_BYTES
+    ):
+        raise HTTPException(status_code=413, detail="Chat tools payload is too large")
+
+
+def _request_capability_allowed(
+    request: Request,
+    capability: str,
+    resource: str,
+) -> bool:
+    """Check one capability for the authenticated request principal."""
+    principal = getattr(request.state, "api_principal", "").strip()
+    if not principal:
+        # No request principal means the explicitly embedded/in-process path.
+        return True
+    policy = getattr(request.app.state, "capability_policy", None)
+    if policy is None or not getattr(policy, "enabled", True):
+        return False
+    try:
+        return policy.check(principal, capability, resource) is True
+    except Exception:
+        logging.getLogger("openjarvis.server").exception("Chat capability check failed")
+        return False
 
 
 def _to_messages(chat_messages) -> list[Message]:
@@ -104,9 +198,65 @@ def _ensure_identity_prompt(messages: list[Message], app_config) -> list[Message
 @router.post("/v1/chat/completions")
 async def chat_completions(request_body: ChatCompletionRequest, request: Request):
     """Handle chat completion requests (streaming and non-streaming)."""
+    _validate_chat_request(request_body)
+    model = request_body.model
+    _reject_disabled_cloud_model(request, model)
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
-    model = request_body.model
+    agent_bus = getattr(request.app.state, "bus", None)
+    external_principal = getattr(request.state, "api_principal", "").strip()
+    if external_principal and agent is not None and not request_body.tools:
+        # The app-level agent and bus are shared mutable service objects.
+        # Authenticated callers receive a fresh pair bound to their principal,
+        # preventing both confused-deputy execution and cross-request event
+        # leakage.
+        request_agent_factory = getattr(
+            request.app.state,
+            "request_agent_factory",
+            None,
+        )
+        if not callable(request_agent_factory):
+            raise HTTPException(
+                status_code=503,
+                detail="Request-scoped agent execution is unavailable.",
+            )
+        try:
+            scope = request_agent_factory(external_principal)
+        except Exception:
+            logging.getLogger("openjarvis.server").exception(
+                "Request-scoped agent construction failed"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Request-scoped agent execution is unavailable.",
+            ) from None
+        if (
+            not isinstance(scope, RequestAgentScope)
+            or scope.agent is None
+            or scope.agent is agent
+            or scope.bus is None
+            or scope.bus is agent_bus
+        ):
+            logging.getLogger("openjarvis.server").error(
+                "Request-scoped agent factory returned a shared or invalid scope"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Request-scoped agent execution is unavailable.",
+            )
+        agent = scope.agent
+        agent_bus = scope.bus
+
+    memory_read_allowed = _request_capability_allowed(
+        request,
+        "memory:read",
+        "memory:context",
+    )
+    memory_write_allowed = _request_capability_allowed(
+        request,
+        "memory:write",
+        "memory:exchange",
+    )
 
     # Inject memory context into messages before dispatching
     config = getattr(request.app.state, "config", None)
@@ -115,6 +265,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         config is not None
         and memory_backend is not None
         and config.agent.context_from_memory
+        and memory_read_allowed
         and request_body.messages
     ):
         try:
@@ -188,7 +339,10 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             # Bump max_tokens when complexity suggests more than what
             # the client requested — never reduce below the request value.
             if suggested > request_body.max_tokens:
-                request_body.max_tokens = suggested
+                request_body.max_tokens = min(
+                    suggested,
+                    _MAX_CHAT_OUTPUT_TOKENS,
+                )
         except Exception:
             logging.getLogger("openjarvis.server").debug(
                 "Complexity analysis failed",
@@ -212,8 +366,25 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 request_body,
                 complexity_info,
                 app_config=config,
-                bus=getattr(request.app.state, "bus", None),
-                memory_service=getattr(request.app.state, "memory_service", None),
+                bus=(
+                    getattr(request.app.state, "bus", None)
+                    if memory_write_allowed
+                    else None
+                ),
+                memory_service=(
+                    getattr(request.app.state, "memory_service", None)
+                    if memory_write_allowed
+                    else None
+                ),
+            )
+        if external_principal and agent is not None:
+            from openjarvis.server.stream_bridge import create_agent_stream
+
+            return await create_agent_stream(
+                agent,
+                agent_bus,
+                model,
+                request_body,
             )
         return await _handle_stream(
             engine,
@@ -222,8 +393,16 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             complexity_info,
             trace_store=getattr(request.app.state, "trace_store", None),
             app_config=config,
-            bus=getattr(request.app.state, "bus", None),
-            memory_service=getattr(request.app.state, "memory_service", None),
+            bus=(
+                getattr(request.app.state, "bus", None)
+                if memory_write_allowed
+                else None
+            ),
+            memory_service=(
+                getattr(request.app.state, "memory_service", None)
+                if memory_write_allowed
+                else None
+            ),
         )
 
     # Non-streaming: use agent if available, otherwise direct engine call.
@@ -254,7 +433,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             request_body,
             complexity_info,
             trace_store=getattr(request.app.state, "trace_store", None),
-            bus=getattr(request.app.state, "bus", None),
+            bus=agent_bus,
         )
     else:
         bus = getattr(request.app.state, "bus", None)
@@ -269,13 +448,14 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         )
 
     # Hand the completed exchange to the background memory service.
-    _remember_exchange(
-        getattr(request.app.state, "memory_service", None),
-        query_text_for_complexity,
-        response,
-        bus=getattr(request.app.state, "bus", None),
-        source="server.chat",
-    )
+    if memory_write_allowed:
+        _remember_exchange(
+            getattr(request.app.state, "memory_service", None),
+            query_text_for_complexity,
+            response,
+            bus=getattr(request.app.state, "bus", None),
+            source="server.chat",
+        )
     return response
 
 
@@ -938,6 +1118,12 @@ async def reload_cloud_engine(request: Request):
     Called by the desktop app immediately after the user saves a cloud API
     key so that cloud models become available without a full app restart.
     """
+    if not _server_cloud_enabled(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Cloud models are disabled by server configuration.",
+        )
+
     import os
 
     submitted_keys: dict[str, str] | None = None

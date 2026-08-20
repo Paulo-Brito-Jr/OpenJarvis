@@ -29,6 +29,7 @@ def _register_sendblue():
 @pytest.fixture
 def mock_bridge():
     bridge = MagicMock()
+    bridge.is_sender_allowed.return_value = True
     bridge.handle_incoming.return_value = "Here are your results..."
     return bridge
 
@@ -167,8 +168,8 @@ class TestSendBlueWebhook:
         )
         assert resp.status_code == 200
 
-    def test_no_bridge_returns_200(self, sendblue_channel):
-        """When no bridge exists, webhook should not crash."""
+    def test_no_bridge_denies_processing(self, sendblue_channel):
+        """Without a bridge there is no sender allowlist, so deny."""
         from openjarvis.server.webhook_routes import create_webhook_router
 
         app = FastAPI()
@@ -184,7 +185,7 @@ class TestSendBlueWebhook:
                 "is_outbound": False,
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 503
 
     def test_no_secret_configured_is_rejected(self, mock_bridge):
         """Fail closed: a channel without a webhook_secret rejects all posts."""

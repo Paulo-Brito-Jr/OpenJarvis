@@ -363,10 +363,12 @@ class TestRichTraceCollector:
         gen_steps = [s for s in trace.steps if s.step_type == StepType.GENERATE]
         assert len(gen_steps) == 2
         assert gen_steps[0].output["content"] == "I'll calculate that for you."
-        expected_tc = [
-            {"id": "call_1", "name": "calculator", "arguments": '{"expr": "2+2"}'},
-        ]
-        assert gen_steps[0].output["tool_calls"] == expected_tc
+        tool_call = gen_steps[0].output["tool_calls"][0]
+        assert tool_call["id"] == "call_1"
+        assert tool_call["name"] == "calculator"
+        assert tool_call["arguments"]["retained"] is False
+        assert "sha256" in tool_call["arguments"]
+        assert "2+2" not in str(tool_call["arguments"])
         assert gen_steps[0].output["finish_reason"] == "tool_calls"
         assert gen_steps[1].output["content"] == "The answer is 4."
         assert gen_steps[1].output["finish_reason"] == "stop"
@@ -384,8 +386,10 @@ class TestRichTraceCollector:
         tool_steps = [s for s in trace.steps if s.step_type == StepType.TOOL_CALL]
         assert len(tool_steps) == 1
         assert tool_steps[0].input["tool"] == "calculator"
-        assert tool_steps[0].input["arguments"] == {"expr": "2+2"}
-        assert tool_steps[0].output["result"] == "4"
+        assert tool_steps[0].input["arguments"]["retained"] is False
+        assert tool_steps[0].input["arguments"]["keys"] == ["expr"]
+        assert tool_steps[0].output["result"]["retained"] is False
+        assert "2+2" not in str(tool_steps[0].input["arguments"])
         assert tool_steps[0].output["success"] is True
         store.close()
 
@@ -400,6 +404,8 @@ class TestRichTraceCollector:
         trace = store.list_traces()[0]
         assert len(trace.messages) == 4
         assert trace.messages[0]["role"] == "user"
+        assert trace.messages[2]["role"] == "tool"
+        assert trace.messages[2]["content"]["retained"] is False
         assert trace.messages[3]["role"] == "assistant"
         store.close()
 

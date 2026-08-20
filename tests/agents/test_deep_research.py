@@ -11,6 +11,7 @@ from openjarvis.agents._stubs import AgentResult
 from openjarvis.agents.deep_research import DeepResearchAgent
 from openjarvis.connectors.store import KnowledgeStore
 from openjarvis.core.registry import AgentRegistry
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools.knowledge_search import KnowledgeSearchTool
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,13 @@ def _make_engine_response(content, tool_calls=None):
     return result
 
 
+def _allow_test_tools(agent):
+    policy = CapabilityPolicy()
+    policy.grant("deep-research-test-agent", "*")
+    agent.bind_security(policy, "deep-research-test-agent")
+    return agent
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -89,7 +97,9 @@ def test_agent_produces_result(mock_engine, store):
         "Based on my research, the Kubernetes migration was approved."
     )
     ks_tool = KnowledgeSearchTool(store=store)
-    agent = DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    agent = _allow_test_tools(
+        DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    )
     result = agent.run("What happened with the Kubernetes migration?")
     assert isinstance(result, AgentResult)
     assert "migration" in result.content.lower() or "Kubernetes" in result.content
@@ -118,7 +128,9 @@ def test_agent_uses_knowledge_search(mock_engine, store):
     mock_engine.generate.side_effect = [tool_call_response, final_response]
 
     ks_tool = KnowledgeSearchTool(store=store)
-    agent = DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    agent = _allow_test_tools(
+        DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    )
     result = agent.run("Tell me about the Kubernetes migration")
 
     assert result.turns == 2
@@ -146,7 +158,14 @@ def test_agent_respects_max_turns(mock_engine, store):
     mock_engine.generate.return_value = always_search
 
     ks_tool = KnowledgeSearchTool(store=store)
-    agent = DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool], max_turns=3)
+    agent = _allow_test_tools(
+        DeepResearchAgent(
+            mock_engine,
+            "test-model",
+            tools=[ks_tool],
+            max_turns=3,
+        )
+    )
     result = agent.run("Keep searching forever")
 
     assert result.turns == 3
@@ -159,7 +178,9 @@ def test_agent_system_prompt_mentions_research(mock_engine, store):
     mock_engine.generate.return_value = _make_engine_response("Done.")
 
     ks_tool = KnowledgeSearchTool(store=store)
-    agent = DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    agent = _allow_test_tools(
+        DeepResearchAgent(mock_engine, "test-model", tools=[ks_tool])
+    )
     agent.run("test")
 
     call_args = mock_engine.generate.call_args

@@ -1,0 +1,118 @@
+# OpenJarvis L99 — perfil shadow read-only para o MacBook Air.
+# Não contém credenciais. O launcher injeta somente quatro segredos vindos
+# de contas exatas no Keychain e mantém o serviço desligado por padrão.
+# A identidade é isolada por request e desconexões sinalizam cancelamento
+# cooperativo nos boundaries do agente e das tools. Mesmo assim, este perfil
+# permanece estritamente read-only/default-deny até os gates humanos de canário.
+
+[engine]
+default = "ollama"
+
+[engine.ollama]
+host = "http://127.0.0.1:11434"
+
+[agent]
+default_agent = "orchestrator"
+tools = "skynet_casa_read,skynet_agenda_read,skynet_frota_read"
+context_from_memory = false
+
+[server]
+host = "127.0.0.1"
+port = 8000
+agent = "orchestrator"
+workers = 1
+cors_origins = [
+  "tauri://localhost",
+  "http://tauri.localhost",
+  "https://tauri.localhost",
+]
+cloud_enabled = false
+
+[tools]
+enabled = "skynet_casa_read,skynet_agenda_read,skynet_frota_read"
+
+[tools.storage]
+enabled = false
+
+[tools.mcp]
+enabled = false
+servers = ""
+
+[learning]
+enabled = false
+
+[telemetry]
+enabled = false
+
+[analytics]
+enabled = false
+
+[traces]
+enabled = false
+
+[channel]
+enabled = false
+
+[security]
+enabled = true
+scan_input = true
+scan_output = true
+mode = "block"
+secret_scanner = true
+pii_scanner = true
+enforce_tool_confirmation = true
+merkle_audit = true
+ssrf_protection = true
+rate_limit_enabled = true
+rate_limit_rpm = 30
+rate_limit_burst = 5
+local_engine_bypass = false
+local_tool_bypass = false
+profile = "personal"
+
+[security.capabilities]
+enabled = true
+default_deny = true
+policy_path = "~/.openjarvis/skynet-l99/shadow/config/skynet-l99-shadow-capabilities.json"
+
+[sandbox]
+enabled = false
+
+[scheduler]
+enabled = false
+
+[workflow]
+enabled = false
+
+[sessions]
+enabled = false
+
+[a2a]
+enabled = false
+
+[operators]
+enabled = false
+
+[speech]
+backend = "disabled"
+
+[agent_manager]
+enabled = false
+
+[skills]
+enabled = false
+active = ""
+auto_discover = false
+auto_sync = false
+
+[digest]
+enabled = false
+
+[proactive]
+enabled = false
+
+[memory]
+enabled = false
+
+[compression]
+enabled = false

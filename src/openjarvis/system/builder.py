@@ -156,6 +156,7 @@ class SystemBuilder:
 
         sec = setup_security(config, engine, bus)
         engine = sec.engine
+        agent_name = self._agent_name or config.agent.default_agent
 
         if telemetry_enabled:
             from openjarvis.telemetry.instrumented_engine import (
@@ -181,8 +182,20 @@ class SystemBuilder:
             model,
             memory_backend,
             channel_backend,
+            capability_policy=sec.capability_policy,
+            agent_id=agent_name,
         )
-        tool_executor = ToolExecutor(tool_list, bus) if tool_list else None
+        tool_executor = (
+            ToolExecutor(
+                tool_list,
+                bus,
+                capability_policy=sec.capability_policy,
+                agent_id=agent_name,
+                boundary_guard=sec.boundary_guard,
+            )
+            if tool_list
+            else None
+        )
 
         skill_manager = None
         skill_few_shot_examples: List[str] = []
@@ -207,14 +220,33 @@ class SystemBuilder:
                 )
                 tool_list.extend(skill_tools)
                 if tool_list:
-                    tool_executor = ToolExecutor(tool_list, bus)
+                    tool_executor = ToolExecutor(
+                        tool_list,
+                        bus,
+                        capability_policy=sec.capability_policy,
+                        agent_id=agent_name,
+                        boundary_guard=sec.boundary_guard,
+                    )
                 skill_few_shot_examples = skill_manager.get_few_shot_examples()
             except Exception as exc:
                 logger.warning("Failed to initialize skills: %s", exc)
 
-        agent_name = self._agent_name or config.agent.default_agent
         container_runner = self._setup_sandbox(config)
-        scheduler_store, task_scheduler = self._setup_scheduler(config, bus)
+        scheduler_store, task_scheduler = self._setup_scheduler(
+            config,
+            bus,
+            capability_policy=sec.capability_policy,
+            operator_id=agent_name,
+        )
+        if task_scheduler is not None:
+            for tool in tool_list:
+                bind_scheduler = getattr(
+                    tool,
+                    "bind_scheduler_context",
+                    None,
+                )
+                if callable(bind_scheduler):
+                    bind_scheduler(task_scheduler, agent_name)
         workflow_engine = self._setup_workflow(config, bus)
         session_store = self._setup_sessions(config)
 
@@ -304,6 +336,7 @@ class SystemBuilder:
             session_store=session_store,
             capability_policy=capability_policy,
             audit_logger=sec.audit_logger,
+            boundary_guard=sec.boundary_guard,
             agent_manager=agent_manager,
             agent_scheduler=agent_scheduler,
             agent_executor=agent_executor,
@@ -313,6 +346,8 @@ class SystemBuilder:
         system._learning_orchestrator = learning_orchestrator
         system._skill_few_shot_examples = skill_few_shot_examples
         system._mcp_clients = list(getattr(self, "_mcp_clients", []))
+        if task_scheduler is not None:
+            task_scheduler.bind_system(system)
         if system.agent_executor is not None:
             system.agent_executor.set_system(system)
         return system
@@ -412,12 +447,23 @@ class SystemBuilder:
             return None
 
     def _resolve_tools(
-        self, config, engine, model, memory_backend, channel_backend=None
+        self,
+        config,
+        engine,
+        model,
+        memory_backend,
+        channel_backend=None,
+        *,
+        capability_policy=None,
+        agent_id: str = "",
     ):
         """Resolve tool instances via MCPServer (primary) + external MCP servers."""
         from openjarvis.mcp.server import MCPServer
 
-        internal_server = MCPServer()
+        internal_server = MCPServer(
+            capability_policy=capability_policy,
+            agent_id=agent_id,
+        )
         for tool in internal_server.get_tools():
             self._inject_tool_deps(tool, engine, model, memory_backend, channel_backend)
 
@@ -436,7 +482,16 @@ class SystemBuilder:
 
         if tool_names:
             all_tools = {t.spec.name: t for t in internal_server.get_tools()}
-            tools = [all_tools[n] for n in tool_names if n in all_tools]
+            tools = [
+                all_tools[n]
+                for n in tool_names
+                if n in all_tools
+                and not getattr(
+                    all_tools[n],
+                    "execution_disabled_reason",
+                    "",
+                )
+            ]
         else:
             tools = []
 
@@ -445,24 +500,47 @@ class SystemBuilder:
                 import json
 
                 server_list = json.loads(config.tools.mcp.servers)
-                if isinstance(server_list, list):
-                    for server_cfg in server_list:
-                        try:
-                            external_tools = self._discover_external_mcp(server_cfg)
-                            if tool_names:
-                                external_tools = [
-                                    t
-                                    for t in external_tools
-                                    if t.spec.name in tool_names
-                                ]
-                            tools.extend(external_tools)
-                        except Exception as exc:
-                            logger.warning(
-                                "Failed to discover external MCP tools: %s",
-                                exc,
+                if not isinstance(server_list, list):
+                    raise RuntimeError("MCP servers config must be a JSON array")
+                seen_servers: set[str] = set()
+                seen_tools = {tool.spec.name for tool in tools}
+                for server_cfg in server_list:
+                    cfg = (
+                        json.loads(server_cfg)
+                        if isinstance(server_cfg, str)
+                        else server_cfg
+                    )
+                    if not isinstance(cfg, dict):
+                        raise RuntimeError("Each MCP server config must be an object")
+                    namespace = cfg.get("name", "")
+                    from openjarvis.tools.mcp_adapter import (
+                        validate_mcp_namespace,
+                    )
+
+                    namespace = validate_mcp_namespace(namespace)
+                    if namespace in seen_servers:
+                        raise RuntimeError(f"Duplicate MCP namespace: {namespace}")
+                    seen_servers.add(namespace)
+                    external_tools = self._discover_external_mcp(cfg)
+                    if tool_names:
+                        external_tools = [
+                            tool
+                            for tool in external_tools
+                            if (
+                                tool.spec.name in tool_names
+                                or tool.spec.metadata.get("mcp", {}).get("remote_name")
+                                in tool_names
                             )
+                        ]
+                    for tool in external_tools:
+                        if tool.spec.name in seen_tools:
+                            raise RuntimeError(
+                                f"Duplicate tool name rejected: {tool.spec.name}"
+                            )
+                        seen_tools.add(tool.spec.name)
+                        tools.append(tool)
             except (json.JSONDecodeError, TypeError) as exc:
-                logger.warning("Failed to parse MCP server config: %s", exc)
+                raise RuntimeError("Failed to parse MCP server config") from exc
 
         return tools
 
@@ -512,7 +590,14 @@ class SystemBuilder:
             logger.warning("Failed to set up container sandbox: %s", exc)
             return None
 
-    def _setup_scheduler(self, config, bus):
+    def _setup_scheduler(
+        self,
+        config,
+        bus,
+        *,
+        capability_policy,
+        operator_id: str,
+    ):
         scheduler_enabled = (
             self._scheduler if self._scheduler is not None else config.scheduler.enabled
         )
@@ -537,11 +622,13 @@ class SystemBuilder:
                 store,
                 poll_interval=config.scheduler.poll_interval,
                 bus=bus,
+                capability_policy=capability_policy,
+                default_operator_id=operator_id,
+                default_capabilities=["schedule:create"],
             )
             return store, sched
         except Exception as exc:
-            logger.warning("Failed to set up task scheduler: %s", exc)
-            return None, None
+            raise RuntimeError("Failed to set up task scheduler securely") from exc
 
     def _setup_workflow(self, config, bus):
         workflow_enabled = (
@@ -625,39 +712,69 @@ class SystemBuilder:
         from openjarvis.tools.mcp_adapter import MCPToolProvider
 
         cfg = json.loads(server_cfg) if isinstance(server_cfg, str) else server_cfg
-        name = cfg.get("name", "<unnamed>")
+        if not isinstance(cfg, dict):
+            raise ValueError("MCP server config must be an object")
+        from openjarvis.tools.mcp_adapter import validate_mcp_namespace
+
+        name = validate_mcp_namespace(cfg.get("name", ""))
         url = cfg.get("url")
         # Bearer token from config — needed by authenticated MCP servers
         # like Home Assistant. None / empty string skips the header. #461.
         token = cfg.get("token")
         command = cfg.get("command", "")
         args = cfg.get("args", [])
+        if bool(url) == bool(command):
+            raise ValueError(
+                f"MCP server '{name}' must configure exactly one transport"
+            )
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError(f"MCP server '{name}' args must be a string array")
 
         if url:
             transport = StreamableHTTPTransport(url=url, token=token)
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError(f"MCP server '{name}' URL is invalid")
+            provenance = f"{parsed.scheme}://{parsed.hostname}"
         elif command:
             transport = StdioTransport(command=[command] + args)
+            from pathlib import Path
+
+            provenance = f"stdio:{Path(command).name}"
         else:
-            logger.warning(
-                "MCP server '%s' has neither 'url' nor 'command' — skipping",
-                name,
-            )
-            return []
+            raise AssertionError("transport validation should be exhaustive")
 
         client = MCPClient(transport)
-        client.initialize()
+        try:
+            client.initialize()
+            provider = MCPToolProvider(
+                client,
+                namespace=name,
+                provenance=provenance,
+            )
+            discovered = provider.discover()
+        except Exception:
+            client.close()
+            raise
 
         self._mcp_clients.append(client)
-
-        provider = MCPToolProvider(client)
-        discovered = provider.discover()
 
         include_tools = set(cfg.get("include_tools", []))
         exclude_tools = set(cfg.get("exclude_tools", []))
         if include_tools:
-            discovered = [t for t in discovered if t.spec.name in include_tools]
+            discovered = [
+                tool
+                for tool in discovered
+                if tool.spec.metadata["mcp"]["remote_name"] in include_tools
+            ]
         if exclude_tools:
-            discovered = [t for t in discovered if t.spec.name not in exclude_tools]
+            discovered = [
+                tool
+                for tool in discovered
+                if tool.spec.metadata["mcp"]["remote_name"] not in exclude_tools
+            ]
 
         logger.info(
             "Discovered %d tools from MCP server '%s'",

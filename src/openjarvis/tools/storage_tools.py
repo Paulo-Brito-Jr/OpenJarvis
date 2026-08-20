@@ -294,6 +294,7 @@ class MemoryIndexTool(BaseTool):
                 tool_name="memory_index",
                 content=f"Indexed {stored} chunks from {path}",
                 success=True,
+                metadata={"chunks_indexed": stored},
             )
         except Exception as exc:
             return ToolResult(

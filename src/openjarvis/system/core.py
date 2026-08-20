@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import logging
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -47,6 +50,33 @@ if TYPE_CHECKING:
     from openjarvis.workflow.engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
+
+
+def channel_operator_id(channel: str, sender: str) -> str:
+    """Return a stable principal without exposing the channel sender ID."""
+    digest = hashlib.sha256(
+        f"openjarvis-channel-v1\0{channel}\0{sender}".encode("utf-8")
+    ).hexdigest()
+    return f"channel:{channel}:{digest}"
+
+
+def _explicit_channel_grant(
+    policy: Any,
+    principal: str,
+    resource: str,
+) -> bool:
+    if policy is None:
+        return False
+    try:
+        grants = policy.list_grants(principal)
+        has_grant = any(
+            fnmatch.fnmatchcase("tool:invoke", grant.capability)
+            and (grant.pattern == "*" or fnmatch.fnmatchcase(resource, grant.pattern))
+            for grant in grants
+        )
+        return has_grant and bool(policy.check(principal, "tool:invoke", resource))
+    except Exception:
+        return False
 
 
 @dataclass
@@ -142,6 +172,7 @@ class JarvisSystem:
         system_prompt: Optional[str] = None,
         operator_id: Optional[str] = None,
         prior_messages: Optional[List[Message]] = None,
+        capability_scope: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         return self._get_orchestrator().ask(
             query,
@@ -153,6 +184,7 @@ class JarvisSystem:
             system_prompt=system_prompt,
             operator_id=operator_id,
             prior_messages=prior_messages,
+            capability_scope=capability_scope,
         )
 
     def _detect_agent_intent(self, query: str) -> Optional[str]:
@@ -173,6 +205,7 @@ class JarvisSystem:
         system_prompt=None,
         operator_id=None,
         prior_messages=None,
+        capability_policy=None,
     ) -> Dict[str, Any]:
         return self._get_orchestrator()._run_agent(
             query,
@@ -184,9 +217,15 @@ class JarvisSystem:
             system_prompt=system_prompt,
             operator_id=operator_id,
             prior_messages=prior_messages,
+            capability_policy=capability_policy,
         )
 
-    def wire_channel(self, channel_bridge: Any) -> None:
+    def wire_channel(
+        self,
+        channel_bridge: Any,
+        *,
+        sender_allowlist: Mapping[str, Iterable[str]] | None = None,
+    ) -> None:
         """Register a message handler on *channel_bridge* that routes every
         incoming message through this system (agent or engine) and replies.
 
@@ -202,6 +241,29 @@ class JarvisSystem:
         from openjarvis.core.types import Message
         from openjarvis.sessions.session import SessionStore
 
+        normalized_allowlist: dict[str, frozenset[str]] = {}
+        for channel, senders in (sender_allowlist or {}).items():
+            if (
+                not isinstance(channel, str)
+                or not channel.strip()
+                or isinstance(senders, (str, bytes))
+                or not isinstance(senders, Iterable)
+            ):
+                continue
+            normalized = frozenset(
+                sender.strip()
+                for sender in senders
+                if isinstance(sender, str) and sender.strip()
+            )
+            if normalized:
+                normalized_allowlist[channel.strip()] = normalized
+        if not normalized_allowlist:
+            raise RuntimeError(
+                "Generic channel wiring requires an explicit sender allowlist"
+            )
+        if self.capability_policy is None:
+            raise RuntimeError("Generic channel wiring requires a capability policy")
+
         if self.session_store is None:
             from pathlib import Path
 
@@ -214,6 +276,24 @@ class JarvisSystem:
         _system = self  # capture for closure
 
         def _on_channel_message(cm) -> None:
+            channel = getattr(cm, "channel", "")
+            sender = getattr(cm, "sender", "")
+            if (
+                not isinstance(channel, str)
+                or not isinstance(sender, str)
+                or sender not in normalized_allowlist.get(channel, ())
+            ):
+                logger.warning("Channel message denied by sender policy")
+                return
+            principal = channel_operator_id(channel, sender)
+            if not _explicit_channel_grant(
+                _system.capability_policy,
+                principal,
+                "agent:system",
+            ):
+                logger.warning("Channel message denied by capability policy")
+                return
+
             session_key = f"{cm.channel}:{cm.conversation_id}"
             session = _system.session_store.get_or_create(
                 session_key,
@@ -236,6 +316,7 @@ class JarvisSystem:
                         cm.content,
                         context=False,
                         agent=_system.agent_name,
+                        operator_id=principal,
                         prior_messages=prior_msgs,
                     )
                     reply = result.get("content", "")
@@ -243,6 +324,7 @@ class JarvisSystem:
                     result = _system.ask(
                         cm.content,
                         context=False,
+                        operator_id=principal,
                         prior_messages=prior_msgs,
                     )
                     reply = result.get("content", "")

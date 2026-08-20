@@ -110,14 +110,19 @@ def test_cron_scheduled_agent(scenario_harness: ScenarioHarness) -> None:
     )
     aid = agent["id"]
 
-    h.scheduler.register_agent(aid)
+    try:
+        import croniter  # noqa: F401
+    except ImportError:
+        with pytest.raises(RuntimeError, match="requires.*croniter"):
+            h.scheduler.register_agent(aid)
+    else:
+        h.scheduler.register_agent(aid)
+        info = h.scheduler._agents[aid]
+        assert info["schedule_type"] == "cron"
+        # next_fire should be in the future
+        import time
 
-    info = h.scheduler._agents[aid]
-    assert info["schedule_type"] == "cron"
-    # next_fire should be in the future
-    import time
-
-    assert info["next_fire"] > time.time()
+        assert info["next_fire"] > time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +130,10 @@ def test_cron_scheduled_agent(scenario_harness: ScenarioHarness) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_queued_message_delivery(scenario_harness: ScenarioHarness) -> None:
-    """Queue 3 messages, run tick, verify all delivered and in prompt."""
+def test_queued_message_without_provenance_is_quarantined(
+    scenario_harness: ScenarioHarness,
+) -> None:
+    """Legacy queued messages must not inherit the managed agent identity."""
     h = scenario_harness
     h.engine._responses = [{"content": "Processed all messages."}]
     h.engine._call_count = 0
@@ -147,18 +154,21 @@ def test_queued_message_delivery(scenario_harness: ScenarioHarness) -> None:
 
     h.executor.execute_tick(aid)
 
-    # All should be delivered
+    # They leave the executable queue but remain visible for audit.
     pending = h.manager.get_pending_messages(aid)
     assert len(pending) == 0
+    messages = h.manager.list_messages(aid)
+    assert len(messages) == 4  # three quarantined inputs plus agent response
+    assert sum(m["status"] == "quarantined" for m in messages) == 3
 
-    # Engine should have been called with messages in the prompt
+    # Unauthenticated content never reaches the model prompt.
     assert h.engine.last_messages is not None
     prompt_text = " ".join(
         str(getattr(m, "content", m)) for m in h.engine.last_messages
     )
-    assert "Message one" in prompt_text
-    assert "Message two" in prompt_text
-    assert "Message three" in prompt_text
+    assert "Message one" not in prompt_text
+    assert "Message two" not in prompt_text
+    assert "Message three" not in prompt_text
 
     # Response stored
     agent = h.manager.get_agent(aid)
@@ -232,8 +242,10 @@ def test_budget_enforcement(scenario_harness: ScenarioHarness) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_error_retry_success(scenario_harness: ScenarioHarness) -> None:
-    """FakeEngine raises RetryableError first 2 times, succeeds on 3rd."""
+def test_retryable_error_is_not_replayed(
+    scenario_harness: ScenarioHarness,
+) -> None:
+    """An ambiguous tick failure must not replay external side effects."""
     h = scenario_harness
     h.engine._responses = [
         {"raise": RetryableError("transient-1")},
@@ -248,15 +260,14 @@ def test_error_retry_success(scenario_harness: ScenarioHarness) -> None:
     )
     aid = agent["id"]
 
-    # Patch retry_delay to avoid real sleeps
-    with patch("openjarvis.agents.executor.time.sleep"):
-        h.executor.execute_tick(aid)
+    h.executor.execute_tick(aid)
 
-    assert h.engine.call_count == 3
+    assert h.engine.call_count == 1
     agent = h.manager.get_agent(aid)
     assert agent is not None
-    assert agent["status"] == "idle"
-    assert "Success after retries." in agent["summary_memory"]
+    assert agent["status"] == "error"
+    assert agent["total_runs"] == 0
+    assert "transient-1" in agent["summary_memory"]
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +511,9 @@ def test_template_instantiation(scenario_harness: ScenarioHarness) -> None:
 def test_memory_persistence_across_ticks(scenario_harness: ScenarioHarness) -> None:
     """Tick 1 summary becomes part of tick 2 engine prompt (Previous context)."""
     h = scenario_harness
+    from openjarvis.security.capabilities import CapabilityPolicy
+
+    policy = CapabilityPolicy()
     h.engine._responses = [{"content": "Findings from tick one."}]
     h.engine._call_count = 0
 
@@ -511,6 +525,9 @@ def test_memory_persistence_across_ticks(scenario_harness: ScenarioHarness) -> N
         },
     )
     aid = agent["id"]
+    policy.grant(aid, "memory:read", f"agent:{aid}:memory")
+    policy.grant(aid, "memory:write", f"agent:{aid}:memory")
+    h.system.capability_policy = policy
 
     # --- Tick 1 ---
     h.executor.execute_tick(aid)

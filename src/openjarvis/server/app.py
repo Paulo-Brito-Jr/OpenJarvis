@@ -24,93 +24,17 @@ logger = logging.getLogger(__name__)
 
 
 def _restore_sendblue_bindings(app: FastAPI) -> None:
-    """Restore SendBlue channel bindings from the database on startup.
+    """Keep legacy managed-channel bindings quarantined at startup.
 
-    If a SendBlue binding was created via the Messaging tab and the server
-    restarts, this ensures the ChannelBridge + DeepResearchAgent are wired
-    up so incoming webhooks continue to work.
+    Old rows may contain plaintext credentials and lack an immutable operator
+    identity.  Do not even enumerate them here: merely reading and reconnecting
+    those rows would silently re-enable the confused-deputy path on restart.
     """
-    try:
-        mgr = getattr(app.state, "agent_manager", None)
-        if mgr is None:
-            return
+    from openjarvis.server.managed_channel_security import (
+        quarantine_legacy_sendblue_bindings,
+    )
 
-        # Check all agents for sendblue bindings
-        for agent in mgr.list_agents():
-            agent_id = agent.get("id", agent.get("agent_id", ""))
-            bindings = mgr.list_channel_bindings(agent_id)
-            for b in bindings:
-                if b.get("channel_type") != "sendblue":
-                    continue
-                config = b.get("config", {})
-                api_key_id = config.get("api_key_id", "")
-                api_secret_key = config.get("api_secret_key", "")
-                from_number = config.get("from_number", "")
-                if not api_key_id or not api_secret_key:
-                    continue
-
-                from openjarvis.channels.sendblue import SendBlueChannel
-
-                sb = SendBlueChannel(
-                    api_key_id=api_key_id,
-                    api_secret_key=api_secret_key,
-                    from_number=from_number,
-                )
-                sb.connect()
-                app.state.sendblue_channel = sb
-
-                # Create ChannelBridge if none exists
-                bridge = getattr(app.state, "channel_bridge", None)
-                if bridge and hasattr(bridge, "_channels"):
-                    bridge._channels["sendblue"] = sb
-                else:
-                    from openjarvis.server.channel_bridge import ChannelBridge
-                    from openjarvis.server.session_store import SessionStore
-
-                    session_store = SessionStore()
-                    engine = getattr(app.state, "engine", None)
-                    dr_agent = None
-                    if engine:
-                        from openjarvis.server.agent_manager_routes import (
-                            _build_deep_research_tools,
-                        )
-
-                        tools = _build_deep_research_tools(engine=engine, model="")
-                        if tools:
-                            from openjarvis.agents.deep_research import (
-                                DeepResearchAgent,
-                            )
-
-                            model_name = getattr(app.state, "model", "") or getattr(
-                                engine, "_model", ""
-                            )
-                            dr_agent = DeepResearchAgent(
-                                engine=engine,
-                                model=model_name,
-                                tools=tools,
-                            )
-
-                    bus = getattr(app.state, "bus", None)
-                    if bus is None:
-                        from openjarvis.core.events import EventBus
-
-                        bus = EventBus()
-
-                    app.state.channel_bridge = ChannelBridge(
-                        channels={"sendblue": sb},
-                        session_store=session_store,
-                        bus=bus,
-                        agent_manager=mgr,
-                        deep_research_agent=dr_agent,
-                    )
-
-                logger.info(
-                    "Restored SendBlue channel binding: %s",
-                    from_number,
-                )
-                return  # Only need one SendBlue binding
-    except Exception as exc:
-        logger.debug("SendBlue binding restore skipped: %s", exc)
+    quarantine_legacy_sendblue_bindings(app)
 
 
 # No-cache headers applied to static file responses
@@ -145,6 +69,7 @@ def create_app(
     model: str,
     *,
     agent=None,
+    request_agent_factory=None,
     bus=None,
     engine_name: str = "",
     agent_name: str = "",
@@ -155,7 +80,12 @@ def create_app(
     speech_backend=None,
     agent_manager=None,
     agent_scheduler=None,
-    api_key: str = "",
+    capability_policy=None,
+    audit_logger=None,
+    boundary_guard=None,
+    api_key: str | None = None,
+    api_principal: str = "",
+    api_principal_allowlist: set[str] | None = None,
     webhook_config: dict | None = None,
     cors_origins: list[str] | None = None,
 ) -> FastAPI:
@@ -169,6 +99,9 @@ def create_app(
         Default model name.
     agent:
         Optional agent instance for agent-mode completions.
+    request_agent_factory:
+        Callable that returns a fresh ``RequestAgentScope`` for an
+        authenticated API principal. External requests never reuse ``agent``.
     bus:
         Optional event bus for telemetry.
     channel_bridge:
@@ -209,16 +142,20 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    from openjarvis.server.middleware import RequestBodyLimitMiddleware
+
+    app.add_middleware(RequestBodyLimitMiddleware)
 
     # Store dependencies in app state
     app.state.engine = engine
     app.state.model = model
     app.state.agent = agent
+    app.state.request_agent_factory = request_agent_factory
     app.state.bus = bus
     app.state.engine_name = engine_name
-    app.state.agent_name = agent_name or (
-        getattr(agent, "agent_id", None) if agent else None
-    )
+    # Do not promote a class-level agent label into an authorization
+    # principal.  Callers must supply the runtime identity explicitly.
+    app.state.agent_name = agent_name or ""
     app.state.channel_bridge = channel_bridge
     app.state.config = config
     app.state.memory_backend = memory_backend
@@ -226,10 +163,34 @@ def create_app(
     app.state.speech_backend = speech_backend
     app.state.agent_manager = agent_manager
     app.state.agent_scheduler = agent_scheduler
+    app.state.capability_policy = capability_policy
+    app.state.audit_logger = audit_logger
+    app.state.boundary_guard = boundary_guard
     app.state.session_start = time.time()
     # Exposed so WebSocket handlers can authenticate the handshake (the HTTP
-    # AuthMiddleware never sees WS upgrade requests). Empty = auth disabled.
+    # AuthMiddleware never sees WS upgrade requests). ``None`` is reserved for
+    # explicitly embedded/test applications; an empty production key denies.
     app.state.api_key = api_key
+    app.state.api_principal = api_principal.strip()
+    app.state.api_principal_allowlist = frozenset(
+        value.strip() for value in (api_principal_allowlist or set()) if value.strip()
+    )
+
+    needs_security = agent is not None and bool(
+        getattr(agent, "accepts_tools", False)
+        or getattr(agent, "requires_security_context", False)
+    )
+    if needs_security:
+        bind_security = getattr(agent, "bind_security", None)
+        if not callable(bind_security):
+            raise RuntimeError(
+                "Security-bound server agent does not expose bind_security()"
+            )
+        bind_security(
+            capability_policy,
+            app.state.agent_name or "",
+            boundary_guard,
+        )
 
     # Wire up trace store if traces are enabled.
     #
@@ -329,14 +290,19 @@ def create_app(
     except Exception as exc:
         logger.debug("Security middleware init skipped: %s", exc)
 
-    # API key authentication middleware
-    if api_key:
-        try:
-            from openjarvis.server.auth_middleware import AuthMiddleware
+    # API key authentication middleware. ``api_key is not None`` means the
+    # caller selected server mode, so an empty key must deny rather than
+    # silently disabling authentication.
+    if api_key is not None:
+        from openjarvis.server.auth_middleware import AuthMiddleware
 
-            app.add_middleware(AuthMiddleware, api_key=api_key)
-        except Exception as exc:
-            logger.debug("Auth middleware init skipped: %s", exc)
+        app.add_middleware(
+            AuthMiddleware,
+            api_key=api_key,
+            principal=app.state.api_principal,
+            allowed_principals=app.state.api_principal_allowlist,
+            capability_policy=capability_policy,
+        )
 
     # Mount webhook routes (always — SendBlue may be configured dynamically)
     if webhook_config:

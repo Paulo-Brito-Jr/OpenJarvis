@@ -22,9 +22,10 @@ def _make_mcp_cfg(*, enabled=True, servers):
     return cfg
 
 
-def _fake_tool(name):
+def _fake_tool(name, *, namespace="x"):
     t = MagicMock()
-    t.spec.name = name
+    t.spec.name = f"mcp__{namespace}__{name}"
+    t.spec.metadata = {"mcp": {"remote_name": name}}
     return t
 
 
@@ -67,17 +68,14 @@ class TestLoaderEarlyReturns:
         assert tools == []
         assert clients == []
 
-    def test_malformed_json_logs_warning_returns_empty(self, _mock_mcp_stack, caplog):
+    def test_malformed_json_fails_closed(self, _mock_mcp_stack):
         from openjarvis.mcp.loader import load_mcp_tools_from_config
 
         cfg = MagicMock()
         cfg.enabled = True
         cfg.servers = "{not valid json"
-        with caplog.at_level("WARNING"):
-            tools, clients = load_mcp_tools_from_config(cfg)
-        assert tools == []
-        assert clients == []
-        assert any("parse MCP servers config" in r.message for r in caplog.records)
+        with pytest.raises(RuntimeError, match="parse MCP servers config"):
+            load_mcp_tools_from_config(cfg)
 
 
 class TestLoaderTokenPlumbing:
@@ -89,7 +87,7 @@ class TestLoaderTokenPlumbing:
             enabled=True,
             servers=[
                 {
-                    "name": "home-assistant",
+                    "name": "home_assistant",
                     "url": "http://homeassistant.local:8123/mcp",
                     "token": "ha-llat-secret",
                 }
@@ -122,7 +120,7 @@ class TestLoaderTokenPlumbing:
         cfg = _make_mcp_cfg(
             enabled=True,
             servers=[
-                {"name": "local-mcp", "command": "mcp-server-foo", "args": ["--flag"]}
+                {"name": "local_mcp", "command": "mcp-server-foo", "args": ["--flag"]}
             ],
         )
         load_mcp_tools_from_config(cfg)
@@ -146,7 +144,7 @@ class TestLoaderFiltering:
             servers=[{"name": "x", "url": "http://x"}],
         )
         tools, _ = load_mcp_tools_from_config(cfg, allowed_names={"beta"})
-        assert [t.spec.name for t in tools] == ["beta"]
+        assert [t.spec.name for t in tools] == ["mcp__x__beta"]
 
     def test_include_tools_per_server(self, _mock_mcp_stack):
         """Per-server include_tools restricts to just those names."""
@@ -161,7 +159,7 @@ class TestLoaderFiltering:
             servers=[{"name": "x", "url": "http://x", "include_tools": ["alpha"]}],
         )
         tools, _ = load_mcp_tools_from_config(cfg)
-        assert [t.spec.name for t in tools] == ["alpha"]
+        assert [t.spec.name for t in tools] == ["mcp__x__alpha"]
 
     def test_exclude_tools_per_server(self, _mock_mcp_stack):
         """Per-server exclude_tools drops the named tools."""
@@ -176,7 +174,7 @@ class TestLoaderFiltering:
             servers=[{"name": "x", "url": "http://x", "exclude_tools": ["alpha"]}],
         )
         tools, _ = load_mcp_tools_from_config(cfg)
-        assert [t.spec.name for t in tools] == ["beta"]
+        assert [t.spec.name for t in tools] == ["mcp__x__beta"]
 
 
 class TestLoaderClientLifetime:
@@ -199,12 +197,10 @@ class TestLoaderClientLifetime:
 
 
 class TestLoaderFailureIsolation:
-    def test_one_server_failure_doesnt_abort_others(self, _mock_mcp_stack, caplog):
-        """When one server's initialize() raises, the loader logs and
-        moves on — the remaining servers still contribute tools."""
+    def test_one_server_failure_aborts_batch_and_closes_clients(self, _mock_mcp_stack):
+        """A partial MCP surface must never be exposed after discovery failure."""
         from openjarvis.mcp.loader import load_mcp_tools_from_config
 
-        # First initialize() raises, second succeeds
         bad_client = MagicMock()
         bad_client.initialize.side_effect = RuntimeError("can't reach server")
         good_client = MagicMock()
@@ -221,8 +217,7 @@ class TestLoaderFailureIsolation:
                 {"name": "working", "url": "http://working"},
             ],
         )
-        with caplog.at_level("WARNING"):
-            tools, clients = load_mcp_tools_from_config(cfg)
-        assert [t.spec.name for t in tools] == ["survivor"]
-        assert len(clients) == 1
-        assert any("broken" in r.message for r in caplog.records)
+        with pytest.raises(RuntimeError, match="can't reach server"):
+            load_mcp_tools_from_config(cfg)
+        bad_client.close.assert_called_once_with()
+        good_client.initialize.assert_not_called()

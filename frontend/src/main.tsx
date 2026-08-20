@@ -3,7 +3,11 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import App from './App';
-import { initApiBase } from './lib/api';
+import {
+  initApiBase,
+  initApiKey,
+  type ApiKeyInitResult,
+} from './lib/api';
 import { initAnalytics } from './lib/analytics';
 import './index.css';
 
@@ -24,15 +28,54 @@ function applyTheme() {
 
 applyTheme();
 
-// Fetch the API base URL from the Tauri backend before rendering.
-// This ensures JARVIS_PORT is defined in one place (the Rust backend).
-// In non-Tauri environments this is a no-op.
-initApiBase().finally(() => {
+const root = createRoot(document.getElementById('root')!);
+
+function renderStartupFailure(
+  failure: Extract<ApiKeyInitResult, { ok: false }>,
+) {
+  root.render(
+    <main
+      role="alert"
+      className="min-h-screen flex items-center justify-center p-6"
+      style={{
+        background: 'var(--color-bg)',
+        color: 'var(--color-text)',
+      }}
+    >
+      <section
+        className="max-w-lg rounded-xl p-6"
+        style={{
+          background: 'var(--color-bg-secondary)',
+          border: '1px solid var(--color-border)',
+        }}
+      >
+        <h1 className="text-lg font-semibold">Secure startup paused</h1>
+        <p className="mt-2 text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+          {failure.message} No API key value was logged or shown.
+        </p>
+        <p className="mt-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          Resolve Keychain or storage access, then retry. OpenJarvis will not
+          open the normal interface until secure key initialization succeeds.
+        </p>
+        <button
+          type="button"
+          className="mt-4 rounded-lg px-3 py-2 text-sm font-medium"
+          style={{ background: 'var(--color-accent)', color: 'white' }}
+          onClick={() => void bootstrap()}
+        >
+          Retry secure startup
+        </button>
+      </section>
+    </main>,
+  );
+}
+
+function renderApp() {
   // Kick off analytics init in the background — it's never awaited so
   // a slow/failed identity fetch never delays UI render.
   void initAnalytics();
 
-  createRoot(document.getElementById('root')!).render(
+  root.render(
     <StrictMode>
       <ErrorBoundary>
         <BrowserRouter>
@@ -41,4 +84,42 @@ initApiBase().finally(() => {
       </ErrorBoundary>
     </StrictMode>,
   );
-});
+}
+
+let bootstrapInFlight: Promise<void> | null = null;
+
+async function runBootstrap() {
+  root.render(
+    <main
+      role="status"
+      className="min-h-screen flex items-center justify-center p-6"
+      style={{
+        background: 'var(--color-bg)',
+        color: 'var(--color-text-secondary)',
+      }}
+    >
+      Securing local API access...
+    </main>,
+  );
+
+  await initApiBase();
+  const apiKeyResult = await initApiKey();
+  if (!apiKeyResult.ok) {
+    renderStartupFailure(apiKeyResult);
+    return;
+  }
+  renderApp();
+}
+
+function bootstrap(): Promise<void> {
+  if (bootstrapInFlight) return bootstrapInFlight;
+  bootstrapInFlight = runBootstrap().finally(() => {
+    bootstrapInFlight = null;
+  });
+  return bootstrapInFlight;
+}
+
+// Fetch the API base URL and hydrate the ephemeral Bearer token before
+// rendering. This keeps the first HTTP/SSE request authenticated without ever
+// persisting OPENJARVIS_API_KEY in the WebView's localStorage.
+void bootstrap();

@@ -656,6 +656,17 @@ class AgentManager:
         )
         self._conn.commit()
 
+    def quarantine_pending_messages(self, agent_id: str) -> int:
+        """Quarantine legacy messages that lack authenticated provenance."""
+        cursor = self._conn.execute(
+            "UPDATE agent_messages SET status = 'quarantined' "
+            "WHERE agent_id = ? AND direction = 'user_to_agent' "
+            "AND status = 'pending'",
+            (agent_id,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def add_agent_response(self, agent_id: str, content: str) -> dict:
         msg_id = uuid4().hex[:16]
         now = time.time()

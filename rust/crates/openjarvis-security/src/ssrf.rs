@@ -47,15 +47,24 @@ fn embedded_ipv4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
+            // Keep this explicit denylist in parity with `_BLOCKED_CIDR` in
+            // the Python fallback.  100.64.0.0/10 includes CGNAT and
+            // Tailscale addresses and must never be treated as public.
+            is_in_cidr_v4(v4, Ipv4Addr::new(0, 0, 0, 0), 8)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(10, 0, 0, 0), 8)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(100, 64, 0, 0), 10)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(127, 0, 0, 0), 8)
                 || is_in_cidr_v4(v4, Ipv4Addr::new(169, 254, 0, 0), 16)
-                || *v4 == Ipv4Addr::UNSPECIFIED
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                // 0.0.0.0/8 — current network, routes to localhost on Linux
-                || v4.octets()[0] == 0
+                || is_in_cidr_v4(v4, Ipv4Addr::new(172, 16, 0, 0), 12)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(192, 0, 0, 0), 24)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(192, 0, 2, 0), 24)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(192, 88, 99, 0), 24)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(192, 168, 0, 0), 16)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(198, 18, 0, 0), 15)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(198, 51, 100, 0), 24)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(203, 0, 113, 0), 24)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(224, 0, 0, 0), 4)
+                || is_in_cidr_v4(v4, Ipv4Addr::new(240, 0, 0, 0), 4)
         }
         IpAddr::V6(v6) => {
             // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`)
@@ -65,11 +74,63 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = embedded_ipv4(v6) {
                 return is_private_ip(&IpAddr::V4(v4));
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || is_ula_v6(v6)
-                || is_link_local_v6(v6)
+            is_in_cidr_v6(v6, Ipv6Addr::UNSPECIFIED, 128)
+                || is_in_cidr_v6(v6, Ipv6Addr::LOCALHOST, 128)
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0),
+                    96,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0),
+                    48,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0),
+                    64,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0),
+                    23,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0),
+                    32,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0),
+                    16,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0),
+                    20,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0),
+                    16,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0),
+                    7,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
+                    10,
+                )
+                || is_in_cidr_v6(
+                    v6,
+                    Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
+                    8,
+                )
         }
     }
 }
@@ -83,14 +144,15 @@ fn is_in_cidr_v4(addr: &Ipv4Addr, network: Ipv4Addr, prefix_len: u32) -> bool {
     (u32::from(*addr) & mask) == (u32::from(network) & mask)
 }
 
-fn is_ula_v6(addr: &Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    (segments[0] & 0xfe00) == 0xfc00
-}
-
-fn is_link_local_v6(addr: &Ipv6Addr) -> bool {
-    let segments = addr.segments();
-    (segments[0] & 0xffc0) == 0xfe80
+fn is_in_cidr_v6(addr: &Ipv6Addr, network: Ipv6Addr, prefix_len: u32) -> bool {
+    let mask = if prefix_len == 0 {
+        0u128
+    } else {
+        !0u128 << (128 - prefix_len)
+    };
+    let addr_bits = u128::from_be_bytes(addr.octets());
+    let network_bits = u128::from_be_bytes(network.octets());
+    (addr_bits & mask) == (network_bits & mask)
 }
 
 /// Check a URL for SSRF vulnerabilities.
@@ -180,6 +242,41 @@ mod tests {
     fn test_public_ip_allowed() {
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[test]
+    fn test_cgnat_tailscale_and_special_use_are_private() {
+        for ip in [
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 100, 100, 100),
+            Ipv4Addr::new(100, 127, 255, 254),
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(198, 51, 100, 1),
+            Ipv4Addr::new(203, 0, 113, 1),
+            Ipv4Addr::new(240, 0, 0, 1),
+        ] {
+            assert!(is_private_ip(&IpAddr::V4(ip)), "{ip} must be blocked");
+        }
+    }
+
+    #[test]
+    fn test_ipv6_special_use_is_private() {
+        for value in [
+            "64:ff9b::8.8.8.8",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:db8::1",
+            "2002:0808:0808::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            let ip: Ipv6Addr = value.parse().unwrap();
+            assert!(
+                is_private_ip(&IpAddr::V6(ip)),
+                "{value} must be blocked"
+            );
+        }
     }
 
     #[test]

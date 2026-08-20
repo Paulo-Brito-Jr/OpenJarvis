@@ -13,6 +13,11 @@ logger = logging.getLogger(__name__)
 
 # Default tick prompt sent to the operative agent
 _TICK_PROMPT = "[OPERATOR TICK] Execute your operational protocol."
+_SCHEDULER_AUTH_ERROR = (
+    "Operator lifecycle changes require an authenticated scheduler principal, "
+    "explicit capability grants, and a durable consent record. This caller "
+    "did not provide that security context."
+)
 
 
 class OperatorManager:
@@ -25,9 +30,37 @@ class OperatorManager:
         memory_backend, and to run operators via ``system.ask()``).
     """
 
-    def __init__(self, system: Any) -> None:
+    def __init__(
+        self,
+        system: Any,
+        *,
+        scheduler_operator_id: str = "",
+        scheduler_capabilities: Optional[List[str]] = None,
+        scheduler_consent: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._system = system
         self._manifests: Dict[str, OperatorManifest] = {}
+        self._scheduler_operator_id = scheduler_operator_id.strip()
+        self._scheduler_capabilities = list(scheduler_capabilities or [])
+        self._scheduler_consent = dict(scheduler_consent or {})
+
+    def _require_scheduler_authorization(
+        self,
+        *,
+        require_consent: bool = False,
+    ) -> tuple[str, List[str], Dict[str, Any]]:
+        """Return caller-supplied scheduler authority or fail closed."""
+        if (
+            not self._scheduler_operator_id
+            or "schedule:create" not in self._scheduler_capabilities
+            or (require_consent and not self._scheduler_consent)
+        ):
+            raise PermissionError(_SCHEDULER_AUTH_ERROR)
+        return (
+            self._scheduler_operator_id,
+            list(self._scheduler_capabilities),
+            dict(self._scheduler_consent),
+        )
 
     # -- Registration --------------------------------------------------------
 
@@ -73,18 +106,18 @@ class OperatorManager:
             raise RuntimeError(
                 "TaskScheduler not available. Enable [scheduler] in config."
             )
+        principal, capabilities, consent = self._require_scheduler_authorization(
+            require_consent=True,
+        )
 
         task_id = f"operator:{operator_id}"
 
         # Check if already active
-        try:
-            existing = scheduler.list_tasks()
-            for t in existing:
-                if t.id == task_id and t.status == "active":
-                    logger.info("Operator %s already active", operator_id)
-                    return task_id
-        except Exception:
-            pass
+        existing = scheduler.list_tasks(operator_id=principal)
+        for task in existing:
+            if task.id == task_id and task.status == "active":
+                logger.info("Operator %s already active", operator_id)
+                return task_id
 
         tools_str = ",".join(manifest.tools) if manifest.tools else ""
         metadata: Dict[str, Any] = {
@@ -95,20 +128,19 @@ class OperatorManager:
             "metrics": manifest.metrics,
         }
 
-        # Use the scheduler's create_task but with a deterministic ID
-        task = scheduler.create_task(
+        scheduler.create_task(
             prompt=_TICK_PROMPT,
             schedule_type=manifest.schedule_type,
             schedule_value=manifest.schedule_value,
             agent="operative",
             tools=tools_str,
             metadata=metadata,
+            task_id=task_id,
+            operator_id=principal,
+            capabilities=capabilities,
+            consent=consent,
         )
 
-        # Override the random ID with our deterministic one
-        task_dict = task.to_dict()
-        task_dict["id"] = task_id
-        scheduler._store.save_task(task_dict)
         logger.info("Activated operator %s (task_id=%s)", operator_id, task_id)
         return task_id
 
@@ -117,9 +149,10 @@ class OperatorManager:
         scheduler = self._system.scheduler
         if scheduler is None:
             raise RuntimeError("TaskScheduler not available.")
+        principal, _capabilities, _consent = self._require_scheduler_authorization()
         task_id = f"operator:{operator_id}"
         try:
-            scheduler.cancel_task(task_id)
+            scheduler.cancel_task(task_id, operator_id=principal)
             logger.info("Deactivated operator %s", operator_id)
         except KeyError:
             logger.warning("No active task for operator %s", operator_id)
@@ -129,7 +162,11 @@ class OperatorManager:
         scheduler = self._system.scheduler
         if scheduler is None:
             raise RuntimeError("TaskScheduler not available.")
-        scheduler.pause_task(f"operator:{operator_id}")
+        principal, _capabilities, _consent = self._require_scheduler_authorization()
+        scheduler.pause_task(
+            f"operator:{operator_id}",
+            operator_id=principal,
+        )
         logger.info("Paused operator %s", operator_id)
 
     def resume(self, operator_id: str) -> None:
@@ -137,7 +174,11 @@ class OperatorManager:
         scheduler = self._system.scheduler
         if scheduler is None:
             raise RuntimeError("TaskScheduler not available.")
-        scheduler.resume_task(f"operator:{operator_id}")
+        principal, _capabilities, _consent = self._require_scheduler_authorization()
+        scheduler.resume_task(
+            f"operator:{operator_id}",
+            operator_id=principal,
+        )
         logger.info("Resumed operator %s", operator_id)
 
     def status(self) -> List[Dict[str, Any]]:
@@ -160,10 +201,12 @@ class OperatorManager:
                 "next_run": None,
                 "last_run": None,
             }
-            if scheduler is not None:
+            if scheduler is not None and self._scheduler_operator_id:
                 task_id = f"operator:{op_id}"
                 try:
-                    tasks = scheduler.list_tasks()
+                    tasks = scheduler.list_tasks(
+                        operator_id=self._scheduler_operator_id,
+                    )
                     for t in tasks:
                         if t.id == task_id:
                             info["status"] = t.status

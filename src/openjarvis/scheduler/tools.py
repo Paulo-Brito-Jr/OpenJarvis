@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from openjarvis.core.registry import ToolRegistry
@@ -10,12 +11,29 @@ from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 
+class _SchedulerToolBase(BaseTool):
+    _scheduler: Optional[Any] = None
+    _operator_id: str = ""
+
+    def bind_scheduler_context(self, scheduler: Any, operator_id: str) -> None:
+        self._scheduler = scheduler
+        self._operator_id = operator_id.strip()
+
+    def _require_operator(self) -> str:
+        if not self._operator_id:
+            raise PermissionError("Scheduler operator identity is unavailable")
+        return self._operator_id
+
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        task_id = str(params.get("task_id", "")).strip()
+        return f"schedule:{task_id}" if task_id else "schedule:new"
+
+
 @ToolRegistry.register("schedule_task")
-class ScheduleTaskTool(BaseTool):
+class ScheduleTaskTool(_SchedulerToolBase):
     """Schedule a new task for future or recurring execution."""
 
     tool_id = "schedule_task"
-    _scheduler: Optional[Any] = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -58,10 +76,26 @@ class ScheduleTaskTool(BaseTool):
                             "(e.g. 'calculator,think')."
                         ),
                     },
+                    "allow_replay": {
+                        "type": "boolean",
+                        "description": (
+                            "Must be true for cron/interval tasks to grant "
+                            "explicit recurring replay consent."
+                        ),
+                    },
+                    "consent_expires_at": {
+                        "type": "string",
+                        "description": (
+                            "ISO datetime when recurring replay consent expires "
+                            "(required for cron/interval; at most 31 days)."
+                        ),
+                    },
                 },
                 "required": ["prompt", "schedule_type", "schedule_value"],
             },
             category="scheduler",
+            requires_confirmation=True,
+            required_capabilities=["schedule:create"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -84,12 +118,32 @@ class ScheduleTaskTool(BaseTool):
                 success=False,
             )
         try:
+            operator_id = self._require_operator()
+            if schedule_type == "once":
+                consent = {
+                    "scope": "once",
+                    "granted_at": datetime.now(timezone.utc).isoformat(),
+                }
+            else:
+                if params.get("allow_replay") is not True:
+                    raise PermissionError(
+                        "Recurring schedules require explicit replay consent"
+                    )
+                consent = {
+                    "scope": "recurring",
+                    "allow_replay": True,
+                    "granted_at": datetime.now(timezone.utc).isoformat(),
+                    "expires_at": params.get("consent_expires_at", ""),
+                }
             task = self._scheduler.create_task(
                 prompt=prompt,
                 schedule_type=schedule_type,
                 schedule_value=schedule_value,
                 agent=params.get("agent", "simple"),
                 tools=params.get("tools", ""),
+                operator_id=operator_id,
+                capabilities=["schedule:create"],
+                consent=consent,
             )
             return ToolResult(
                 tool_name="schedule_task",
@@ -102,20 +156,19 @@ class ScheduleTaskTool(BaseTool):
                 ),
                 success=True,
             )
-        except Exception as exc:
+        except Exception:
             return ToolResult(
                 tool_name="schedule_task",
-                content=f"Failed to schedule task: {exc}",
+                content="Failed to schedule task securely.",
                 success=False,
             )
 
 
 @ToolRegistry.register("list_scheduled_tasks")
-class ListScheduledTasksTool(BaseTool):
+class ListScheduledTasksTool(_SchedulerToolBase):
     """List all scheduled tasks."""
 
     tool_id = "list_scheduled_tasks"
-    _scheduler: Optional[Any] = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -135,6 +188,7 @@ class ListScheduledTasksTool(BaseTool):
                 },
             },
             category="scheduler",
+            required_capabilities=["schedule:create"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -146,27 +200,40 @@ class ListScheduledTasksTool(BaseTool):
             )
         try:
             status = params.get("status")
-            tasks = self._scheduler.list_tasks(status=status)
-            items = [t.to_dict() for t in tasks]
+            tasks = self._scheduler.list_tasks(
+                status=status,
+                operator_id=self._require_operator(),
+            )
+            items = [
+                {
+                    "id": task.id,
+                    "schedule_type": task.schedule_type,
+                    "schedule_value": task.schedule_value,
+                    "status": task.status,
+                    "next_run": task.next_run,
+                    "last_run": task.last_run,
+                    "agent": task.agent,
+                }
+                for task in tasks
+            ]
             return ToolResult(
                 tool_name="list_scheduled_tasks",
                 content=json.dumps(items, default=str),
                 success=True,
             )
-        except Exception as exc:
+        except Exception:
             return ToolResult(
                 tool_name="list_scheduled_tasks",
-                content=f"Failed to list tasks: {exc}",
+                content="Failed to list scheduled tasks securely.",
                 success=False,
             )
 
 
 @ToolRegistry.register("pause_scheduled_task")
-class PauseScheduledTaskTool(BaseTool):
+class PauseScheduledTaskTool(_SchedulerToolBase):
     """Pause a scheduled task."""
 
     tool_id = "pause_scheduled_task"
-    _scheduler: Optional[Any] = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -184,6 +251,8 @@ class PauseScheduledTaskTool(BaseTool):
                 "required": ["task_id"],
             },
             category="scheduler",
+            requires_confirmation=True,
+            required_capabilities=["schedule:create"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -201,7 +270,10 @@ class PauseScheduledTaskTool(BaseTool):
                 success=False,
             )
         try:
-            self._scheduler.pause_task(task_id)
+            self._scheduler.pause_task(
+                task_id,
+                operator_id=self._require_operator(),
+            )
             return ToolResult(
                 tool_name="pause_scheduled_task",
                 content=f"Task {task_id} paused.",
@@ -213,20 +285,19 @@ class PauseScheduledTaskTool(BaseTool):
                 content=f"Task not found: {task_id}",
                 success=False,
             )
-        except Exception as exc:
+        except Exception:
             return ToolResult(
                 tool_name="pause_scheduled_task",
-                content=f"Failed to pause task: {exc}",
+                content="Failed to pause scheduled task securely.",
                 success=False,
             )
 
 
 @ToolRegistry.register("resume_scheduled_task")
-class ResumeScheduledTaskTool(BaseTool):
+class ResumeScheduledTaskTool(_SchedulerToolBase):
     """Resume a paused scheduled task."""
 
     tool_id = "resume_scheduled_task"
-    _scheduler: Optional[Any] = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -244,6 +315,8 @@ class ResumeScheduledTaskTool(BaseTool):
                 "required": ["task_id"],
             },
             category="scheduler",
+            requires_confirmation=True,
+            required_capabilities=["schedule:create"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -261,7 +334,10 @@ class ResumeScheduledTaskTool(BaseTool):
                 success=False,
             )
         try:
-            self._scheduler.resume_task(task_id)
+            self._scheduler.resume_task(
+                task_id,
+                operator_id=self._require_operator(),
+            )
             return ToolResult(
                 tool_name="resume_scheduled_task",
                 content=f"Task {task_id} resumed.",
@@ -273,20 +349,19 @@ class ResumeScheduledTaskTool(BaseTool):
                 content=f"Task not found: {task_id}",
                 success=False,
             )
-        except Exception as exc:
+        except Exception:
             return ToolResult(
                 tool_name="resume_scheduled_task",
-                content=f"Failed to resume task: {exc}",
+                content="Failed to resume scheduled task securely.",
                 success=False,
             )
 
 
 @ToolRegistry.register("cancel_scheduled_task")
-class CancelScheduledTaskTool(BaseTool):
+class CancelScheduledTaskTool(_SchedulerToolBase):
     """Cancel a scheduled task."""
 
     tool_id = "cancel_scheduled_task"
-    _scheduler: Optional[Any] = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -304,6 +379,8 @@ class CancelScheduledTaskTool(BaseTool):
                 "required": ["task_id"],
             },
             category="scheduler",
+            requires_confirmation=True,
+            required_capabilities=["schedule:create"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -321,7 +398,10 @@ class CancelScheduledTaskTool(BaseTool):
                 success=False,
             )
         try:
-            self._scheduler.cancel_task(task_id)
+            self._scheduler.cancel_task(
+                task_id,
+                operator_id=self._require_operator(),
+            )
             return ToolResult(
                 tool_name="cancel_scheduled_task",
                 content=f"Task {task_id} cancelled.",
@@ -333,10 +413,10 @@ class CancelScheduledTaskTool(BaseTool):
                 content=f"Task not found: {task_id}",
                 success=False,
             )
-        except Exception as exc:
+        except Exception:
             return ToolResult(
                 tool_name="cancel_scheduled_task",
-                content=f"Failed to cancel task: {exc}",
+                content="Failed to cancel scheduled task securely.",
                 success=False,
             )
 

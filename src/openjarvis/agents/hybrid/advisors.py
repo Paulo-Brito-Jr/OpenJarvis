@@ -283,6 +283,7 @@ class AdvisorsAgent(LocalCloudAgent):
             res = tavily_search_context(
                 query or user,
                 max_results=int(self._cfg.get("tavily_max_results", 5)),
+                action_authorizer=self._action_authorizer,
             )
             grounded_user = (
                 f"Web search results:\n{res['text']}\n\n"
@@ -311,6 +312,7 @@ class AdvisorsAgent(LocalCloudAgent):
                 temperature=0.0,
                 tools=[build_web_search_tool(ws_max_uses)],
                 max_turns=max_turns,
+                action_authorizer=self._action_authorizer,
             )
             return text, p, c, n_searches, turns, 0.0
         if self._cloud_endpoint == "openai":
@@ -321,6 +323,7 @@ class AdvisorsAgent(LocalCloudAgent):
                 max_tokens=max_tokens,
                 temperature=0.0,
                 max_turns=max_turns,
+                action_authorizer=self._action_authorizer,
             )
             return text, p, c, n_searches, turns, 0.0
         if self._cloud_endpoint == "gemini":
@@ -331,6 +334,7 @@ class AdvisorsAgent(LocalCloudAgent):
                 max_tokens=max_tokens,
                 temperature=0.0,
                 max_turns=max_turns,
+                action_authorizer=self._action_authorizer,
             )
             return text, p, c, n_searches, turns, 0.0
         # Genuinely unsupported (openrouter / vllm / unknown). The caller

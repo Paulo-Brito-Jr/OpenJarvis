@@ -52,7 +52,7 @@ def test_returns_tools_from_mcp_server(mock_load_config: MagicMock):
     """With a mocked MCP server, discovered tools are returned."""
     from openjarvis.server.agent_manager_routes import _get_mcp_tools
 
-    server_cfg = [{"name": "test-server", "url": "http://localhost:9999"}]
+    server_cfg = [{"name": "test_server", "url": "http://localhost:9999"}]
     mock_load_config.return_value = _make_config(
         servers_json=json.dumps(server_cfg),
     )
@@ -79,7 +79,7 @@ def test_caches_successful_discovery(mock_load_config: MagicMock):
     """Second call returns cached result without re-discovering."""
     from openjarvis.server.agent_manager_routes import _get_mcp_tools
 
-    server_cfg = [{"name": "test-server", "url": "http://localhost:9999"}]
+    server_cfg = [{"name": "test_server", "url": "http://localhost:9999"}]
     mock_load_config.return_value = _make_config(
         servers_json=json.dumps(server_cfg),
     )
@@ -107,11 +107,11 @@ def test_caches_successful_discovery(mock_load_config: MagicMock):
 
 
 @patch("openjarvis.core.config.load_config")
-def test_does_not_cache_empty_results(mock_load_config: MagicMock):
-    """Failed/empty discovery is not cached so it can be retried."""
+def test_caches_empty_results_fail_closed(mock_load_config: MagicMock):
+    """An empty discovery is cached so tools cannot appear mid-session."""
     from openjarvis.server.agent_manager_routes import _get_mcp_tools
 
-    server_cfg = [{"name": "failing-server", "url": "http://localhost:9999"}]
+    server_cfg = [{"name": "empty_server", "url": "http://localhost:9999"}]
     mock_load_config.return_value = _make_config(
         servers_json=json.dumps(server_cfg),
     )
@@ -128,16 +128,17 @@ def test_does_not_cache_empty_results(mock_load_config: MagicMock):
         tools1, _ = _get_mcp_tools(app_state)
         assert len(tools1) == 0
 
-        # Verify no cache was set (empty result)
-        assert getattr(app_state, "_mcp_tools_cache", None) is None
+        assert app_state._mcp_tools_cache == ([], {})
+        discover_call_count = MockProvider.return_value.discover.call_count
 
-        # Second call: discovery now returns something
+        # A remote server changing after the initial snapshot must not
+        # silently expand the executable tool surface.
         mock_adapter = _make_adapter("retry_tool")
         MockProvider.return_value.discover.return_value = [mock_adapter]
 
         tools2, _ = _get_mcp_tools(app_state)
-        assert len(tools2) == 1
-        assert tools2[0]["function"]["name"] == "retry_tool"
+        assert tools2 == []
+        assert MockProvider.return_value.discover.call_count == discover_call_count
 
 
 @patch("openjarvis.core.config.load_config")

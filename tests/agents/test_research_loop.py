@@ -22,6 +22,7 @@ from openjarvis.agents.research_loop import (
     shape_results_for_model,
 )
 from openjarvis.connectors.hybrid_search import SearchHit
+from openjarvis.security.capabilities import CapabilityPolicy
 
 
 class _MockEngine:
@@ -88,6 +89,52 @@ def stub_search() -> MagicMock:
     return s
 
 
+def _research_agent(
+    engine: _MockEngine,
+    search: MagicMock,
+    **kwargs: Any,
+) -> ResearchAgent:
+    """Build a research agent with an explicit least-privilege test identity."""
+    policy = CapabilityPolicy()
+    policy.grant("research-test", "tool:invoke", "research:planner")
+    policy.grant("research-test", "memory:read", "research:corpus:*")
+    return ResearchAgent(
+        engine,
+        search,
+        capability_policy=policy,
+        agent_id="research-test",
+        **kwargs,
+    )
+
+
+def test_research_agent_requires_explicit_security_context(
+    stub_search: MagicMock,
+) -> None:
+    engine = _MockEngine(responses=[_text_response("must not run")])
+
+    with pytest.raises(RuntimeError, match="explicit capability policy"):
+        ResearchAgent(engine, stub_search)
+
+
+def test_research_denial_prevents_model_and_corpus_access(
+    stub_search: MagicMock,
+) -> None:
+    engine = _MockEngine(responses=[_text_response("must not run")])
+    denied_policy = CapabilityPolicy()
+    agent = ResearchAgent(
+        engine,
+        stub_search,
+        capability_policy=denied_policy,
+        agent_id="research-denied",
+    )
+
+    with pytest.raises(PermissionError, match="tool:invoke"):
+        agent.run("private query")
+
+    assert engine.calls == []
+    stub_search.search.assert_not_called()
+
+
 def test_forced_synthesis_when_budget_exhausts(stub_search: MagicMock) -> None:
     """Loop exits cleanly with a synthesis even when the model keeps tool-calling.
 
@@ -107,7 +154,7 @@ def test_forced_synthesis_when_budget_exhausts(stub_search: MagicMock) -> None:
         ]
     )
 
-    agent = ResearchAgent(engine, stub_search, model="mock", max_iterations=1)
+    agent = _research_agent(engine, stub_search, model="mock", max_iterations=1)
     result = agent.run("test query")
 
     assert "Here is what I found" in result.answer
@@ -134,7 +181,7 @@ def test_forced_synthesis_returns_sentinel_when_model_stays_silent(
         ]
     )
 
-    agent = ResearchAgent(engine, stub_search, model="mock", max_iterations=1)
+    agent = _research_agent(engine, stub_search, model="mock", max_iterations=1)
     result = agent.run("test query")
 
     assert result.answer  # non-empty
@@ -144,7 +191,7 @@ def test_forced_synthesis_returns_sentinel_when_model_stays_silent(
 def test_first_turn_text_response_returns_directly(stub_search: MagicMock) -> None:
     """When the model produces text on the very first turn, return it as-is."""
     engine = _MockEngine(responses=[_text_response("Quick answer.")])
-    agent = ResearchAgent(engine, stub_search, model="mock", max_iterations=5)
+    agent = _research_agent(engine, stub_search, model="mock", max_iterations=5)
     result = agent.run("hello")
     assert result.answer == "Quick answer."
     assert result.tool_calls == []
@@ -182,7 +229,7 @@ def test_clarify_before_any_search_is_rejected(stub_search: MagicMock) -> None:
         ]
     )
 
-    agent = ResearchAgent(
+    agent = _research_agent(
         engine,
         stub_search,
         model="mock",
@@ -325,7 +372,7 @@ def test_search_with_sources_filter_is_passed_through(
         ]
     )
 
-    agent = ResearchAgent(engine, stub_search, model="mock", max_iterations=2)
+    agent = _research_agent(engine, stub_search, model="mock", max_iterations=2)
     result = agent.run("tell me about my recent meetings from Granola")
 
     stub_search.search.assert_called_once()
@@ -355,7 +402,7 @@ def test_search_sources_coerces_scalar_to_list(stub_search: MagicMock) -> None:
             _text_response("done"),
         ]
     )
-    agent = ResearchAgent(engine, stub_search, model="mock", max_iterations=2)
+    agent = _research_agent(engine, stub_search, model="mock", max_iterations=2)
     agent.run("anything in slack")
 
     kwargs = stub_search.search.call_args.kwargs
@@ -417,7 +464,7 @@ def test_available_sources_override_appears_in_prompt(
     have never been wired up.
     """
     engine = _MockEngine(responses=[_text_response("ok")])
-    agent = ResearchAgent(
+    agent = _research_agent(
         engine,
         stub_search,
         model="mock",
@@ -449,7 +496,7 @@ def test_available_sources_fall_back_to_store(stub_search: MagicMock) -> None:
     stub_search._store = fake_store
 
     engine = _MockEngine(responses=[_text_response("ok")])
-    agent = ResearchAgent(engine, stub_search, model="mock", max_iterations=1)
+    agent = _research_agent(engine, stub_search, model="mock", max_iterations=1)
     agent.run("hi")
 
     fake_store.distinct_sources.assert_called_once()
@@ -468,7 +515,7 @@ def test_available_sources_empty_message_when_nothing_connected(
     """
     stub_search._store = None
     engine = _MockEngine(responses=[_text_response("ok")])
-    agent = ResearchAgent(
+    agent = _research_agent(
         engine,
         stub_search,
         model="mock",
@@ -598,7 +645,7 @@ def test_final_answer_event_carries_renumbered_sources(
     def on_event(ev: dict) -> None:
         captured.append(ev)
 
-    agent = ResearchAgent(
+    agent = _research_agent(
         engine,
         stub_search,
         model="mock",

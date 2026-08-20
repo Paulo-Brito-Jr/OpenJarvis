@@ -10,6 +10,7 @@ from openjarvis.mcp.protocol import (
     MCPRequest,
 )
 from openjarvis.mcp.server import MCPServer
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools.calculator import CalculatorTool
 from openjarvis.tools.think import ThinkTool
 
@@ -17,10 +18,28 @@ from openjarvis.tools.think import ThinkTool
 @pytest.fixture
 def server():
     """Create an MCP server with calculator and think tools."""
-    return MCPServer([CalculatorTool(), ThinkTool()])
+    policy = CapabilityPolicy()
+    policy.grant("mcp-test", "*", "*")
+    return MCPServer(
+        [CalculatorTool(), ThinkTool()],
+        capability_policy=policy,
+        agent_id="mcp-test",
+    )
 
 
 class TestMCPServer:
+    def test_tools_call_without_security_binding_denies(self):
+        server = MCPServer([CalculatorTool()])
+        req = MCPRequest(
+            method="tools/call",
+            params={"name": "calculator", "arguments": {"expression": "2+2"}},
+            id=0,
+        )
+        resp = server.handle(req)
+        assert resp.error is None
+        assert resp.result["isError"] is True
+        assert "policy unavailable" in resp.result["content"][0]["text"].lower()
+
     def test_initialize(self, server):
         req = MCPRequest(method="initialize", id=1)
         resp = server.handle(req)

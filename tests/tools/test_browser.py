@@ -268,6 +268,70 @@ class TestBrowserNavigateTool:
         assert fn["function"]["name"] == "browser_navigate"
         assert "url" in fn["function"]["parameters"]["properties"]
 
+    @pytest.mark.parametrize(
+        ("tool_class_name", "tool_name", "arguments"),
+        [
+            ("BrowserNavigateTool", "browser_navigate", {"url": "https://example.com"}),
+            ("BrowserClickTool", "browser_click", {"selector": "#submit"}),
+            (
+                "BrowserTypeTool",
+                "browser_type",
+                {"selector": "#name", "text": "secret"},
+            ),
+            (
+                "BrowserScreenshotTool",
+                "browser_screenshot",
+                {"path": "/tmp/should-not-exist.png"},
+            ),
+            ("BrowserExtractTool", "browser_extract", {"selector": "body"}),
+        ],
+    )
+    def test_tool_executor_disables_shared_browser_until_isolation(
+        self,
+        tool_class_name,
+        tool_name,
+        arguments,
+    ):
+        import json
+
+        from openjarvis.core.types import ToolCall
+        from openjarvis.security.capabilities import CapabilityPolicy
+        from openjarvis.tools import browser
+        from openjarvis.tools._stubs import ToolExecutor
+
+        policy = CapabilityPolicy()
+        policy.grant("browser-test", "tool:invoke", "*")
+        policy.grant("browser-test", "network:fetch", "*")
+        policy.grant("browser-test", "network:mutate", "*")
+        policy.grant("browser-test", "file:write", "*")
+        page = _make_mock_page()
+        session = _make_mock_session(page)
+        tool_class = getattr(browser, tool_class_name)
+        executor = ToolExecutor(
+            [tool_class()],
+            capability_policy=policy,
+            agent_id="browser-test",
+            boundary_guard=MagicMock(),
+        )
+
+        with patch("openjarvis.tools.browser._session", session):
+            result = executor.execute(
+                ToolCall(
+                    id="browser-1",
+                    name=tool_name,
+                    arguments=json.dumps(arguments),
+                )
+            )
+
+        assert result.success is False
+        assert result.metadata["security_disabled"] is True
+        assert "sessions are isolated per principal" in result.content
+        page.goto.assert_not_called()
+        page.click.assert_not_called()
+        page.fill.assert_not_called()
+        page.screenshot.assert_not_called()
+        page.inner_text.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestBrowserClickTool

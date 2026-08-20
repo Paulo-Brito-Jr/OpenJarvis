@@ -16,21 +16,41 @@ _BLOCKED_HOSTS = frozenset(
     }
 )
 
-_BLOCKED_CIDR = [
-    ipaddress.ip_network("0.0.0.0/8"),  # current network — routes to localhost on Linux
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
+# Explicit, shared Python/Rust denylist.  In addition to RFC1918, loopback and
+# link-local ranges, SSRF protection must reject address space that is not a
+# normal globally-routable destination.  In particular 100.64.0.0/10 is used
+# by carrier-grade NAT and Tailscale, so treating it as public would expose
+# services on the private tailnet.
+_BLOCKED_CIDR = (
+    ipaddress.ip_network("0.0.0.0/8"),  # current network
+    ipaddress.ip_network("10.0.0.0/8"),  # RFC1918
+    ipaddress.ip_network("100.64.0.0/10"),  # shared/CGNAT, including Tailscale
+    ipaddress.ip_network("127.0.0.0/8"),  # loopback
     ipaddress.ip_network("169.254.0.0/16"),  # link-local
+    ipaddress.ip_network("172.16.0.0/12"),  # RFC1918
+    ipaddress.ip_network("192.0.0.0/24"),  # IETF protocol assignments
+    ipaddress.ip_network("192.0.2.0/24"),  # documentation
+    ipaddress.ip_network("192.88.99.0/24"),  # deprecated 6to4 relay
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC1918
+    ipaddress.ip_network("198.18.0.0/15"),  # benchmark testing
+    ipaddress.ip_network("198.51.100.0/24"),  # documentation
+    ipaddress.ip_network("203.0.113.0/24"),  # documentation
     ipaddress.ip_network("224.0.0.0/4"),  # multicast
-    ipaddress.ip_network("255.255.255.255/32"),  # broadcast
+    ipaddress.ip_network("240.0.0.0/4"),  # reserved/broadcast
     ipaddress.ip_network("::/128"),  # IPv6 unspecified
-    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("64:ff9b::/96"),  # well-known NAT64 translation
+    ipaddress.ip_network("64:ff9b:1::/48"),  # local-use NAT64 translation
+    ipaddress.ip_network("100::/64"),  # discard-only
+    ipaddress.ip_network("2001::/23"),  # IETF special-purpose assignments
+    ipaddress.ip_network("2001:db8::/32"),  # documentation
+    ipaddress.ip_network("2002::/16"),  # deprecated 6to4
+    ipaddress.ip_network("3fff::/20"),  # documentation
+    ipaddress.ip_network("5f00::/16"),  # segment-routing SIDs
     ipaddress.ip_network("fc00::/7"),  # unique local
     ipaddress.ip_network("fe80::/10"),  # link-local v6
     ipaddress.ip_network("ff00::/8"),  # IPv6 multicast
-]
+)
 
 
 def _embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:

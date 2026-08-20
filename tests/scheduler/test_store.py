@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import stat
+
 import pytest
 
 from openjarvis.scheduler.store import SchedulerStore
@@ -37,6 +39,14 @@ def _make_task(task_id: str = "t1", **overrides) -> dict:
 
 
 class TestTaskCRUD:
+    def test_database_permissions_are_owner_only(self, tmp_path):
+        db_path = tmp_path / "scheduler_permissions.db"
+        scheduler_store = SchedulerStore(db_path)
+        try:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+        finally:
+            scheduler_store.close()
+
     def test_save_and_get(self, store):
         task = _make_task()
         store.save_task(task)
@@ -46,6 +56,14 @@ class TestTaskCRUD:
         assert got["prompt"] == "summarize the news"
         assert got["schedule_type"] == "interval"
         assert got["schedule_value"] == "3600"
+
+    def test_create_task_is_insert_only(self, store):
+        assert store.create_task(_make_task("stable-id")) is True
+        assert (
+            store.create_task(_make_task("stable-id", prompt="must not overwrite"))
+            is False
+        )
+        assert store.get_task("stable-id")["prompt"] == "summarize the news"
 
     def test_get_missing_returns_none(self, store):
         assert store.get_task("nonexistent") is None
@@ -84,6 +102,22 @@ class TestTaskCRUD:
         store.save_task(task)
         got = store.get_task("t1")
         assert got["metadata"] == {"key": "value", "count": 42}
+
+    def test_save_cannot_cross_operator_ownership(self, store):
+        original = _make_task("shared-id", operator_id="owner-a")
+        store.save_task(original)
+        replacement = _make_task(
+            "shared-id",
+            operator_id="owner-b",
+            prompt="replacement",
+        )
+
+        with pytest.raises(PermissionError, match="another operator"):
+            store.save_task(replacement)
+
+        got = store.get_task("shared-id")
+        assert got["operator_id"] == "owner-a"
+        assert got["prompt"] == original["prompt"]
 
 
 # -- Due tasks ---------------------------------------------------------------

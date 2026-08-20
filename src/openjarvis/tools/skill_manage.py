@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Any, List
 
@@ -19,6 +23,9 @@ class SkillManageTool(BaseTool):
         if skills_dir is None:
             skills_dir = get_config_dir() / "skills"
         self._skills_dir = Path(skills_dir).expanduser()
+
+    _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    _SAFE_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 
     @property
     def spec(self) -> ToolSpec:
@@ -54,19 +61,41 @@ class SkillManageTool(BaseTool):
             category="skill",
         )
 
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        name = params.get("name")
+        if isinstance(name, str) and self._SAFE_NAME_RE.fullmatch(name):
+            return str(self._skill_path(name))
+        return str(self._skills_dir.resolve(strict=False))
+
+    def authorization_capabilities(self, params: dict[str, Any]) -> List[str]:
+        action = params.get("action", "list")
+        if action in {"create", "delete"}:
+            return ["file:write"]
+        return ["file:read"]
+
+    def requires_confirmation_for(self, params: dict[str, Any]) -> bool:
+        return params.get("action") in {"create", "delete"}
+
     def execute(self, **params: Any) -> ToolResult:
         action = params.get("action", "list")
         name = params.get("name", "")
-        if action == "create":
-            return self._create(
-                name, params.get("description", ""), params.get("steps", [])
+        try:
+            if action == "create":
+                return self._create(
+                    name, params.get("description", ""), params.get("steps", [])
+                )
+            elif action == "list":
+                return self._list()
+            elif action == "load":
+                return self._load(name)
+            elif action == "delete":
+                return self._delete(name)
+        except (TypeError, ValueError) as exc:
+            return ToolResult(
+                tool_name=self.spec.name,
+                success=False,
+                content=f"Invalid skill request: {exc}",
             )
-        elif action == "list":
-            return self._list()
-        elif action == "load":
-            return self._load(name)
-        elif action == "delete":
-            return self._delete(name)
         return ToolResult(
             tool_name=self.spec.name,
             success=False,
@@ -74,29 +103,64 @@ class SkillManageTool(BaseTool):
         )
 
     def _create(self, name: str, description: str, steps: List[dict]) -> ToolResult:
-        if not name:
-            return ToolResult(
-                tool_name=self.spec.name,
-                success=False,
-                content="Skill name is required.",
-            )
+        path = self._skill_path(name)
+        if not isinstance(description, str) or len(description) > 4096:
+            raise ValueError("description must be a string of at most 4096 characters")
+        if not isinstance(steps, list) or len(steps) > 100:
+            raise ValueError("steps must be a list containing at most 100 entries")
+
         self._skills_dir.mkdir(parents=True, exist_ok=True)
-        path = self._skills_dir / f"{name}.toml"
         lines = [
             "[skill]",
-            f'name = "{name}"',
-            f'description = "{description}"',
+            f"name = {json.dumps(name, ensure_ascii=False)}",
+            f"description = {json.dumps(description, ensure_ascii=False)}",
             "",
         ]
         for step in steps:
+            if not isinstance(step, dict):
+                raise ValueError("each step must be an object")
+            tool_name = step.get("tool_name", "")
+            if not isinstance(tool_name, str) or not self._SAFE_TOOL_RE.fullmatch(
+                tool_name
+            ):
+                raise ValueError("step tool_name is invalid")
             lines.append("[[skill.steps]]")
-            lines.append(f'tool_name = "{step.get("tool_name", "")}"')
+            lines.append(f"tool_name = {json.dumps(tool_name, ensure_ascii=False)}")
             if "arguments_template" in step:
-                lines.append(f"arguments_template = '{step['arguments_template']}'")
+                arguments_template = step["arguments_template"]
+                if not isinstance(arguments_template, str):
+                    raise ValueError("arguments_template must be a string")
+                lines.append(
+                    "arguments_template = "
+                    f"{json.dumps(arguments_template, ensure_ascii=False)}"
+                )
             if "output_key" in step:
-                lines.append(f'output_key = "{step["output_key"]}"')
+                output_key = step["output_key"]
+                if not isinstance(output_key, str):
+                    raise ValueError("output_key must be a string")
+                lines.append(
+                    f"output_key = {json.dumps(output_key, ensure_ascii=False)}"
+                )
             lines.append("")
-        path.write_text("\n".join(lines))
+
+        serialized = "\n".join(lines)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=str(self._skills_dir),
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
         return ToolResult(
             tool_name=self.spec.name,
             success=True,
@@ -126,7 +190,7 @@ class SkillManageTool(BaseTool):
         )
 
     def _load(self, name: str) -> ToolResult:
-        path = self._skills_dir / f"{name}.toml"
+        path = self._skill_path(name)
         if not path.exists():
             return ToolResult(
                 tool_name=self.spec.name,
@@ -136,11 +200,11 @@ class SkillManageTool(BaseTool):
         return ToolResult(
             tool_name=self.spec.name,
             success=True,
-            content=path.read_text(),
+            content=path.read_text(encoding="utf-8"),
         )
 
     def _delete(self, name: str) -> ToolResult:
-        path = self._skills_dir / f"{name}.toml"
+        path = self._skill_path(name)
         if not path.exists():
             return ToolResult(
                 tool_name=self.spec.name,
@@ -153,3 +217,15 @@ class SkillManageTool(BaseTool):
             success=True,
             content=f"Deleted skill: {name}",
         )
+
+    def _skill_path(self, name: str) -> Path:
+        """Resolve a canonical child path or reject traversal/aliases."""
+        if not isinstance(name, str) or not self._SAFE_NAME_RE.fullmatch(name):
+            raise ValueError(
+                "name must contain only letters, digits, underscores, or hyphens"
+            )
+        root = self._skills_dir.resolve(strict=False)
+        candidate = (root / f"{name}.toml").resolve(strict=False)
+        if candidate.parent != root:
+            raise ValueError("skill path escapes the configured skills directory")
+        return candidate

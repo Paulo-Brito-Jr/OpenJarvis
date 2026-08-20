@@ -279,7 +279,10 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
     """Start an interactive Deep Research chat session."""
     from openjarvis.agents.deep_research import DeepResearchAgent
     from openjarvis.connectors.retriever import TwoStageRetriever
+    from openjarvis.core.config import load_config
+    from openjarvis.core.events import EventBus
     from openjarvis.engine.ollama import OllamaEngine
+    from openjarvis.security import setup_security
     from openjarvis.tools.knowledge_search import KnowledgeSearchTool
     from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
     from openjarvis.tools.scan_chunks import ScanChunksTool
@@ -288,6 +291,8 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
     console.print("\n[bold]Setting up Deep Research agent...[/bold]")
 
     # Engine
+    config = load_config()
+    bus = EventBus(record_history=False)
     engine = OllamaEngine()
     if not engine.health():
         console.print(
@@ -305,6 +310,8 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
                 f"Pull it with: [bold]ollama pull {_OLLAMA_MODEL}[/bold]"
             )
             return
+    security = setup_security(config, engine, bus)
+    engine = security.engine
 
     # Tools
     retriever = TwoStageRetriever(store)
@@ -316,11 +323,29 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
     ]
 
     # Agent
+    can_confirm = bool(
+        getattr(
+            security.capability_policy,
+            "enforce_tool_confirmation",
+            True,
+        )
+        and sys.stdin.isatty()
+    )
+
+    def _confirm_tool(prompt: str) -> bool:
+        return click.confirm(prompt, default=False)
+
     agent = DeepResearchAgent(
         engine=engine,
         model=_OLLAMA_MODEL,
         tools=tools,
-        interactive=True,
+        bus=bus,
+        interactive=can_confirm,
+        confirm_callback=_confirm_tool if can_confirm else None,
+    )
+    agent.bind_security(
+        security.capability_policy,
+        "deep-research-setup",
     )
 
     console.print(

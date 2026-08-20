@@ -73,6 +73,15 @@ def _run_research(
     # API server. research_router.py hardcodes OllamaEngine() for the
     # same reason; mirror that here so CLI and HTTP behave identically.
     engine = OllamaEngine()
+    from openjarvis.security import setup_security
+
+    research_security = setup_security(
+        load_config(),
+        engine,
+        EventBus(record_history=False),
+    )
+    engine = research_security.engine
+    research_identity = "cli:research"
 
     chunk_count = store._conn.execute(
         "SELECT COUNT(*) FROM knowledge_chunks"
@@ -161,6 +170,8 @@ def _run_research(
         search=HybridSearch(store, embedder),
         model=planner_model,
         on_event=on_event,
+        capability_policy=research_security.capability_policy,
+        agent_id=research_identity,
     )
 
     started = time.monotonic()
@@ -367,9 +378,10 @@ def _run_agent(
         # the verdict flagged).
         existing = {t.spec.name for t in tools}
         for t in mcp_tools:
-            if t.spec.name not in existing:
-                tools.append(t)
-                existing.add(t.spec.name)
+            if t.spec.name in existing:
+                raise RuntimeError(f"Duplicate tool name rejected: {t.spec.name}")
+            tools.append(t)
+            existing.add(t.spec.name)
 
     # Build agent with appropriate kwargs
     agent_kwargs = {
@@ -380,10 +392,17 @@ def _run_agent(
     if getattr(agent_cls, "accepts_tools", False):
         agent_kwargs["tools"] = tools
         agent_kwargs["max_turns"] = config.agent.max_turns
-        agent_kwargs["interactive"] = True
-        agent_kwargs["confirm_callback"] = lambda prompt: True
-    if capability_policy is not None:
-        agent_kwargs["capability_policy"] = capability_policy
+        if config.security.enforce_tool_confirmation and sys.stdin.isatty():
+
+            def _confirm_tool(prompt: str) -> bool:
+                return click.confirm(prompt, default=False)
+
+            agent_kwargs["interactive"] = True
+            agent_kwargs["confirm_callback"] = _confirm_tool
+        else:
+            # Non-TTY callers cannot provide contemporaneous human approval.
+            # Sensitive tools therefore deny in ToolExecutor.
+            agent_kwargs["interactive"] = False
 
     # Wire the SystemPromptBuilder so SOUL.md / MEMORY.md / USER.md persona
     # files actually reach the model. Only passed to agents whose __init__
@@ -402,6 +421,17 @@ def _run_agent(
         )
 
     agent = agent_cls(engine, model_name, **agent_kwargs)
+    needs_security = bool(
+        getattr(agent_cls, "accepts_tools", False)
+        or getattr(agent_cls, "requires_security_context", False)
+    )
+    if needs_security:
+        bind_security = getattr(agent, "bind_security", None)
+        if not callable(bind_security):
+            raise click.ClickException(
+                f"Agent '{agent_name}' cannot bind the required security policy."
+            )
+        bind_security(capability_policy, agent_name)
     # Hold MCP transports alive for the agent's lifetime — without this
     # reference they'd be garbage-collected when this function returns
     # and the underlying HTTP connections would close mid-execution (#461

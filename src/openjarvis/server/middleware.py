@@ -4,7 +4,92 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["SECURITY_HEADERS", "create_security_middleware"]
+MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class RequestBodyLimitMiddleware:
+    """ASGI request-body cap that also covers chunked uploads."""
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        max_bytes: int = MAX_REQUEST_BODY_BYTES,
+    ) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):  # noqa: ANN001
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                await self._send_error(send, 400, "Invalid Content-Length")
+                return
+            if content_length < 0:
+                await self._send_error(send, 400, "Invalid Content-Length")
+                return
+            if content_length > self.max_bytes:
+                await self._send_error(send, 413, "Request body too large")
+                return
+
+        consumed = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal consumed
+            message = await receive()
+            if message.get("type") == "http.request":
+                consumed += len(message.get("body", b""))
+                if consumed > self.max_bytes:
+                    raise _RequestBodyTooLarge
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _RequestBodyTooLarge:
+            if response_started:
+                raise
+            await self._send_error(send, 413, "Request body too large")
+
+    @staticmethod
+    async def _send_error(send, status: int, detail: str) -> None:  # noqa: ANN001
+        body = ('{"detail":"' + detail + '"}').encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+__all__ = [
+    "MAX_REQUEST_BODY_BYTES",
+    "RequestBodyLimitMiddleware",
+    "SECURITY_HEADERS",
+    "create_security_middleware",
+]
 
 
 def create_security_middleware() -> Any:

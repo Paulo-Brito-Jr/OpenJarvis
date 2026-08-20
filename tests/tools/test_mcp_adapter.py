@@ -7,16 +7,47 @@ import pytest
 from openjarvis.mcp.client import MCPClient
 from openjarvis.mcp.server import MCPServer
 from openjarvis.mcp.transport import InProcessTransport
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.tools._stubs import ToolSpec
 from openjarvis.tools.calculator import CalculatorTool
 from openjarvis.tools.mcp_adapter import MCPToolAdapter, MCPToolProvider
 from openjarvis.tools.think import ThinkTool
 
+_NAMESPACE = "test_server"
+_PROVENANCE = "inprocess:test"
+
+
+def _adapter(client, spec):
+    return MCPToolAdapter(
+        client,
+        spec,
+        namespace=_NAMESPACE,
+        provenance=_PROVENANCE,
+    )
+
+
+def _provider(client):
+    return MCPToolProvider(
+        client,
+        namespace=_NAMESPACE,
+        provenance=_PROVENANCE,
+    )
+
+
+def _server(tools):
+    policy = CapabilityPolicy()
+    policy.grant("mcp-adapter-test", "*", "*")
+    return MCPServer(
+        tools,
+        capability_policy=policy,
+        agent_id="mcp-adapter-test",
+    )
+
 
 @pytest.fixture
 def server():
     """Create an MCP server with calculator and think tools."""
-    return MCPServer([CalculatorTool(), ThinkTool()])
+    return _server([CalculatorTool(), ThinkTool()])
 
 
 @pytest.fixture
@@ -38,9 +69,12 @@ class TestMCPToolAdapter:
                 "properties": {"expression": {"type": "string"}},
             },
         )
-        adapter = MCPToolAdapter(client, spec)
-        assert adapter.spec.name == "calculator"
+        adapter = _adapter(client, spec)
+        assert adapter.spec.name == "mcp__test_server__calculator"
         assert adapter.spec.description == "Evaluate a math expression"
+        assert adapter.spec.requires_confirmation is True
+        assert "mcp:test_server:invoke" in adapter.spec.required_capabilities
+        assert adapter.is_local is False
 
     def test_adapter_execute_success(self, client):
         spec = ToolSpec(
@@ -48,11 +82,12 @@ class TestMCPToolAdapter:
             description="Calculator",
             parameters={},
         )
-        adapter = MCPToolAdapter(client, spec)
+        adapter = _adapter(client, spec)
         result = adapter.execute(expression="2+2")
         assert result.success is True
         assert "4" in result.content
-        assert result.tool_name == "calculator"
+        assert result.tool_name == "mcp__test_server__calculator"
+        assert result.metadata["_taint"]["labels"] == ["external"]
 
     def test_adapter_execute_think(self, client):
         spec = ToolSpec(
@@ -60,7 +95,7 @@ class TestMCPToolAdapter:
             description="Think tool",
             parameters={},
         )
-        adapter = MCPToolAdapter(client, spec)
+        adapter = _adapter(client, spec)
         result = adapter.execute(thought="Let me analyze this.")
         assert result.success is True
         assert "analyze" in result.content
@@ -71,7 +106,7 @@ class TestMCPToolAdapter:
             description="Calculator",
             parameters={},
         )
-        adapter = MCPToolAdapter(client, spec)
+        adapter = _adapter(client, spec)
         result = adapter.execute(expression="1/0")
         assert result.success is True
         assert result.content == "inf"
@@ -82,38 +117,38 @@ class TestMCPToolAdapter:
             description="Does not exist",
             parameters={},
         )
-        adapter = MCPToolAdapter(client, spec)
+        adapter = _adapter(client, spec)
         result = adapter.execute(x="y")
         assert result.success is False
         assert "error" in result.content.lower() or "MCP" in result.content
 
     def test_adapter_tool_id(self, client):
         spec = ToolSpec(name="calculator", description="Calc", parameters={})
-        adapter = MCPToolAdapter(client, spec)
+        adapter = _adapter(client, spec)
         assert adapter.tool_id == "mcp_adapter"
 
 
 class TestMCPToolProvider:
     def test_discover_returns_adapters(self, client):
-        provider = MCPToolProvider(client)
+        provider = _provider(client)
         tools = provider.discover()
         assert len(tools) == 2
         names = {t.spec.name for t in tools}
-        assert "calculator" in names
-        assert "think" in names
+        assert "mcp__test_server__calculator" in names
+        assert "mcp__test_server__think" in names
 
     def test_discovered_tools_are_base_tool(self, client):
         from openjarvis.tools._stubs import BaseTool
 
-        provider = MCPToolProvider(client)
+        provider = _provider(client)
         tools = provider.discover()
         for tool in tools:
             assert isinstance(tool, BaseTool)
 
     def test_discovered_tool_execution(self, client):
-        provider = MCPToolProvider(client)
+        provider = _provider(client)
         tools = provider.discover()
-        calc = next(t for t in tools if t.spec.name == "calculator")
+        calc = next(t for t in tools if t.spec.name == "mcp__test_server__calculator")
         result = calc.execute(expression="3*7")
         assert result.success is True
         assert "21" in result.content
@@ -123,24 +158,24 @@ class TestMCPAdapterRoundTrip:
     """End-to-end: Server → InProcessTransport → Client → Adapter → execute."""
 
     def test_full_round_trip(self):
-        server = MCPServer([CalculatorTool(), ThinkTool()])
+        server = _server([CalculatorTool(), ThinkTool()])
         transport = InProcessTransport(server)
         client = MCPClient(transport)
         client.initialize()
-        provider = MCPToolProvider(client)
+        provider = _provider(client)
         tools = provider.discover()
 
-        calc = next(t for t in tools if t.spec.name == "calculator")
+        calc = next(t for t in tools if t.spec.name == "mcp__test_server__calculator")
         result = calc.execute(expression="10+20")
         assert result.success is True
         assert "30" in result.content
 
     def test_round_trip_error_handling(self):
-        server = MCPServer([CalculatorTool()])
+        server = _server([CalculatorTool()])
         transport = InProcessTransport(server)
         client = MCPClient(transport)
         client.initialize()
-        provider = MCPToolProvider(client)
+        provider = _provider(client)
         tools = provider.discover()
 
         calc = tools[0]
@@ -153,6 +188,22 @@ class TestMCPAdapterRoundTrip:
         transport = InProcessTransport(server)
         client = MCPClient(transport)
         client.initialize()
-        provider = MCPToolProvider(client)
+        provider = _provider(client)
         tools = provider.discover()
         assert tools == []
+
+    def test_duplicate_remote_tool_names_are_rejected(self, client):
+        client.list_tools = lambda: [
+            ToolSpec(name="same", description="", parameters={}),
+            ToolSpec(name="same", description="", parameters={}),
+        ]
+        with pytest.raises(ValueError, match="duplicate"):
+            _provider(client).discover()
+
+    def test_ambiguous_normalized_names_are_rejected(self, client):
+        client.list_tools = lambda: [
+            ToolSpec(name="foo-bar", description="", parameters={}),
+            ToolSpec(name="foo.bar", description="", parameters={}),
+        ]
+        with pytest.raises(ValueError, match="ambiguous"):
+            _provider(client).discover()

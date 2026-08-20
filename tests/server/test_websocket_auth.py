@@ -18,6 +18,7 @@ from starlette.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from openjarvis.core.events import EventBus, EventType  # noqa: E402
+from openjarvis.security.capabilities import CapabilityPolicy  # noqa: E402
 from openjarvis.server.api_routes import include_all_routes  # noqa: E402
 from openjarvis.server.auth_middleware import websocket_authorized  # noqa: E402
 from openjarvis.server.ws_bridge import create_ws_router  # noqa: E402
@@ -31,25 +32,60 @@ def _ws(query=None, headers=None):
 
 
 class TestWebsocketAuthorizedHelper:
-    def test_no_key_allows_all(self):
-        assert websocket_authorized(_ws(), "") is True
+    def test_empty_key_denies(self):
+        assert websocket_authorized(_ws(), "") is False
 
     def test_token_via_query(self):
-        assert websocket_authorized(_ws(query={"token": "sek"}), "sek") is True
+        assert (
+            websocket_authorized(
+                _ws(query={"token": "sek"}),
+                "sek",
+                principal="api:test",
+                allowed_principals={"api:test"},
+            )
+            is True
+        )
 
     def test_token_via_bearer_header(self):
         ws = _ws(headers={"authorization": "Bearer sek"})
-        assert websocket_authorized(ws, "sek") is True
+        assert (
+            websocket_authorized(
+                ws,
+                "sek",
+                principal="api:test",
+                allowed_principals={"api:test"},
+            )
+            is True
+        )
 
     def test_wrong_token_rejected(self):
-        assert websocket_authorized(_ws(query={"token": "nope"}), "sek") is False
+        assert (
+            websocket_authorized(
+                _ws(query={"token": "nope"}),
+                "sek",
+                principal="api:test",
+                allowed_principals={"api:test"},
+            )
+            is False
+        )
 
     def test_missing_token_rejected_when_required(self):
-        assert websocket_authorized(_ws(), "sek") is False
+        assert (
+            websocket_authorized(
+                _ws(),
+                "sek",
+                principal="api:test",
+                allowed_principals={"api:test"},
+            )
+            is False
+        )
 
 
 def _make_app(api_key=""):
     app = FastAPI()
+    principal = "api:test"
+    policy = CapabilityPolicy()
+    policy.grant(principal, "tool:invoke", "/v1/chat/stream")
     engine = MagicMock()
     engine.engine_id = "mock"
 
@@ -61,6 +97,9 @@ def _make_app(api_key=""):
     app.state.engine = engine
     app.state.model = "test-model"
     app.state.api_key = api_key
+    app.state.api_principal = principal
+    app.state.api_principal_allowlist = frozenset({principal})
+    app.state.capability_policy = policy
     include_all_routes(app)
     return app
 
@@ -84,17 +123,41 @@ class TestChatStreamAuth:
             ws.send_text(json.dumps({"message": "hi"}))
             assert ws.receive_json()["type"] in ("chunk", "done", "error")
 
-    def test_allowed_when_no_key_configured(self):
+    def test_rejected_when_no_key_configured(self):
         client = TestClient(_make_app(api_key=""))
-        with client.websocket_connect("/v1/chat/stream") as ws:
-            ws.send_text(json.dumps({"message": "hi"}))
-            assert ws.receive_json()["type"] in ("chunk", "done", "error")
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/v1/chat/stream") as ws:
+                ws.receive_text()
+
+    def test_rejected_without_explicit_capability(self):
+        app = _make_app(api_key="secret")
+        app.state.capability_policy = CapabilityPolicy()
+        client = TestClient(app)
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/v1/chat/stream?token=secret") as ws:
+                ws.receive_text()
+
+    def test_oversized_frame_closes_with_1009(self):
+        from openjarvis.server.input_limits import MAX_WS_FRAME_BYTES
+
+        client = TestClient(_make_app(api_key="secret"))
+        with client.websocket_connect("/v1/chat/stream?token=secret") as ws:
+            ws.send_text("x" * (MAX_WS_FRAME_BYTES + 1))
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
+        assert exc_info.value.code == 1009
 
 
 class TestAgentEventsAuth:
     def _app(self, api_key=""):
         app = FastAPI()
+        principal = "api:test"
+        policy = CapabilityPolicy()
+        policy.grant(principal, "system:admin", "/v1/agents/events")
         app.state.api_key = api_key
+        app.state.api_principal = principal
+        app.state.api_principal_allowlist = frozenset({principal})
+        app.state.capability_policy = policy
         app.include_router(create_ws_router(EventBus()))
         return app
 
@@ -107,9 +170,35 @@ class TestAgentEventsAuth:
     def test_accepted_with_correct_token(self):
         bus = EventBus()
         app = FastAPI()
+        principal = "api:test"
+        policy = CapabilityPolicy()
+        policy.grant(principal, "system:admin", "/v1/agents/events")
         app.state.api_key = "secret"
+        app.state.api_principal = principal
+        app.state.api_principal_allowlist = frozenset({principal})
+        app.state.capability_policy = policy
         app.include_router(create_ws_router(bus))
         client = TestClient(app)
         with client.websocket_connect("/v1/agents/events?token=secret") as ws:
             bus.publish(EventType.AGENT_TICK_START, {"agent_id": "a"})
             assert ws.receive_json()["data"]["agent_id"] == "a"
+
+    def test_rejected_without_explicit_capability(self):
+        app = self._app(api_key="secret")
+        app.state.capability_policy = CapabilityPolicy()
+        client = TestClient(app)
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/v1/agents/events?token=secret") as ws:
+                ws.receive_text()
+
+    def test_oversized_agent_filter_closes_with_1009(self):
+        from openjarvis.server.input_limits import MAX_WS_FILTER_BYTES
+
+        client = TestClient(self._app(api_key="secret"))
+        oversized = "a" * (MAX_WS_FILTER_BYTES + 1)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                f"/v1/agents/events?token=secret&agent_id={oversized}"
+            ) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 1009

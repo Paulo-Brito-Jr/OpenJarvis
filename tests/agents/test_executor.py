@@ -98,7 +98,7 @@ class TestExecutorBasic:
         assert manager.get_agent(agent["id"])["status"] == "error"
         assert len(errors) == 1
 
-    def test_execute_tick_retries_retryable_error(self, executor, manager):
+    def test_execute_tick_does_not_replay_retryable_error(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
         call_count = 0
 
@@ -110,21 +110,20 @@ class TestExecutorBasic:
             return AgentResult(content="success")
 
         with patch.object(executor, "_invoke_agent", side_effect=flaky_invoke):
-            with patch("openjarvis.agents.executor.retry_delay", return_value=0):
-                executor.execute_tick(agent["id"])
+            executor.execute_tick(agent["id"])
 
-        assert call_count == 3
-        assert manager.get_agent(agent["id"])["status"] == "idle"
+        assert call_count == 1
+        assert manager.get_agent(agent["id"])["status"] == "error"
 
-    def test_execute_tick_gives_up_after_max_retries(self, executor, manager):
+    def test_execute_tick_surfaces_retryable_error_once(self, executor, manager):
         agent = manager.create_agent(name="test", agent_type="monitor_operative")
 
         with patch.object(
             executor, "_invoke_agent", side_effect=RetryableError("always fails")
-        ):
-            with patch("openjarvis.agents.executor.retry_delay", return_value=0):
-                executor.execute_tick(agent["id"])
+        ) as invoke:
+            executor.execute_tick(agent["id"])
 
+        invoke.assert_called_once()
         assert manager.get_agent(agent["id"])["status"] == "error"
 
     def test_execute_tick_concurrency_guard(self, executor, manager):

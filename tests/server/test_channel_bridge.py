@@ -17,6 +17,7 @@ from openjarvis.channels._stubs import (
     ChannelStatus,
 )
 from openjarvis.core.events import EventBus
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.server.channel_bridge import ChannelBridge
 from openjarvis.server.session_store import SessionStore
 
@@ -79,7 +80,16 @@ def mock_system():
 
 
 @pytest.fixture
-def bridge(store, bus, mock_system):
+def policy():
+    capability_policy = CapabilityPolicy()
+    principal = ChannelBridge.principal_for("fake", "user1")
+    capability_policy.grant(principal, "system:admin", "*")
+    capability_policy.grant(principal, "tool:invoke", "*")
+    return capability_policy
+
+
+@pytest.fixture
+def bridge(store, bus, mock_system, policy):
     fake = FakeChannel()
     fake.connect()
     b = ChannelBridge(
@@ -87,6 +97,8 @@ def bridge(store, bus, mock_system):
         session_store=store,
         bus=bus,
         system=mock_system,
+        sender_allowlist={"fake": ["user1"]},
+        capability_policy=policy,
     )
     return b
 
@@ -167,6 +179,15 @@ class TestChatRouting:
         mock_system.ask.side_effect = RuntimeError("engine down")
         reply = bridge.handle_incoming("user1", "hello", "fake")
         assert "sorry" in reply.lower() or "couldn't" in reply.lower()
+
+    def test_sender_outside_allowlist_never_reaches_system(
+        self,
+        bridge,
+        mock_system,
+    ):
+        reply = bridge.handle_incoming("attacker", "hello", "fake")
+        assert reply == "Unauthorized sender."
+        mock_system.ask.assert_not_called()
 
 
 class TestResponseFormatting:

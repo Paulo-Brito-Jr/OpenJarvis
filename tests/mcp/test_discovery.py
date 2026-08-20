@@ -12,7 +12,11 @@ from openjarvis.tools._stubs import ToolSpec
 def _make_mock_tool(name: str) -> MagicMock:
     """Create a mock BaseTool with the given name."""
     tool = MagicMock()
-    tool.spec = ToolSpec(name=name, description=f"Mock {name}")
+    tool.spec = ToolSpec(
+        name=name,
+        description=f"Mock {name}",
+        metadata={"mcp": {"remote_name": name}},
+    )
     return tool
 
 
@@ -36,7 +40,6 @@ _PATCH_HTTP = "openjarvis.mcp.transport.StreamableHTTPTransport"
 _PATCH_STDIO = "openjarvis.mcp.transport.StdioTransport"
 _PATCH_CLIENT = "openjarvis.mcp.client.MCPClient"
 _PATCH_PROVIDER = "openjarvis.tools.mcp_adapter.MCPToolProvider"
-_PATCH_LOGGER = "openjarvis.system.builder.logger"
 
 
 class TestDiscoverHTTPServer:
@@ -50,7 +53,7 @@ class TestDiscoverHTTPServer:
         mock_tools = [_make_mock_tool("get_entities"), _make_mock_tool("call_service")]
         mock_provider_cls.return_value.discover.return_value = mock_tools
 
-        cfg = {"name": "ha-mcp", "url": "http://172.16.3.1:9583/mcp"}
+        cfg = {"name": "ha_mcp", "url": "http://172.16.3.1:9583/mcp"}
         result = builder._discover_external_mcp(cfg)
 
         # token=None is now forwarded explicitly (#461) so authenticated
@@ -74,7 +77,7 @@ class TestDiscoverStdioServer:
         mock_tools = [_make_mock_tool("read_file")]
         mock_provider_cls.return_value.discover.return_value = mock_tools
 
-        cfg = {"name": "fs-server", "command": "node", "args": ["server.js", "--stdio"]}
+        cfg = {"name": "fs_server", "command": "node", "args": ["server.js", "--stdio"]}
         result = builder._discover_external_mcp(cfg)
 
         mock_transport_cls.assert_called_once_with(
@@ -85,15 +88,12 @@ class TestDiscoverStdioServer:
 
 
 class TestDiscoverInvalidConfig:
-    @patch(_PATCH_LOGGER)
-    def test_no_url_no_command_returns_empty(self, mock_logger, builder):
-        """Config with neither 'url' nor 'command' should return [] and log warning."""
-        cfg = {"name": "broken-server"}
-        result = builder._discover_external_mcp(cfg)
+    def test_no_url_no_command_is_rejected(self, builder):
+        """An ambiguous transport config must fail closed."""
+        cfg = {"name": "broken_server"}
 
-        assert result == []
-        mock_logger.warning.assert_called_once()
-        assert "neither" in mock_logger.warning.call_args[0][0].lower()
+        with pytest.raises(ValueError, match="exactly one transport"):
+            builder._discover_external_mcp(cfg)
 
 
 class TestToolFiltering:
@@ -175,7 +175,7 @@ class TestClientPersistence:
         mock_provider_cls.return_value.discover.return_value = []
 
         for i in range(3):
-            cfg = {"name": f"server-{i}", "url": f"http://localhost:{8080 + i}/mcp"}
+            cfg = {"name": f"server_{i}", "url": f"http://localhost:{8080 + i}/mcp"}
             builder._discover_external_mcp(cfg)
 
         assert len(builder._mcp_clients) == 3

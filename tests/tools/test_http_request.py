@@ -8,25 +8,28 @@ import httpx
 import pytest
 import respx
 
+import openjarvis.tools.http_request as http_request_module
 from openjarvis.tools.http_request import HttpRequestTool
+
+_REAL_PIN_DESTINATION = HttpRequestTool._pin_destination
 
 
 @pytest.fixture(autouse=True)
-def _force_httpx_fallback():
-    """Patch the Rust HTTP tool so it raises, falling back to httpx.
+def _keep_respx_on_logical_hosts():
+    """Keep legacy respx fixtures deterministic while preserving hop checks."""
 
-    The Rust backend makes real HTTP requests that bypass respx mocks.
-    By making the Rust HttpRequestTool().execute() raise, the tool falls
-    through to the httpx code path where respx interception works.
-    """
-    mock_rust = MagicMock()
-    mock_rust.HttpRequestTool.return_value.execute.side_effect = RuntimeError(
-        "mocked out"
-    )
-    with patch(
-        "openjarvis._rust_bridge.get_rust_module",
-        return_value=mock_rust,
-    ):
+    def _passthrough_pin(self, url):
+        error = http_request_module.check_ssrf(url)
+        if error:
+            raise http_request_module._SSRFRedirectError(error)
+        parsed = httpx.URL(url)
+        host = parsed.host
+        port = parsed.port
+        default_port = 443 if parsed.scheme == "https" else 80
+        host_header = host if port in (None, default_port) else f"{host}:{port}"
+        return url, host_header, host
+
+    with patch.object(HttpRequestTool, "_pin_destination", _passthrough_pin):
         yield
 
 
@@ -39,6 +42,13 @@ class TestHttpRequestTool:
     def test_spec_required_capabilities(self):
         tool = HttpRequestTool()
         assert "network:fetch" in tool.spec.required_capabilities
+
+    def test_mutations_require_extra_capability_and_confirmation(self):
+        tool = HttpRequestTool()
+        assert tool.authorization_capabilities({"method": "GET"}) == ["network:fetch"]
+        assert "network:mutate" in tool.authorization_capabilities({"method": "POST"})
+        assert tool.requires_confirmation_for({"method": "GET"}) is False
+        assert tool.requires_confirmation_for({"method": "POST"}) is True
 
     def test_spec_parameters_require_url(self):
         tool = HttpRequestTool()
@@ -204,7 +214,7 @@ class TestHttpRequestTool:
             ):
                 result = tool.execute(url="https://down.example.com")
         assert result.success is False
-        assert "Request error" in result.content
+        assert result.content == "Request failed."
 
     @respx.mock
     def test_redirect_to_private_ip_blocked(self):
@@ -241,6 +251,114 @@ class TestHttpRequestTool:
         assert result.success is True
         assert "done" in result.content
 
+    def test_cross_origin_redirect_strips_all_credentials(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.host == "public.example.com":
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://other.example.net/final"},
+                )
+            return httpx.Response(200, text="done")
+
+        tool = HttpRequestTool(transport=httpx.MockTransport(handler))
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
+            result = tool.execute(
+                url="https://public.example.com/start",
+                headers={
+                    "Authorization": "Bearer first-origin-only",
+                    "Cookie": "session=first-origin-only",
+                    "X-Api-Key": "first-origin-only",
+                    "Vendor-Access-Token": "first-origin-only",
+                    "X-Skynet-Token": "first-origin-only",
+                    "Private-Token": "first-origin-only",
+                    "X-Harmless": "not-allowlisted",
+                    "Accept-Language": "pt-BR",
+                },
+            )
+
+        assert result.success is True
+        assert len(requests) == 2
+        assert requests[0].headers["authorization"] == ("Bearer first-origin-only")
+        for name in (
+            "authorization",
+            "cookie",
+            "x-api-key",
+            "vendor-access-token",
+            "x-skynet-token",
+            "private-token",
+            "x-harmless",
+        ):
+            assert name not in requests[1].headers
+        assert requests[1].headers["accept-language"] == "pt-BR"
+
+    def test_same_origin_redirect_preserves_credentials(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.path == "/start":
+                return httpx.Response(302, headers={"location": "/final"})
+            return httpx.Response(200, text="done")
+
+        tool = HttpRequestTool(transport=httpx.MockTransport(handler))
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
+            result = tool.execute(
+                url="https://public.example.com/start",
+                headers={
+                    "Authorization": "Bearer same-origin",
+                    "Cookie": "session=same-origin",
+                },
+            )
+
+        assert result.success is True
+        assert len(requests) == 2
+        assert requests[1].headers["authorization"] == "Bearer same-origin"
+        assert requests[1].headers["cookie"] == "session=same-origin"
+
+    def test_scheme_or_port_change_is_cross_origin(self):
+        tool = HttpRequestTool()
+        assert tool._origin("https://example.com/a") == (
+            "https",
+            "example.com",
+            443,
+        )
+        assert tool._origin("https://EXAMPLE.com.:443/b") == (
+            "https",
+            "example.com",
+            443,
+        )
+        assert tool._origin("http://example.com/a") != tool._origin(
+            "https://example.com/a"
+        )
+        assert tool._origin("https://example.com:8443/a") != tool._origin(
+            "https://example.com/a"
+        )
+
+    def test_cross_origin_307_never_replays_mutating_body(self):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                307,
+                headers={"location": "https://other.example.net/final"},
+            )
+
+        tool = HttpRequestTool(transport=httpx.MockTransport(handler))
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
+            result = tool.execute(
+                url="https://public.example.com/start",
+                method="POST",
+                body='{"secret":"must-not-replay"}',
+            )
+
+        assert result.success is False
+        assert "mutating request denied" in result.content
+        assert len(requests) == 1
+
     def test_method_validation(self):
         """Invalid HTTP method should be rejected."""
         tool = HttpRequestTool()
@@ -248,6 +366,30 @@ class TestHttpRequestTool:
         assert result.success is False
         assert "Unsupported HTTP method" in result.content
         assert "TRACE" in result.content
+
+    def test_request_limits_reject_oversized_body_and_headers(self):
+        tool = HttpRequestTool()
+        oversized_body = tool.execute(
+            url="https://example.com",
+            method="POST",
+            body="x" * 262_145,
+        )
+        assert oversized_body.success is False
+        assert "256 KiB" in oversized_body.content
+
+        too_many_headers = tool.execute(
+            url="https://example.com",
+            headers={f"X-Test-{index}": "ok" for index in range(33)},
+        )
+        assert too_many_headers.success is False
+        assert "too many headers" in too_many_headers.content
+
+        oversized_header = tool.execute(
+            url="https://example.com",
+            headers={"X-Test": "x" * 8_193},
+        )
+        assert oversized_header.success is False
+        assert "forbidden or malformed" in oversized_header.content
 
     def test_method_case_insensitive(self):
         """Method should be case-insensitive."""
@@ -305,7 +447,59 @@ class TestHttpRequestTool:
         with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
             result = tool.execute(url="https://api.example.com/data")
         assert isinstance(result.metadata["headers"], dict)
-        assert result.metadata["headers"]["x-request-id"] == "abc123"
+        assert "x-request-id" not in result.metadata["headers"]
+
+    @respx.mock
+    def test_header_environment_variables_are_never_expanded(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("OPENJARVIS_TEST_SECRET", "must-not-leak")
+        route = respx.get("https://api.example.com/data").mock(
+            return_value=httpx.Response(200, text="ok")
+        )
+        tool = HttpRequestTool()
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
+            result = tool.execute(
+                url="https://api.example.com/data",
+                headers={"X-Test": "$OPENJARVIS_TEST_SECRET"},
+            )
+        assert result.success
+        assert route.calls[0].request.headers["x-test"] == ("$OPENJARVIS_TEST_SECRET")
+
+    def test_dns_resolution_is_pinned_to_validated_public_ip(self):
+        resolver = MagicMock(
+            return_value=[
+                (
+                    2,
+                    1,
+                    6,
+                    "",
+                    ("93.184.216.34", 443),
+                )
+            ]
+        )
+        tool = HttpRequestTool(resolver=resolver)
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
+            pinned, host_header, sni = _REAL_PIN_DESTINATION(
+                tool,
+                "https://example.com/path",
+            )
+        assert pinned == "https://93.184.216.34/path"
+        assert host_header == "example.com"
+        assert sni == "example.com"
+
+    def test_dns_rebinding_candidate_blocks_entire_hop(self):
+        resolver = MagicMock(
+            return_value=[
+                (2, 1, 6, "", ("93.184.216.34", 443)),
+                (2, 1, 6, "", ("127.0.0.1", 443)),
+            ]
+        )
+        tool = HttpRequestTool(resolver=resolver)
+        with patch("openjarvis.tools.http_request.check_ssrf", return_value=None):
+            with pytest.raises(http_request_module._SSRFRedirectError):
+                _REAL_PIN_DESTINATION(tool, "https://example.com/")
 
 
 __all__ = ["TestHttpRequestTool"]

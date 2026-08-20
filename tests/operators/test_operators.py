@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
@@ -71,29 +73,149 @@ class FakeMemoryBackend:
 
 
 class FakeSchedulerStore:
-    """Minimal scheduler store stub."""
+    """In-memory scheduler store with durable-copy and CAS semantics."""
 
     def __init__(self) -> None:
         self._tasks: Dict[str, Dict] = {}
         self._runs: List[Dict] = []
 
+    def create_task(self, task_dict: Dict) -> bool:
+        task_id = task_dict["id"]
+        if task_id in self._tasks:
+            return False
+        self._tasks[task_id] = deepcopy(task_dict)
+        return True
+
     def save_task(self, task_dict: Dict) -> None:
-        self._tasks[task_dict["id"]] = task_dict
+        self._tasks[task_dict["id"]] = deepcopy(task_dict)
 
     def get_task(self, task_id: str) -> Optional[Dict]:
-        return self._tasks.get(task_id)
+        task = self._tasks.get(task_id)
+        return deepcopy(task) if task is not None else None
 
     def update_task(self, task_dict: Dict) -> None:
-        self._tasks[task_dict["id"]] = task_dict
+        self._tasks[task_dict["id"]] = deepcopy(task_dict)
 
     def list_tasks(self, *, status=None) -> List[Dict]:
         tasks = list(self._tasks.values())
         if status:
             tasks = [t for t in tasks if t.get("status") == status]
-        return tasks
+        return deepcopy(tasks)
 
     def get_due_tasks(self, now: str) -> List[Dict]:
-        return []
+        return [
+            deepcopy(task)
+            for task in self._tasks.values()
+            if task.get("status") == "active"
+            and task.get("next_run")
+            and task["next_run"] <= now
+            and not task.get("claim_token")
+        ]
+
+    def claim_due_task(self, now: str, claim_token: str) -> Optional[Dict]:
+        for task_id in sorted(self._tasks):
+            task = self._tasks[task_id]
+            if (
+                task.get("status") == "active"
+                and task.get("next_run")
+                and task["next_run"] <= now
+                and not task.get("claim_token")
+            ):
+                return self.claim_task(task_id, claim_token, now)
+        return None
+
+    def claim_task(
+        self,
+        task_id: str,
+        claim_token: str,
+        claimed_at: str,
+    ) -> Optional[Dict]:
+        task = self._tasks.get(task_id)
+        if task is None or task.get("status") != "active" or task.get("claim_token"):
+            return None
+        task["status"] = "running"
+        task["claim_token"] = claim_token
+        task["claim_started_at"] = claimed_at
+        return deepcopy(task)
+
+    def finish_claim(
+        self,
+        task_id: str,
+        claim_token: str,
+        *,
+        status: str,
+        next_run: Optional[str],
+        last_run: str,
+        consent: Dict,
+    ) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("status") != "running"
+            or task.get("claim_token") != claim_token
+        ):
+            return False
+        task.update(
+            {
+                "status": status,
+                "next_run": next_run,
+                "last_run": last_run,
+                "consent": deepcopy(consent),
+                "claim_token": None,
+                "claim_started_at": None,
+            }
+        )
+        return True
+
+    def pause_active_task(self, task_id: str, operator_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("operator_id") != operator_id
+            or task.get("status") != "active"
+            or task.get("claim_token")
+        ):
+            return False
+        task["status"] = "paused"
+        return True
+
+    def resume_paused_task(
+        self,
+        task_id: str,
+        operator_id: str,
+        *,
+        schedule_value: str,
+        next_run: Optional[str],
+    ) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("operator_id") != operator_id
+            or task.get("status") != "paused"
+            or task.get("claim_token")
+        ):
+            return False
+        task.update(
+            {
+                "status": "active",
+                "schedule_value": schedule_value,
+                "next_run": next_run,
+            }
+        )
+        return True
+
+    def cancel_unclaimed_task(self, task_id: str, operator_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if (
+            task is None
+            or task.get("operator_id") != operator_id
+            or task.get("status") not in {"active", "paused", "completed"}
+            or task.get("claim_token")
+        ):
+            return False
+        task["status"] = "cancelled"
+        task["next_run"] = None
+        return True
 
     def log_run(self, **kwargs) -> None:
         self._runs.append(kwargs)
@@ -124,6 +246,35 @@ def _make_system(
     system.memory_backend = memory_backend
     system.operator_manager = None
     return system
+
+
+def _operator_consent() -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "scope": "recurring",
+        "allow_replay": True,
+        "granted_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=1)).isoformat(),
+    }
+
+
+def _make_authorized_operator_manager(store):
+    from openjarvis.operators.manager import OperatorManager
+    from openjarvis.scheduler.scheduler import TaskScheduler
+    from openjarvis.security.capabilities import CapabilityPolicy
+
+    principal = "operator-admin-test"
+    policy = CapabilityPolicy()
+    policy.grant(principal, "schedule:create", "schedule:*")
+    scheduler = TaskScheduler(store, capability_policy=policy)
+    system = _make_system(scheduler=scheduler)
+    manager = OperatorManager(
+        system,
+        scheduler_operator_id=principal,
+        scheduler_capabilities=["schedule:create"],
+        scheduler_consent=_operator_consent(),
+    )
+    return scheduler, manager
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +456,8 @@ name = "Discovered"
         assert mgr.get_manifest("discovered") is not None
 
     def test_activate_creates_scheduler_task(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(
             id="test_op",
@@ -330,13 +476,8 @@ name = "Discovered"
         assert task_dict["agent"] == "operative"
 
     def test_activate_uses_operative_agent(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="ag_test", name="Agent Test")
         mgr.register(m)
@@ -346,13 +487,8 @@ name = "Discovered"
         assert task_dict["agent"] == "operative"
 
     def test_activate_passes_metadata(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(
             id="meta_test",
@@ -370,13 +506,8 @@ name = "Discovered"
         assert meta["temperature"] == 0.5
 
     def test_deactivate(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="deact", name="Deact")
         mgr.register(m)
@@ -387,13 +518,8 @@ name = "Discovered"
         assert task_dict["status"] == "cancelled"
 
     def test_pause_resume(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="pr_test", name="PR")
         mgr.register(m)
@@ -423,13 +549,8 @@ name = "Discovered"
         assert statuses[0]["status"] == "registered"
 
     def test_activate_idempotent(self):
-        from openjarvis.operators.manager import OperatorManager
-        from openjarvis.scheduler.scheduler import TaskScheduler
-
         store = FakeSchedulerStore()
-        scheduler = TaskScheduler(store)
-        system = _make_system(scheduler=scheduler)
-        mgr = OperatorManager(system)
+        _scheduler, mgr = _make_authorized_operator_manager(store)
 
         m = OperatorManifest(id="idem", name="Idem")
         mgr.register(m)
@@ -448,6 +569,23 @@ name = "Discovered"
 
         with pytest.raises(RuntimeError, match="TaskScheduler not available"):
             mgr.activate("no_sched")
+
+    def test_activate_without_authenticated_context_fails_before_mutation(self):
+        from openjarvis.operators.manager import OperatorManager
+
+        scheduler = MagicMock()
+        system = _make_system(scheduler=scheduler)
+        mgr = OperatorManager(system)
+        mgr.register(OperatorManifest(id="blocked", name="Blocked"))
+
+        with pytest.raises(
+            PermissionError,
+            match="authenticated scheduler principal",
+        ):
+            mgr.activate("blocked")
+
+        scheduler.list_tasks.assert_not_called()
+        scheduler.create_task.assert_not_called()
 
     def test_run_once(self):
         from openjarvis.operators.manager import OperatorManager
@@ -779,12 +917,20 @@ class TestSchedulerOperatorExecution:
     def test_execute_task_with_operator_metadata(self):
         """Scheduler passes operator metadata through to system.ask()."""
         from openjarvis.scheduler.scheduler import ScheduledTask, TaskScheduler
+        from openjarvis.security.capabilities import CapabilityPolicy
 
         store = FakeSchedulerStore()
         mock_system = MagicMock()
         mock_system.ask = MagicMock(return_value="Tick result")
+        principal = "operator-admin-test"
+        policy = CapabilityPolicy()
+        policy.grant(principal, "schedule:create", "schedule:*")
 
-        scheduler = TaskScheduler(store, system=mock_system)
+        scheduler = TaskScheduler(
+            store,
+            system=mock_system,
+            capability_policy=policy,
+        )
 
         task = ScheduledTask(
             id="operator:test_op",
@@ -798,6 +944,9 @@ class TestSchedulerOperatorExecution:
                 "system_prompt": "You are a test operator.",
                 "temperature": 0.3,
             },
+            operator_id=principal,
+            capabilities=["schedule:create"],
+            consent=_operator_consent(),
         )
         store.save_task(task.to_dict())
 

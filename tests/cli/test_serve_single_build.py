@@ -94,7 +94,14 @@ def _repopulate_registries() -> None:
                     pass
 
 
-def _run_serve(tmp_path, monkeypatch, *, build_spy, set_system_spy):
+def _run_serve(
+    tmp_path,
+    monkeypatch,
+    *,
+    build_spy,
+    set_system_spy,
+    uvicorn_run=None,
+):
     """Invoke ``jarvis serve`` with all heavy/blocking pieces stubbed out.
 
     Returns the CliRunner result. The server is never actually started
@@ -145,7 +152,7 @@ def _run_serve(tmp_path, monkeypatch, *, build_spy, set_system_spy):
             "openjarvis.agents.executor.AgentExecutor.set_system",
             set_system_spy,
         ),
-        patch("uvicorn.run", lambda *a, **k: None),
+        patch("uvicorn.run", uvicorn_run or (lambda *a, **k: None)),
     ):
         return CliRunner().invoke(cli, ["serve"], catch_exceptions=False)
 
@@ -208,3 +215,55 @@ def test_executor_receives_required_system_attrs(tmp_path, monkeypatch):
     assert system.engine is not None
     assert system.model == "test-model"
     assert system.config is not None
+
+
+def test_request_agent_factory_isolates_agent_bus_tools_and_principal(
+    tmp_path,
+    monkeypatch,
+):
+    """Authenticated API calls get a complete, fresh execution scope."""
+    captured: dict = {}
+
+    def _capture_app(app, *args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        captured["app"] = app
+
+    result = _run_serve(
+        tmp_path,
+        monkeypatch,
+        build_spy=MagicMock(),
+        set_system_spy=MagicMock(),
+        uvicorn_run=_capture_app,
+    )
+
+    assert result.exit_code == 0, result.output
+    app = captured["app"]
+    factory = app.state.request_agent_factory
+    first = factory("api:first")
+    second = factory("api:second")
+
+    assert first.agent is not app.state.agent
+    assert second.agent is not app.state.agent
+    assert first.agent is not second.agent
+    assert first.bus is not app.state.bus
+    assert second.bus is not app.state.bus
+    assert first.bus is not second.bus
+
+    service_tools = app.state.agent._tools
+    first_tools = first.agent._tools
+    second_tools = second.agent._tools
+    assert service_tools
+    assert len(service_tools) == len(first_tools) == len(second_tools)
+    assert all(
+        service is not request_one
+        and service is not request_two
+        and request_one is not request_two
+        for service, request_one, request_two in zip(
+            service_tools,
+            first_tools,
+            second_tools,
+            strict=True,
+        )
+    )
+    assert first.agent._executor._agent_id == "api:first"
+    assert second.agent._executor._agent_id == "api:second"

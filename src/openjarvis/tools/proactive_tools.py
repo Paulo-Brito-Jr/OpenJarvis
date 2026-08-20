@@ -31,11 +31,6 @@ from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 from openjarvis.tools.approval_store import (
-    DECISION_ALWAYS_APPROVE,
-    DECISION_ALWAYS_DENY,
-    STATUS_APPROVED,
-    STATUS_DENIED,
-    STATUS_EXECUTED,
     TIER_HIGH,
     TIER_LOW,
     TIER_MEDIUM,
@@ -49,6 +44,22 @@ from openjarvis.tools.approval_store import (
 # ---------------------------------------------------------------------------
 
 _store: Optional[ApprovalStore] = None
+_DISABLED_REASON = (
+    "Proactive actions are disabled until approval is authenticated, "
+    "digest-bound, and TTL-validated server-side."
+)
+
+
+def _disabled_result(tool_name: str) -> ToolResult:
+    return ToolResult(
+        tool_name=tool_name,
+        success=False,
+        content=_DISABLED_REASON,
+        metadata={
+            "security_disabled": True,
+            "reason": "authenticated_digest_approval_required",
+        },
+    )
 
 
 def get_store() -> ApprovalStore:
@@ -94,6 +105,7 @@ class CheckPermissionTool(BaseTool):
                 "required": ["permission_key"],
             },
             category="proactive",
+            required_capabilities=["memory:read"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -107,6 +119,10 @@ class CheckPermissionTool(BaseTool):
             content=decision,
             metadata={"permission_key": key, "decision": decision},
         )
+
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        key = str(params.get("permission_key", "")).strip()
+        return f"permission:{key or 'unknown'}"
 
 
 # ---------------------------------------------------------------------------
@@ -169,23 +185,17 @@ class QueueActionTool(BaseTool):
                 ],
             },
             category="proactive",
+            requires_confirmation=True,
+            required_capabilities=["memory:write"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
-        store = self._store or get_store()
-        action = store.queue_action(
-            action_type=params["action_type"],
-            description=params["description"],
-            payload=params.get("payload", {}),
-            permission_key=params["permission_key"],
-            tier=params["tier"],
-        )
-        return ToolResult(
-            tool_name=self.spec.name,
-            success=True,
-            content=action.id,
-            metadata={"action_id": action.id, "status": action.status},
-        )
+        del params
+        return _disabled_result(self.spec.name)
+
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        key = str(params.get("permission_key", "")).strip()
+        return f"approval-proposal:{key or 'unknown'}"
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +219,11 @@ class GetPendingActionsTool(BaseTool):
             description="Return all pending actions awaiting user approval as a JSON list.",
             parameters={"type": "object", "properties": {}},
             category="proactive",
+            required_capabilities=["memory:read"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
         store = self._store or get_store()
-        store.expire_stale()
         actions = store.list_pending()
         data = [
             {
@@ -232,6 +242,10 @@ class GetPendingActionsTool(BaseTool):
             content=json.dumps(data, indent=2),
             metadata={"count": len(data)},
         )
+
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        del params
+        return "approval-queue"
 
 
 # ---------------------------------------------------------------------------
@@ -280,48 +294,17 @@ class RecordDecisionTool(BaseTool):
                 "required": ["action_id", "approved"],
             },
             category="proactive",
+            requires_confirmation=True,
+            required_capabilities=["approval:decide"],
         )
 
     def execute(self, **params: Any) -> ToolResult:
-        store = self._store or get_store()
-        action_id = params["action_id"]
-        approved = bool(params.get("approved", False))
-        remember = bool(params.get("remember", False))
-        notes = params.get("notes", "")
+        del params
+        return _disabled_result(self.spec.name)
 
-        action = store.get_action(action_id)
-        if action is None:
-            return ToolResult(
-                tool_name=self.spec.name,
-                success=False,
-                content=f"Action not found: {action_id}",
-            )
-
-        new_status = STATUS_APPROVED if approved else STATUS_DENIED
-        store.update_status(action_id, new_status)
-
-        if remember:
-            decision = DECISION_ALWAYS_APPROVE if approved else DECISION_ALWAYS_DENY
-            store.set_permission(
-                action.permission_key,
-                decision,
-                approved=approved,
-                notes=notes,
-            )
-
-        msg = f"Action {action_id} {'approved' if approved else 'denied'}."
-        if remember:
-            msg += f" Permission '{action.permission_key}' saved as {decision}."
-        return ToolResult(
-            tool_name=self.spec.name,
-            success=True,
-            content=msg,
-            metadata={
-                "action_id": action_id,
-                "approved": approved,
-                "remembered": remember,
-            },
-        )
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        action_id = str(params.get("action_id", "")).strip()
+        return f"approval:{action_id or 'unknown'}"
 
 
 # ---------------------------------------------------------------------------
@@ -364,66 +347,35 @@ class ExecutePendingActionsTool(BaseTool):
                 },
             },
             category="proactive",
+            requires_confirmation=True,
+            required_capabilities=[
+                "approval:decide",
+                "code:execute",
+                "email:write",
+                "calendar:write",
+                "message:send",
+            ],
         )
 
     def execute(self, **params: Any) -> ToolResult:
-        store = self._store or get_store()
-        action_ids: Optional[List[str]] = params.get("action_ids")
+        del params
+        return _disabled_result(self.spec.name)
 
-        if action_ids:
-            actions = [a for a in store.list_approved() if a.id in set(action_ids)]
-        else:
-            actions = store.list_approved()
-
-        results: List[Dict[str, Any]] = []
-        for action in actions:
-            success, message = self._run_action(action)
-            store.update_status(action.id, STATUS_EXECUTED)
-            results.append(
-                {
-                    "id": action.id,
-                    "action_type": action.action_type,
-                    "description": action.description,
-                    "success": success,
-                    "message": message,
-                }
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        raw_ids = params.get("action_ids")
+        if isinstance(raw_ids, list):
+            ids = sorted(
+                str(value).strip()
+                for value in raw_ids
+                if isinstance(value, str) and value.strip()
             )
-
-        return ToolResult(
-            tool_name=self.spec.name,
-            success=True,
-            content=json.dumps(results, indent=2),
-            metadata={"executed": len(results)},
-        )
+            if ids:
+                return "approval-batch:" + ",".join(ids)
+        return "approval-batch:all"
 
     def _run_action(self, action: PendingAction) -> Tuple[bool, str]:
-        if self._executor_fn is not None:
-            try:
-                return self._executor_fn(action)
-            except Exception as exc:
-                return False, str(exc)
-
-        # Built-in dispatcher — extend as connectors grow
-        payload = action.payload
-        atype = action.action_type
-
-        try:
-            if atype == "email_delete":
-                return _exec_email_delete(payload)
-            if atype == "email_archive":
-                return _exec_email_archive(payload)
-            if atype == "sms_send":
-                return _exec_sms_send(payload)
-            if atype == "sms_draft_reply":
-                # Draft only — surface in next digest, don't send
-                return True, f"Draft saved: {payload.get('draft', '')[:80]}"
-            if atype == "calendar_decline":
-                return _exec_calendar_decline(payload)
-            if atype == "calendar_accept":
-                return _exec_calendar_accept(payload)
-            return False, f"No executor registered for action_type '{atype}'"
-        except Exception as exc:
-            return False, str(exc)
+        del action
+        return False, _DISABLED_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -432,75 +384,28 @@ class ExecutePendingActionsTool(BaseTool):
 
 
 def _exec_email_delete(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    msg_id = payload.get("message_id", "")
-    if not msg_id:
-        return False, "Missing message_id in payload"
-    try:
-        from openjarvis.connectors.gmail import GmailConnector
-
-        conn = GmailConnector()
-        conn.delete_message(msg_id)
-        return True, f"Deleted email {msg_id}"
-    except Exception as exc:
-        return False, str(exc)
+    del payload
+    return False, _DISABLED_REASON
 
 
 def _exec_email_archive(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    msg_id = payload.get("message_id", "")
-    if not msg_id:
-        return False, "Missing message_id in payload"
-    try:
-        from openjarvis.connectors.gmail import GmailConnector
-
-        conn = GmailConnector()
-        conn.archive_message(msg_id)
-        return True, f"Archived email {msg_id}"
-    except Exception as exc:
-        return False, str(exc)
+    del payload
+    return False, _DISABLED_REASON
 
 
 def _exec_sms_send(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    contact = payload.get("contact", "")
-    body = payload.get("body", "")
-    if not contact or not body:
-        return False, "Missing contact or body in payload"
-    try:
-        from openjarvis.channels.imessage_daemon import send_imessage
-
-        send_imessage(contact, body)
-        return True, f"Sent iMessage to {contact}"
-    except Exception as exc:
-        return False, str(exc)
+    del payload
+    return False, _DISABLED_REASON
 
 
 def _exec_calendar_decline(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    event_id = payload.get("event_id", "")
-    calendar_id = payload.get("calendar_id", "primary")
-    if not event_id:
-        return False, "Missing event_id in payload"
-    try:
-        from openjarvis.connectors.gcalendar import GCalendarConnector
-
-        conn = GCalendarConnector()
-        conn.decline_event(event_id, calendar_id=calendar_id)
-        return True, f"Declined calendar event {event_id}"
-    except Exception as exc:
-        return False, str(exc)
+    del payload
+    return False, _DISABLED_REASON
 
 
 def _exec_calendar_accept(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    event_id = payload.get("event_id", "")
-    calendar_id = payload.get("calendar_id", "primary")
-    if not event_id:
-        return False, "Missing event_id in payload"
-    try:
-        from openjarvis.connectors.gcalendar import GCalendarConnector
-
-        conn = GCalendarConnector()
-        conn.accept_event(event_id, calendar_id=calendar_id)
-        return True, f"Accepted calendar event {event_id}"
-    except Exception as exc:
-        return False, str(exc)
+    del payload
+    return False, _DISABLED_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -528,50 +433,10 @@ def parse_approval_response(
     Call this from any channel message handler before routing the message
     to the main agent, e.g. inside the iMessage daemon or Telegram bot.
     """
-    s = store or get_store()
-    processed: List[Dict[str, Any]] = []
-
-    # Notification template displays ids as `[abc123]`; users naturally reply
-    # with `{abc123} yes`, `(abc123) yes`, etc.  Strip those surrounding
-    # brackets/braces/parens before regex matching so the word-boundary
-    # check sees a clean id.
-    text = re.sub(r"[\[\]\{\}\(\)]", " ", text)
-
-    for m in _APPROVAL_RE.finditer(text):
-        target = (m.group("target") or m.group("target2") or "").lower()
-        raw_decision = (m.group("decision") or m.group("decision2") or "").lower()
-        always = bool(m.group("always") or m.group("always2"))
-
-        approved = raw_decision in ("yes", "approve")
-
-        if target == "all":
-            pending = s.list_pending()
-            for action in pending:
-                new_status = STATUS_APPROVED if approved else STATUS_DENIED
-                s.update_status(action.id, new_status)
-                if always and action.tier in (TIER_LOW, TIER_MEDIUM):
-                    decision = (
-                        DECISION_ALWAYS_APPROVE if approved else DECISION_ALWAYS_DENY
-                    )
-                    s.set_permission(action.permission_key, decision, approved=approved)
-                processed.append(
-                    {"id": action.id, "approved": approved, "remembered": always}
-                )
-        else:
-            action = s.get_action(target)
-            if action is None:
-                continue
-            new_status = STATUS_APPROVED if approved else STATUS_DENIED
-            s.update_status(target, new_status)
-            remember = always and action.tier in (TIER_LOW, TIER_MEDIUM)
-            if remember:
-                decision = DECISION_ALWAYS_APPROVE if approved else DECISION_ALWAYS_DENY
-                s.set_permission(action.permission_key, decision, approved=approved)
-            processed.append(
-                {"id": target, "approved": approved, "remembered": remember}
-            )
-
-    return processed
+    del text, store
+    # Free text from a channel is neither an authenticated human decision nor
+    # bound to the exact action digest.  It must never mutate approval state.
+    return []
 
 
 __all__ = [

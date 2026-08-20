@@ -1,0 +1,120 @@
+{
+  "agents": [
+    {
+      "agent_id": "orchestrator",
+      "grants": [
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "skynet:casa:read",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "skynet:agenda:read",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://frota/*"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://frota/*"
+        },
+        {
+          "capability": "skynet:frota:read",
+          "pattern": "skynet://frota/*"
+        }
+      ],
+      "deny": [
+        "approval:*",
+        "channel:*",
+        "code:*",
+        "connector:*",
+        "email:*",
+        "file:*",
+        "memory:*",
+        "message:*",
+        "schedule:*",
+        "skynet:casa:approval:*",
+        "skynet:casa:write",
+        "skynet:agenda:reminder:*",
+        "system:*"
+      ]
+    },
+    {
+      "agent_id": "api:l99-desktop",
+      "grants": [
+        {
+          "capability": "tool:invoke",
+          "pattern": "/v1/chat/completions"
+        },
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "skynet:casa:read",
+          "pattern": "skynet://casa/read/*"
+        },
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "skynet:agenda:read",
+          "pattern": "skynet://agenda/busy"
+        },
+        {
+          "capability": "tool:invoke",
+          "pattern": "skynet://frota/*"
+        },
+        {
+          "capability": "network:fetch",
+          "pattern": "skynet://frota/*"
+        },
+        {
+          "capability": "skynet:frota:read",
+          "pattern": "skynet://frota/*"
+        }
+      ],
+      "deny": [
+        "approval:*",
+        "channel:*",
+        "code:*",
+        "connector:*",
+        "email:*",
+        "file:*",
+        "memory:*",
+        "message:*",
+        "schedule:*",
+        "skynet:casa:approval:*",
+        "skynet:casa:write",
+        "skynet:agenda:reminder:*",
+        "system:*"
+      ]
+    }
+  ]
+}

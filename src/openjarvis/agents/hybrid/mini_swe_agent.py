@@ -1,10 +1,11 @@
-"""MiniSWEAgent — vendored, ~330-line port of mini-SWE-agent v2.
+"""MiniSWEAgent — security-disabled legacy mini-SWE-agent v2 port.
 
-Single-LLM agent loop with a ``bash`` tool, run inside a per-task git
-clone. The model iterates: read files, grep, run tests, edit, retry —
-the environment-interaction loop that turns SWE-bench from "predict the
-patch blind" (~0.30) into "actually fix the bug" (~0.77 for frontier
-models).
+The original implementation ran model-authored shell commands in a temporary
+host checkout. A temporary directory is not an isolation boundary, so every
+public and helper execution path now returns a structured denial without
+cloning a repository or starting a subprocess. Re-enable this module only
+after it is wired to a verified isolated sandbox and the shared capability,
+taint, confirmation, and outbound-boundary controls.
 
 Two ways to use this module:
 
@@ -16,31 +17,15 @@ Two ways to use this module:
    Advisors / SkillOrchestra / ToolOrchestra / Archon swap their
    one-shot worker call for a real agent loop when running SWE-bench.
 
-Differences vs. the upstream
-(https://github.com/swe-agent/mini-swe-agent):
-
-- No Docker sandbox. We clone the SWE-bench repo into a tempdir and
-  exec bash there. Network is available (pip etc.). Treat outputs as
-  untrusted — model can run ``rm -rf`` against its own workdir, but the
-  workdir is disposable. Don't run this on a host with secrets in the
-  CWD.
-- One tool, ``bash``. No separate ``submit`` — the loop ends when the
-  model produces a turn with no tool calls. We extract the patch from
-  ``git diff`` in the workdir at that point.
-- Trace events captured via the LocalCloudAgent thread-local trace
-  buffer so every bash invocation + result lands in
-  ``experiments/<cell>/logs/<task_id>.json``.
+The retained provider-loop code is inert defense-in-depth: its shell helper
+also refuses execution, and the public worker entrypoint exits before any
+provider call.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
-import signal
-import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,9 +36,6 @@ from openjarvis.agents.hybrid._base import (
     _bump_cloud_calls,
     _bump_local_calls,
     _record_event,
-)
-from openjarvis.agents.hybrid._prices import (
-    cost as estimate_cost,
 )
 from openjarvis.agents.hybrid._prices import (
     is_gpt5_family,
@@ -168,20 +150,11 @@ def _rewrite_testbed_paths(command: str, workdir: Path) -> str:
 
 
 def _clone_repo(repo: str, base_commit: str, dest: Path) -> None:
-    """Shallow-fetch the SWE-bench repo at the right commit into ``dest``."""
-    url = f"https://github.com/{repo}.git"
-    subprocess.run(
-        ["git", "clone", "--quiet", url, str(dest)],
-        check=True,
-        timeout=300,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "checkout", "--quiet", base_commit],
-        cwd=str(dest),
-        check=True,
-        timeout=120,
-        capture_output=True,
+    """Refuse host-side clone/setup for the disabled legacy SWE loop."""
+    del repo, base_commit, dest
+    raise RuntimeError(
+        "Mini-SWE host workspace setup disabled: verified isolated sandbox "
+        "executor required."
     )
 
 
@@ -215,77 +188,19 @@ def _decode_bash_output(raw: bytes, exit_code: int) -> str:
 def _run_bash(
     command: str, workdir: Path, *, timeout: int = 120, output_cap: int = 10_000
 ) -> Dict[str, Any]:
-    """Run one shell command in ``workdir``. Returns dict with stdout, stderr,
-    exit_code, and a ``truncated`` flag if output was clamped.
-
-    The command is launched in its own process group (``start_new_session``)
-    so a model-issued command that backgrounds a long-lived child (a dev
-    server, ``sleep``, a hung test runner) can be killed *as a tree* on
-    timeout. Plain ``subprocess.run(..., capture_output=True, timeout=...)``
-    only kills the direct child and then re-blocks on ``communicate()``
-    draining the pipe — which a surviving grandchild holds open forever,
-    silently wedging the whole agent loop.
-    """
-    t0 = time.time()
-    command = _rewrite_testbed_paths(command, workdir)
-    # Capture as bytes (no ``text=True``) so a tool invocation that emits
-    # binary output (compiled artifact, image, PDF, gzipped tarball) can't
-    # crash the loop on a strict UTF-8 decode mid-``communicate()``. We
-    # decode below with ``errors="replace"`` and, if the result looks
-    # binary (null byte or >5% replacement chars), substitute a stub so
-    # the model doesn't waste tokens / context on Mojibake.
-    proc = subprocess.Popen(
-        ["bash", "-lc", command],
-        cwd=str(workdir),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout_b, stderr_b = proc.communicate(timeout=timeout)
-        exit_code = proc.returncode
-        timed_out = False
-    except subprocess.TimeoutExpired:
-        # Kill the whole process group so backgrounded grandchildren can't
-        # keep the stdout/stderr pipe open and deadlock the drain below.
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(proc.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                break
-            try:
-                proc.wait(timeout=5)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        try:
-            stdout_b, stderr_b = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            stdout_b, stderr_b = b"", b""
-        stdout_b = stdout_b or b""
-        stderr_b = stderr_b or b""
-        exit_code = -1
-        timed_out = True
-    stdout = _decode_bash_output(stdout_b, exit_code)
-    stderr = _decode_bash_output(stderr_b, exit_code)
-    truncated = False
-    if len(stdout) > output_cap:
-        stdout = (
-            stdout[:output_cap] + f"\n…[+{len(stdout) - output_cap} chars truncated]"
-        )
-        truncated = True
-    if len(stderr) > output_cap:
-        stderr = (
-            stderr[:output_cap] + f"\n…[+{len(stderr) - output_cap} chars truncated]"
-        )
-        truncated = True
+    """Return a structured denial; model-authored shell never reaches host."""
+    del command, workdir, timeout, output_cap
     return {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "truncated": truncated,
-        "latency_s": time.time() - t0,
+        "stdout": "",
+        "stderr": (
+            "Mini-SWE shell execution disabled: verified isolated sandbox "
+            "executor required."
+        ),
+        "exit_code": -1,
+        "timed_out": False,
+        "truncated": False,
+        "latency_s": 0.0,
+        "security_disabled": True,
     }
 
 
@@ -303,15 +218,9 @@ def _format_observation(result: Dict[str, Any]) -> str:
 
 
 def _extract_diff(workdir: Path) -> str:
-    """``git diff`` against the base commit — the final SWE-bench patch."""
-    proc = subprocess.run(
-        ["git", "diff", "--no-color"],
-        cwd=str(workdir),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return proc.stdout
+    """No host workspace exists while the legacy SWE loop is disabled."""
+    del workdir
+    return ""
 
 
 def _anthropic_assistant_block(block: Any) -> Dict[str, Any]:
@@ -388,103 +297,29 @@ def run_swe_agent_loop(
         want to chain multiple subloops over the same working tree can
         manage their own workdir.
     """
-    if bash_timeout_s is not None:
-        bash_timeout = int(bash_timeout_s)
-    repo = task.get("repo") or ""
-    base_commit = task.get("base_commit") or ""
-    if not repo or not base_commit:
-        raise ValueError(
-            f"run_swe_agent_loop needs task['repo'] + task['base_commit']; "
-            f"got repo={repo!r}, base_commit={base_commit!r}"
-        )
-
-    own_workdir = workdir is None
-    if own_workdir:
-        workdir = Path(tempfile.mkdtemp(prefix=f"mini-swe-{task.get('task_id', 'x')}-"))
-        try:
-            _clone_repo(repo, base_commit, workdir)
-        except Exception:
-            shutil.rmtree(workdir, ignore_errors=True)
-            raise
-
-    _record_event(
-        {
-            "kind": f"{trace_prefix}_setup",
-            "repo": repo,
-            "base_commit": base_commit,
-            "workdir": str(workdir),
-            "owns_workdir": own_workdir,
-            "backbone": backbone,
-            "backbone_model": backbone_model,
-            "ts": time.time(),
-        }
-    )
-
-    user_prompt = initial_prompt or task.get("problem_statement") or ""
-
-    try:
-        if backbone == "cloud":
-            result = _loop_cloud(
-                user_prompt,
-                workdir,
-                model=backbone_model,
-                cloud_endpoint=cloud_endpoint,
-                max_turns=max_turns,
-                bash_timeout=bash_timeout,
-                output_cap=output_cap,
-                turn_max_tokens=turn_max_tokens,
-                trace_prefix=trace_prefix,
-            )
-        elif backbone == "local":
-            if not local_endpoint:
-                raise ValueError(
-                    "run_swe_agent_loop(backbone='local') needs local_endpoint"
-                )
-            result = _loop_local(
-                user_prompt,
-                workdir,
-                model=backbone_model,
-                endpoint=local_endpoint,
-                max_turns=max_turns,
-                bash_timeout=bash_timeout,
-                output_cap=output_cap,
-                turn_max_tokens=turn_max_tokens,
-                trace_prefix=trace_prefix,
-                compact_at_tokens=compact_at_tokens,
-                compact_keep_last=compact_keep_last,
-            )
-        else:
-            raise ValueError(f"unsupported backbone: {backbone!r}")
-
-        patch = _extract_diff(workdir)
-        framed = result["final_summary"] or "[mini-swe-agent produced no summary text]"
-        if patch.strip():
-            framed = f"{framed}\n\n```diff\n{patch}```"
-
-        return {
-            "answer": framed,
-            "patch": patch,
-            "final_summary": result["final_summary"],
-            "tokens_in": result["tokens_in"],
-            "tokens_out": result["tokens_out"],
-            "tokens_local": result["tokens_in"] + result["tokens_out"]
-            if backbone == "local"
-            else 0,
-            "tokens_cloud": result["tokens_in"] + result["tokens_out"]
-            if backbone == "cloud"
-            else 0,
-            "cost_usd": (
-                estimate_cost(backbone_model, result["tokens_in"], result["tokens_out"])
-                if backbone == "cloud"
-                else 0.0
-            ),
-            "turns": result["turns"],
-            "max_turns_hit": result["max_turns_hit"],
-            "workdir": str(workdir),
-        }
-    finally:
-        if own_workdir:
-            shutil.rmtree(workdir, ignore_errors=True)
+    # The legacy loop clones repositories and executes model-authored bash on
+    # the host. A temporary directory is not a sandbox: commands can still
+    # read user credentials, reach the network, and modify paths outside the
+    # checkout. Keep the public result shape stable while refusing all host
+    # execution until an isolated executor is explicitly integrated.
+    return {
+        "answer": (
+            "Mini-SWE execution disabled: a verified isolated sandbox "
+            "executor is required."
+        ),
+        "patch": "",
+        "final_summary": "",
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "tokens_local": 0,
+        "tokens_cloud": 0,
+        "cost_usd": 0.0,
+        "turns": 0,
+        "max_turns_hit": False,
+        "workdir": str(workdir) if workdir is not None else "",
+        "security_disabled": True,
+        "reason": "isolated_sandbox_required",
+    }
 
 
 # ---------- Cloud loop (dispatcher → per-endpoint multi-turn tool loops) ----------
@@ -1591,6 +1426,9 @@ class MiniSWEAgent(LocalCloudAgent):
                 "final_summary": out["final_summary"],
             },
         }
+        if out.get("security_disabled"):
+            meta["security_disabled"] = True
+            meta["reason"] = out.get("reason", "isolated_sandbox_required")
         return out["answer"], meta
 
 

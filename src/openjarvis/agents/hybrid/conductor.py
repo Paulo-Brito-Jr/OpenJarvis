@@ -579,6 +579,7 @@ def _call_worker(
     *,
     web_search_tool: Optional[Dict[str, Any]] = None,
     web_search_max_uses: int = 8,
+    action_authorizer: Any = None,
 ) -> Tuple[str, int, int, bool, int, float]:
     """Returns (text, p_tok, c_tok, is_local, n_web_searches, extra_cost).
 
@@ -600,6 +601,7 @@ def _call_worker(
         res = tavily_search_context(
             prompt,
             max_results=int(cfg.get("tavily_max_results", 5)),
+            action_authorizer=action_authorizer,
         )
         prompt = (
             f"Web search results:\n{res['text']}\n\n"
@@ -619,6 +621,7 @@ def _call_worker(
             max_tokens=max_tok,
             temperature=temp,
             enable_thinking=False,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, True, tavily_searches, extra_cost
     if ep == "openai":
@@ -628,6 +631,7 @@ def _call_worker(
                 user=prompt,
                 max_tokens=max_tok,
                 temperature=(1.0 if is_gpt5_family(worker["model"]) else temp),
+                action_authorizer=action_authorizer,
             )
             return text, p, c, False, n_searches, 0.0
         text, p, c = LocalCloudAgent._call_openai(
@@ -635,6 +639,7 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=(1.0 if is_gpt5_family(worker["model"]) else temp),
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, tavily_searches, extra_cost
     if ep == "openrouter":
@@ -651,6 +656,7 @@ def _call_worker(
             max_tokens=max_tok,
             temperature=temp,
             extra_body=extra_body if isinstance(extra_body, dict) else None,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, tavily_searches, extra_cost
     if ep == "anthropic":
@@ -659,6 +665,7 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=eff_temp,
+            action_authorizer=action_authorizer,
         )
         if web_search_tool is not None:
             anthropic_kwargs["tools"] = [web_search_tool]
@@ -676,6 +683,7 @@ def _call_worker(
                 user=prompt,
                 max_tokens=max_tok,
                 temperature=temp,
+                action_authorizer=action_authorizer,
             )
             return text, p, c, False, n_searches, 0.0
         text, p, c = LocalCloudAgent._call_gemini(
@@ -683,6 +691,7 @@ def _call_worker(
             user=prompt,
             max_tokens=max_tok,
             temperature=temp,
+            action_authorizer=action_authorizer,
         )
         return text, p, c, False, tavily_searches, extra_cost
     raise ValueError(f"unsupported worker endpoint: {ep!r}")
@@ -695,6 +704,8 @@ def _swe_worker_step(
     cfg: Dict[str, Any],
     workdir: Path,
     step_idx: int,
+    *,
+    action_authorizer: Any = None,
 ) -> Tuple[str, int, int, bool, int, int]:
     """Run one Conductor worker step as a mini-SWE-agent subloop on a shared
     workdir. Returns (final_summary_or_diff, tokens_in, tokens_out, is_local,
@@ -723,7 +734,12 @@ def _swe_worker_step(
         # backbones today (the loop's tool-call format is Anthropic- or
         # OpenAI-via-vllm-shaped only). Fall back to one-shot for those —
         # SWE-bench-wise they were already weak; this preserves behavior.
-        text, p, c, is_local, n_searches, _extra = _call_worker(worker, prompt, cfg)
+        text, p, c, is_local, n_searches, _extra = _call_worker(
+            worker,
+            prompt,
+            cfg,
+            action_authorizer=action_authorizer,
+        )
         return text, p, c, is_local, n_searches, 0
     out = run_swe_agent_loop(
         task,
@@ -990,6 +1006,7 @@ class ConductorAgent(LocalCloudAgent):
                             cfg,
                             shared_workdir,
                             i,
+                            action_authorizer=self._action_authorizer,
                         )
                     )
                     tool_calls += bash_turns
@@ -1001,6 +1018,7 @@ class ConductorAgent(LocalCloudAgent):
                             cfg,
                             web_search_tool=ws_tool,
                             web_search_max_uses=ws_max_uses,
+                            action_authorizer=self._action_authorizer,
                         )
                     )
 

@@ -43,18 +43,40 @@ def run_slack_daemon(
     bot_token: str,
     app_token: str,
     model: str = "qwen3.5:9b",
+    *,
+    agent_id: str = "",
+    allowed_sender_ids: list[str] | None = None,
 ) -> None:
     """Run the Slack daemon (blocking). Handles DMs with DeepResearch."""
+    raise RuntimeError(
+        "Slack daemon is disabled until every request is bound to the "
+        "authenticated sender principal"
+    )
+
     import threading
 
     from slack_bolt import App
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     from openjarvis.agents.deep_research import DeepResearchAgent
+    from openjarvis.core.config import load_config
+    from openjarvis.core.events import EventBus
     from openjarvis.engine.ollama import OllamaEngine
+    from openjarvis.security import setup_security
     from openjarvis.server.agent_manager_routes import (
         _build_deep_research_tools,
     )
+    from openjarvis.server.channel_bridge import ChannelBridge
+
+    allowed_senders = frozenset(
+        sender.strip()
+        for sender in (allowed_sender_ids or [])
+        if isinstance(sender, str) and sender.strip()
+    )
+    if not agent_id.strip():
+        raise RuntimeError("Slack daemon requires an explicit agent identity")
+    if not allowed_senders:
+        raise RuntimeError("Slack daemon requires an explicit sender allowlist")
 
     # Write PID
     pid_path = Path(_PID_FILE)
@@ -62,13 +84,23 @@ def run_slack_daemon(
     pid_path.write_text(str(os.getpid()))
 
     # Build agent
+    config = load_config()
+    bus = EventBus(record_history=False)
     engine = OllamaEngine()
+    security = setup_security(config, engine, bus)
+    engine = security.engine
     tools = _build_deep_research_tools(engine=engine, model=model)
     agent = DeepResearchAgent(
         engine=engine,
         model=model,
         tools=tools,
+        bus=bus,
         max_turns=5,
+    )
+    agent.bind_security(
+        security.capability_policy,
+        agent_id,
+        security.boundary_guard,
     )
     logger.info("Slack daemon: agent ready with %d tools", len(tools))
 
@@ -79,11 +111,25 @@ def run_slack_daemon(
     @app.event("message")
     def handle_dm(event: dict, say: Any) -> None:
         text = event.get("text", "")
-        if not text:
+        sender_id = event.get("user", "")
+        if (
+            not text
+            or event.get("bot_id")
+            or event.get("subtype")
+            or sender_id not in allowed_senders
+        ):
+            return
+        principal = ChannelBridge.principal_for("slack", sender_id)
+        if not security.capability_policy.check(
+            principal,
+            "tool:invoke",
+            "agent:deep_research",
+        ):
+            logger.warning("Rejected unauthorized Slack sender")
             return
 
         ts = event.get("ts", "")
-        logger.info("Slack DM: %s", text[:60])
+        logger.info("Slack DM accepted (%d chars)", len(text))
 
         say(text="Message received! Working on it now...", thread_ts=ts)
         processing.set()
@@ -109,8 +155,8 @@ def run_slack_daemon(
             result = agent.run(text)
             reply = _to_slack_fmt(result.content or "No results found.")
         except Exception as exc:
-            reply = f"Error: {exc}"
-            logger.error("Slack daemon error: %s", exc)
+            reply = "Sorry, I couldn't process that request."
+            logger.error("Slack daemon error: %s", type(exc).__name__)
         finally:
             processing.clear()
             stop.set()
@@ -139,30 +185,17 @@ def start_slack_daemon(
     bot_token: str,
     app_token: str,
     model: str = "qwen3.5:9b",
+    *,
+    agent_id: str = "",
+    allowed_sender_ids: list[str] | None = None,
 ) -> int:
     """Spawn the Slack daemon as a background subprocess.
 
     Returns the PID of the spawned process.
     """
-    import subprocess
-
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "openjarvis.channels.slack_daemon",
-            "--bot-token",
-            bot_token,
-            "--app-token",
-            app_token,
-            "--model",
-            model,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    raise RuntimeError(
+        "Slack daemon is disabled; credentials will not be placed in process arguments"
     )
-    return proc.pid
 
 
 def is_running() -> bool:
@@ -195,21 +228,6 @@ def stop_daemon() -> bool:
 
 
 if __name__ == "__main__":
-    import argparse
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(message)s",
-    )
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bot-token", required=True)
-    parser.add_argument("--app-token", required=True)
-    parser.add_argument("--model", default="qwen3.5:9b")
-    args = parser.parse_args()
-
-    run_slack_daemon(
-        bot_token=args.bot_token,
-        app_token=args.app_token,
-        model=args.model,
+    raise SystemExit(
+        "Slack daemon is disabled until sender-scoped execution is available"
     )

@@ -14,6 +14,7 @@ from openjarvis.core.types import (
     Message,
     Role,
 )
+from openjarvis.security.capabilities import CapabilityPolicy
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +69,25 @@ def _simple_response(content, model="test-model"):
     }
 
 
+def _bind_tool_agent(agent, agent_id: str):
+    policy = CapabilityPolicy()
+    policy.grant(agent_id, "*", "*")
+    agent.bind_security(policy, agent_id)
+    return agent
+
+
+def _mcp_server(tools):
+    from openjarvis.mcp.server import MCPServer
+
+    policy = CapabilityPolicy()
+    policy.grant("integration-mcp", "*", "*")
+    return MCPServer(
+        tools,
+        capability_policy=policy,
+        agent_id="integration-mcp",
+    )
+
+
 # ---------------------------------------------------------------------------
 # ReAct pipeline integration
 # ---------------------------------------------------------------------------
@@ -97,6 +117,7 @@ class TestReActPipeline:
             tools=[CalculatorTool()],
             bus=bus,
         )
+        _bind_tool_agent(agent, "integration-react-calculator")
         result = agent.run("What is 2+2?")
 
         assert isinstance(result, AgentResult)
@@ -126,6 +147,7 @@ class TestReActPipeline:
             "test-model",
             tools=[ThinkTool()],
         )
+        _bind_tool_agent(agent, "integration-react-think")
         result = agent.run("Analyze this.")
         assert result.turns == 2
         assert result.tool_results[0].success is True
@@ -174,7 +196,7 @@ class TestReActPipeline:
 class TestOpenHandsPipeline:
     """End-to-end: OpenHands agent with code execution."""
 
-    def test_openhands_code_execution_e2e(self):
+    def test_openhands_code_execution_requires_isolated_sandbox(self, monkeypatch):
         _register_all()
         from openjarvis.agents.native_openhands import NativeOpenHandsAgent
         from openjarvis.tools.code_interpreter import (
@@ -189,21 +211,33 @@ class TestOpenHandsPipeline:
 
         responses = [
             _simple_response("I'll calculate this:\n```python\nprint(2 + 2)\n```"),
-            _simple_response("The result is 4."),
+            _simple_response(
+                "Execution was denied because no isolated sandbox is configured."
+            ),
         ]
         engine = _make_engine(responses)
+        monkeypatch.setattr(
+            "openjarvis.tools._stubs.sys.stdin.isatty",
+            lambda: True,
+        )
         agent = NativeOpenHandsAgent(
             engine,
             "test-model",
             tools=[CodeInterpreterTool()],
+            interactive=True,
+            confirm_callback=lambda _prompt: True,
         )
+        _bind_tool_agent(agent, "integration-openhands")
         result = agent.run("What is 2+2?")
 
         assert isinstance(result, AgentResult)
         assert result.turns == 2
         assert len(result.tool_results) == 1
-        # The code_interpreter actually runs print(2+2)
-        assert "4" in result.tool_results[0].content
+        tool_result = result.tool_results[0]
+        assert tool_result.success is False
+        assert tool_result.metadata["security_disabled"] is True
+        assert tool_result.metadata["reason"] == "isolated_sandbox_required"
+        assert "isolated sandbox" in tool_result.content
 
     def test_openhands_direct_answer(self):
         """OpenHands returns directly when no code is needed."""
@@ -245,13 +279,12 @@ class TestMCPIntegration:
 
     def test_mcp_server_with_all_tools(self):
         from openjarvis.mcp.client import MCPClient
-        from openjarvis.mcp.server import MCPServer
         from openjarvis.mcp.transport import InProcessTransport
         from openjarvis.tools.calculator import CalculatorTool
         from openjarvis.tools.think import ThinkTool
 
         tools = [CalculatorTool(), ThinkTool()]
-        server = MCPServer(tools)
+        server = _mcp_server(tools)
         transport = InProcessTransport(server)
         client = MCPClient(transport)
 
@@ -285,11 +318,10 @@ class TestMCPIntegration:
     def test_mcp_unknown_tool_error(self):
         from openjarvis.mcp.client import MCPClient
         from openjarvis.mcp.protocol import MCPError
-        from openjarvis.mcp.server import MCPServer
         from openjarvis.mcp.transport import InProcessTransport
         from openjarvis.tools.calculator import CalculatorTool
 
-        server = MCPServer([CalculatorTool()])
+        server = _mcp_server([CalculatorTool()])
         client = MCPClient(InProcessTransport(server))
         client.initialize()
 
@@ -301,11 +333,10 @@ class TestMCPIntegration:
     def test_mcp_roundtrip_lifecycle(self):
         """Full lifecycle: init -> list -> call -> result."""
         from openjarvis.mcp.client import MCPClient
-        from openjarvis.mcp.server import MCPServer
         from openjarvis.mcp.transport import InProcessTransport
         from openjarvis.tools.calculator import CalculatorTool
 
-        server = MCPServer([CalculatorTool()])
+        server = _mcp_server([CalculatorTool()])
         client = MCPClient(InProcessTransport(server))
 
         # 1. Initialize
@@ -376,6 +407,10 @@ class TestCrossEngineConsistency:
                 "test-model",
                 tools=[CalculatorTool()],
             )
+            _bind_tool_agent(
+                agent,
+                f"integration-cross-engine-{engine_name}",
+            )
             result = agent.run("What is 3*3?")
             assert result.content == "9"
             tr = result.tool_results[0]
@@ -392,7 +427,11 @@ class TestMemoryPipeline:
     """Index and retrieve across available backends."""
 
     def test_sqlite_index_and_retrieve(self, tmp_path):
+        from openjarvis._rust_bridge import RUST_AVAILABLE
         from openjarvis.tools.storage.sqlite import SQLiteMemory
+
+        if not RUST_AVAILABLE:
+            pytest.skip("requires the native openjarvis_rust extension")
 
         backend = SQLiteMemory(db_path=str(tmp_path / "mem.db"))
         backend.store(

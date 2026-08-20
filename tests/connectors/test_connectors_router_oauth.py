@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterator
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -113,12 +114,37 @@ def hermetic_connectors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
 
 @pytest.fixture()
 def client(hermetic_connectors: Path) -> Iterator[TestClient]:
+    from openjarvis.security.capabilities import CapabilityPolicy
     from openjarvis.server.connectors_router import create_connectors_router
 
     app = FastAPI()
+    policy = CapabilityPolicy()
+    policy.grant(
+        "api:test",
+        "system:admin",
+        "/v1/connectors/*/oauth/start",
+    )
+    app.state.capability_policy = policy
+
+    @app.middleware("http")
+    async def authenticated_test_principal(request, call_next):
+        request.state.api_principal = "api:test"
+        return await call_next(request)
+
     app.include_router(create_connectors_router())
     with TestClient(app) as c:
         yield c
+
+
+def _start_oauth(client: TestClient) -> str:
+    response = client.get(
+        "/v1/connectors/gdrive/oauth/start",
+        follow_redirects=False,
+    )
+    assert response.status_code in (302, 307), response.text
+    state = parse_qs(urlparse(response.headers["location"]).query).get("state")
+    assert state and state[0]
+    return state[0]
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +227,7 @@ def test_oauth_start_redirects_to_consent(
     assert _CLIENT_ID in location
     # redirect_uri must point back at OUR in-process callback.
     assert "oauth%2Fcallback" in location or "oauth/callback" in location
+    assert parse_qs(urlparse(location).query).get("state")
 
 
 def test_oauth_start_without_creds_returns_400(client: TestClient) -> None:
@@ -220,6 +247,7 @@ def test_oauth_callback_exchanges_and_connects(
     import openjarvis.connectors.oauth as oauth_mod
 
     client.post("/v1/connectors/gdrive/connect", json={"code": _CLIENT_PAIR})
+    state = _start_oauth(client)
 
     fake_tokens = {
         "access_token": "ya29.REAL",
@@ -228,7 +256,10 @@ def test_oauth_callback_exchanges_and_connects(
         "expires_in": 3600,
     }
     with patch.object(oauth_mod, "_exchange_token", return_value=fake_tokens) as ex:
-        resp = client.get("/v1/connectors/gdrive/oauth/callback?code=authcode123")
+        resp = client.get(
+            "/v1/connectors/gdrive/oauth/callback",
+            params={"code": "authcode123", "state": state},
+        )
 
     assert resp.status_code == 200, resp.text
     assert "Connected!" in resp.text
@@ -251,9 +282,14 @@ def test_oauth_callback_exchanges_and_connects(
 
 
 def test_oauth_callback_error_param_renders_failure(client: TestClient) -> None:
-    resp = client.get("/v1/connectors/gdrive/oauth/callback?error=access_denied")
+    client.post("/v1/connectors/gdrive/connect", json={"code": _CLIENT_PAIR})
+    state = _start_oauth(client)
+    resp = client.get(
+        "/v1/connectors/gdrive/oauth/callback",
+        params={"error": "access_denied", "state": state},
+    )
     assert resp.status_code == 400
-    assert "access_denied" in resp.text
+    assert "provider denied authorization" in resp.text
 
 
 def test_oauth_callback_exchange_failure_renders_error(
@@ -262,12 +298,33 @@ def test_oauth_callback_exchange_failure_renders_error(
     import openjarvis.connectors.oauth as oauth_mod
 
     client.post("/v1/connectors/gdrive/connect", json={"code": _CLIENT_PAIR})
+    state = _start_oauth(client)
 
     def _boom(*_a: Any, **_k: Any) -> dict[str, Any]:
         raise RuntimeError("token endpoint 400")
 
     with patch.object(oauth_mod, "_exchange_token", side_effect=_boom):
-        resp = client.get("/v1/connectors/gdrive/oauth/callback?code=bad")
+        resp = client.get(
+            "/v1/connectors/gdrive/oauth/callback",
+            params={"code": "bad", "state": state},
+        )
 
     assert resp.status_code == 500
     assert "Token Exchange Failed" in resp.text
+    assert "token endpoint 400" not in resp.text
+
+
+def test_oauth_callback_without_state_is_rejected_before_exchange(
+    client: TestClient,
+) -> None:
+    import openjarvis.connectors.oauth as oauth_mod
+
+    client.post("/v1/connectors/gdrive/connect", json={"code": _CLIENT_PAIR})
+    with patch.object(oauth_mod, "_exchange_token") as exchange:
+        resp = client.get(
+            "/v1/connectors/gdrive/oauth/callback",
+            params={"code": "authcode123"},
+        )
+
+    assert resp.status_code == 403
+    exchange.assert_not_called()

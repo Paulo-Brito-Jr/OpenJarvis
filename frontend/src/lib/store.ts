@@ -70,9 +70,8 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 interface Settings {
   theme: ThemeMode;
   apiUrl: string;
-  // Local server API key (OPENJARVIS_API_KEY). Sent as a Bearer token on
-  // /v1 + /api requests so a key-protected `jarvis serve` doesn't 401 the
-  // frontend (#266). Empty = no auth header (keyless local default).
+  // Ephemeral input only. The canonical desktop value lives in Keychain and
+  // the active Bearer token lives only in module memory.
   apiKey: string;
   fontSize: 'small' | 'default' | 'large';
   defaultModel: string;
@@ -97,14 +96,18 @@ function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return defaults;
-    return { ...defaults, ...JSON.parse(raw) };
+    const persisted = JSON.parse(raw) as Partial<Settings>;
+    delete persisted.apiKey;
+    return { ...defaults, ...persisted, apiKey: '' };
   } catch {
     return defaults;
   }
 }
 
 function saveSettings(settings: Settings): void {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  const persisted: Partial<Settings> = { ...settings };
+  delete persisted.apiKey;
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(persisted));
 }
 
 // ── Store ─────────────────────────────────────────────────────────────

@@ -23,9 +23,20 @@ def _log_task_exception(task: asyncio.Task) -> None:
     if exc is not None:
         logger.error(
             "Background message handling failed: %s",
-            exc,
-            exc_info=exc,
+            type(exc).__name__,
         )
+
+
+def _sender_allowed(bridge: Any, channel: str, sender: str) -> bool:
+    """Fail closed unless a real bridge explicitly allowlists the sender."""
+    checker = getattr(bridge, "is_sender_allowed", None)
+    if not callable(checker):
+        return False
+    try:
+        return checker(channel, sender) is True
+    except Exception:
+        logger.exception("Sender allowlist check failed")
+        return False
 
 
 def _validate_twilio_signature(
@@ -136,6 +147,8 @@ def create_webhook_router(
             "channel_bridge",
             None,
         )
+        if not _sender_allowed(active_bridge, "twilio", from_number):
+            return Response("Sender not authorized", status_code=403)
 
         def _handle_twilio() -> None:
 
@@ -218,6 +231,33 @@ def create_webhook_router(
                             tools=tools,
                             max_turns=5,
                         )
+                        bind_security = getattr(
+                            agent,
+                            "bind_security",
+                            None,
+                        )
+                        if not callable(bind_security):
+                            raise RuntimeError(
+                                "Twilio fallback agent cannot bind security"
+                            )
+                        bind_security(
+                            getattr(
+                                request.app.state,
+                                "capability_policy",
+                                None,
+                            ),
+                            getattr(
+                                request.app.state,
+                                "agent_name",
+                                "",
+                            )
+                            or "",
+                            getattr(
+                                request.app.state,
+                                "boundary_guard",
+                                None,
+                            ),
+                        )
                         result = agent.run(body)
                         response = result.content or ""
                 except Exception as _exc:
@@ -276,10 +316,19 @@ def create_webhook_router(
         handle = data.get("handle", {})
         sender = handle.get("address", "")
         text = data.get("text", "")
+        active_bridge = bridge or getattr(
+            request.app.state,
+            "channel_bridge",
+            None,
+        )
+        if not sender or not text:
+            return Response("OK", status_code=200)
+        if not _sender_allowed(active_bridge, "bluebubbles", sender):
+            return Response("Sender not authorized", status_code=403)
 
         task = asyncio.create_task(
             asyncio.to_thread(
-                bridge.handle_incoming,
+                active_bridge.handle_incoming,
                 sender,
                 text,
                 "bluebubbles",
@@ -330,6 +379,12 @@ def create_webhook_router(
             return Response("Invalid signature", status_code=403)
 
         payload = json.loads(body_bytes)
+        active_bridge = bridge or getattr(
+            request.app.state,
+            "channel_bridge",
+            None,
+        )
+        pending_messages: list[tuple[str, str]] = []
         for entry in payload.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
@@ -338,16 +393,27 @@ def create_webhook_router(
                         continue
                     sender = message.get("from", "")
                     text = message.get("text", {}).get("body", "")
-
-                    task = asyncio.create_task(
-                        asyncio.to_thread(
-                            bridge.handle_incoming,
-                            sender,
-                            text,
-                            "whatsapp",
+                    if not _sender_allowed(
+                        active_bridge,
+                        "whatsapp",
+                        sender,
+                    ):
+                        return Response(
+                            "Sender not authorized",
+                            status_code=403,
                         )
-                    )
-                    task.add_done_callback(_log_task_exception)
+                    pending_messages.append((sender, text))
+
+        for sender, text in pending_messages:
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    active_bridge.handle_incoming,
+                    sender,
+                    text,
+                    "whatsapp",
+                )
+            )
+            task.add_done_callback(_log_task_exception)
 
         return Response("OK", status_code=200)
 
@@ -388,7 +454,9 @@ def create_webhook_router(
 
         if not active_bridge:
             logger.warning("No channel bridge — cannot process SendBlue msg")
-            return Response("OK", status_code=200)
+            return Response("Sender authorization unavailable", status_code=503)
+        if not _sender_allowed(active_bridge, "sendblue", from_number):
+            return Response("Sender not authorized", status_code=403)
 
         # Message queue tracking (per-sender)
         _sendblue_queues = getattr(request.app.state, "_sendblue_queues", None)

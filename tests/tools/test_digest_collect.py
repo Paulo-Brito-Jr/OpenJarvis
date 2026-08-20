@@ -46,6 +46,16 @@ def test_digest_collect_executes():
     assert "[gmail id=test-1] From: alice@example.com" in result.content
     assert "Team standup" in result.content
     assert result.metadata["total_items"] == 1
+    assert result.metadata["_taint"] == {"labels": ["external"]}
+    assert tool.is_local is False
+    assert set(tool.spec.required_capabilities) == {
+        "memory:read",
+        "network:fetch",
+    }
+    assert (
+        tool.authorization_resource({"sources": ["gmail", "gcalendar", "gmail"]})
+        == "connectors:gcalendar,gmail"
+    )
 
 
 def test_digest_collect_missing_connector():

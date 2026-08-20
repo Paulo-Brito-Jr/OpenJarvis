@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
+from openjarvis.tools._execution_context import _authorized_resource
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # Maximum file size to write (10 MB)
@@ -72,9 +73,16 @@ class FileWriteTool(BaseTool):
             resolved == d or resolved.is_relative_to(d) for d in self._allowed_dirs
         )
 
+    def authorization_resource(self, params: dict[str, Any]) -> str:
+        """Reject invalid paths instead of falling back to a tool-wide grant."""
+        file_path = params.get("path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError("path must be a non-empty string")
+        return super().authorization_resource(params)
+
     def execute(self, **params: Any) -> ToolResult:
         file_path = params.get("path", "")
-        if not file_path:
+        if not isinstance(file_path, str) or not file_path.strip():
             return ToolResult(
                 tool_name="file_write",
                 content="No path provided.",
@@ -97,9 +105,19 @@ class FileWriteTool(BaseTool):
                 success=False,
             )
 
+        resource = _authorized_resource(self.spec.name, file_path)
+        if resource is None:
+            return ToolResult(
+                tool_name="file_write",
+                content=(
+                    "Security block: authenticated ToolExecutor dispatch required."
+                ),
+                success=False,
+            )
+
         create_dirs = params.get("create_dirs", False)
 
-        path = Path(file_path)
+        path = Path(resource)
 
         # Block sensitive files (secrets, credentials, keys)
         from openjarvis.security.file_policy import is_sensitive_file
@@ -153,20 +171,8 @@ class FileWriteTool(BaseTool):
 
         if mode == "write":
             try:
-                from openjarvis._rust_bridge import get_rust_module
-
-                _rust = get_rust_module()
-                _rust.FileWriteTool().execute(str(path), content)
-            except ImportError:
-                try:
-                    path.write_text(content, encoding="utf-8")
-                except OSError as exc:
-                    return ToolResult(
-                        tool_name="file_write",
-                        content=f"Write error: {exc}",
-                        success=False,
-                    )
-            except Exception as exc:
+                path.write_text(content, encoding="utf-8")
+            except OSError as exc:
                 return ToolResult(
                     tool_name="file_write",
                     content=f"Write error: {exc}",

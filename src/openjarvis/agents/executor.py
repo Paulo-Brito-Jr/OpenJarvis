@@ -12,7 +12,6 @@ from openjarvis.agents.errors import (
     EscalateError,
     FatalError,
     classify_error,
-    retry_delay,
 )
 from openjarvis.core.events import EventBus, EventType
 
@@ -20,8 +19,6 @@ if TYPE_CHECKING:
     from openjarvis.agents.manager import AgentManager
 
 logger = logging.getLogger(__name__)
-
-_MAX_RETRIES = 3
 
 # Default model for monitor_operative / long-horizon agent ticks. qwen3:8b
 # emits tool_calls but, when given the full MonitorOperative system prompt
@@ -31,6 +28,65 @@ _MAX_RETRIES = 3
 # actually invokes web_search / memory_retrieve. Explicit ``config["model"]``
 # on an agent still wins.
 _AGENT_TICK_DEFAULT_MODEL = "gemma4:31b"
+
+
+def _bind_agent_security(
+    agent: Any,
+    capability_policy: Any,
+    agent_id: str,
+    boundary_guard: Any,
+    *,
+    agent_type: str,
+) -> None:
+    """Bind policy plus DLP while preserving fail-closed legacy support."""
+    bind_security = getattr(agent, "bind_security", None)
+    if not callable(bind_security):
+        raise FatalError(
+            f"Security-bound agent type '{agent_type}' does not expose bind_security()"
+        )
+
+    if boundary_guard is None:
+        # A disabled security context cannot execute through ToolExecutor
+        # because its capability policy is disabled.  Preserve the historical
+        # two-argument hook for legacy agents in that already-denied mode.
+        bind_security(capability_policy, agent_id)
+        return
+
+    import inspect
+
+    try:
+        parameters = inspect.signature(bind_security).parameters.values()
+        supports_third_arg = (
+            any(
+                parameter.kind
+                in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for parameter in parameters
+            )
+            or sum(
+                parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                for parameter in parameters
+            )
+            >= 3
+        )
+    except (TypeError, ValueError):
+        supports_third_arg = False
+
+    if supports_third_arg:
+        bind_security(capability_policy, agent_id, boundary_guard)
+        return
+
+    bind_security(capability_policy, agent_id)
+    bind_boundary_guard = getattr(agent, "bind_boundary_guard", None)
+    if not callable(bind_boundary_guard):
+        raise FatalError(
+            f"Security-bound agent type '{agent_type}' cannot bind the "
+            "mandatory outbound boundary guard"
+        )
+    bind_boundary_guard(boundary_guard)
 
 
 class AgentExecutor:
@@ -84,12 +140,37 @@ class AgentExecutor:
             if hasattr(tool, "_channel"):
                 tool._channel = getattr(self._system, "channel_backend", None)
 
+    def _has_capability(
+        self,
+        agent_id: str,
+        capability: str,
+        resource: str,
+    ) -> bool:
+        """Check the managed principal's live policy without fail-open paths."""
+        policy = (
+            getattr(self._system, "capability_policy", None)
+            if self._system is not None
+            else None
+        )
+        if policy is None or not agent_id:
+            return False
+        try:
+            return policy.check(agent_id, capability, resource) is True
+        except Exception:
+            logger.exception(
+                "Managed agent capability check failed for %s",
+                agent_id,
+            )
+            return False
+
     def run_ephemeral(
         self,
         agent_type: str,
         system_prompt: str,
         input_text: str,
         tools: list[str] | None = None,
+        *,
+        agent_id: str = "",
     ) -> Any:
         """Run a one-shot agent turn with no lifecycle tracking."""
         from openjarvis.core.registry import AgentRegistry
@@ -100,6 +181,28 @@ class AgentExecutor:
             system_prompt=system_prompt,
             bus=self._bus,
         )
+        needs_security = bool(
+            getattr(agent_cls, "accepts_tools", False)
+            or getattr(agent_cls, "requires_security_context", False)
+        )
+        if needs_security:
+            capability_policy = (
+                getattr(self._system, "capability_policy", None)
+                if self._system is not None
+                else None
+            )
+            boundary_guard = (
+                getattr(self._system, "boundary_guard", None)
+                if self._system is not None
+                else None
+            )
+            _bind_agent_security(
+                agent,
+                capability_policy,
+                agent_id,
+                boundary_guard,
+                agent_type=agent_type,
+            )
         return agent.run(input_text)
 
     def execute_tick(self, agent_id: str, *, lock_already_held: bool = False) -> None:
@@ -209,43 +312,18 @@ class AgentExecutor:
                 )
 
     def _run_with_retries(self, agent: dict) -> AgentResult:
-        """Invoke the agent, retrying on RetryableError up to _MAX_RETRIES."""
-        last_error: AgentTickError | None = None
+        """Invoke exactly once.
 
-        for attempt in range(_MAX_RETRIES):
-            try:
-                return self._invoke_agent(agent)
-            except AgentTickError as e:
-                if not e.retryable or attempt == _MAX_RETRIES - 1:
-                    raise
-                last_error = e
-                delay = retry_delay(attempt)
-                logger.info(
-                    "Agent %s tick retry %d/%d in %ds: %s",
-                    agent["id"],
-                    attempt + 1,
-                    _MAX_RETRIES,
-                    delay,
-                    e,
-                )
-                time.sleep(delay)
-            except Exception as e:
-                classified = classify_error(e)
-                if not classified.retryable or attempt == _MAX_RETRIES - 1:
-                    raise classified from e
-                delay = retry_delay(attempt)
-                logger.info(
-                    "Agent %s tick retry %d/%d in %ds: %s",
-                    agent["id"],
-                    attempt + 1,
-                    _MAX_RETRIES,
-                    delay,
-                    e,
-                )
-                time.sleep(delay)
-
-        # Should not reach here, but just in case
-        raise last_error or FatalError("max retries exhausted")
+        A managed tick can call tools with external side effects. Retrying the
+        whole tick after an ambiguous transport failure can duplicate those
+        effects, so retryable failures are surfaced for explicit reconciliation.
+        """
+        try:
+            return self._invoke_agent(agent)
+        except AgentTickError:
+            raise
+        except Exception as exc:
+            raise classify_error(exc) from exc
 
     def _invoke_agent(self, agent: dict) -> AgentResult:
         """Invoke the actual agent run. Tests mock this method."""
@@ -322,6 +400,12 @@ class AgentExecutor:
                     try:
                         tool_cls = ToolRegistry.get(tname)
                         tool = tool_cls()
+                        if getattr(tool, "execution_disabled_reason", ""):
+                            logger.warning(
+                                "Managed agent tool %s is security-disabled",
+                                tname,
+                            )
+                            continue
                         self._inject_tool_deps(tool)
                         tool_instances.append(tool)
                     except Exception:
@@ -366,9 +450,9 @@ class AgentExecutor:
         # actively invoking web_search/memory_*/etc.
         if self._bus is not None:
             agent_kwargs["bus"] = self._bus
-        # Propagate confirmation policy from the AgentExecutor down to the
-        # agent's own ToolExecutor. Set by CLI paths like `jarvis agents ask`
-        # so non-interactive runs can auto-approve tool execution.
+        # Propagate a real TTY confirmation callback from CLI paths such as
+        # ``jarvis agents ask``. Non-interactive runs leave this unset and
+        # ToolExecutor denies sensitive tools.
         if getattr(self, "_confirm_callback", None) is not None:
             agent_kwargs["interactive"] = True
             agent_kwargs["confirm_callback"] = self._confirm_callback
@@ -388,15 +472,30 @@ class AgentExecutor:
         def _accepts(name: str) -> bool:
             return accepts_var_kw or name in init_sig.parameters
 
+        memory_resource = f"agent:{agent['id']}:memory"
+        can_read_memory = self._has_capability(
+            agent["id"],
+            "memory:read",
+            memory_resource,
+        )
+        can_write_memory = self._has_capability(
+            agent["id"],
+            "memory:write",
+            memory_resource,
+        )
+
         state_kwargs: dict[str, Any] = {}
         if _accepts("operator_id"):
             state_kwargs["operator_id"] = agent["id"]
         if self._system is not None:
-            if _accepts("session_store"):
+            # These are mutable raw backends. Expose them only when the
+            # managed principal has both read and write authority; a read-only
+            # wrapper does not exist yet.
+            if _accepts("session_store") and can_read_memory and can_write_memory:
                 state_kwargs["session_store"] = getattr(
                     self._system, "session_store", None
                 )
-            if _accepts("memory_backend"):
+            if _accepts("memory_backend") and can_read_memory and can_write_memory:
                 state_kwargs["memory_backend"] = getattr(
                     self._system, "memory_backend", None
                 )
@@ -404,7 +503,15 @@ class AgentExecutor:
             # agents, mirroring the one-shot `jarvis ask` path so they no
             # longer apply to CLI calls only (#376).
             cfg = getattr(self._system, "config", None)
-            if cfg is not None and _accepts("prompt_builder"):
+            if (
+                cfg is not None
+                and _accepts("prompt_builder")
+                and self._has_capability(
+                    agent["id"],
+                    "file:read",
+                    f"agent:{agent['id']}:persona",
+                )
+            ):
                 from openjarvis.prompt.builder import SystemPromptBuilder
 
                 state_kwargs["prompt_builder"] = SystemPromptBuilder(
@@ -414,22 +521,43 @@ class AgentExecutor:
                     system_prompt_config=cfg.system_prompt,
                 )
 
-        try:
-            agent_instance = agent_cls(engine, model, **agent_kwargs, **state_kwargs)
-        except TypeError:
-            try:
-                agent_instance = agent_cls(engine, model, **agent_kwargs)
-            except TypeError:
-                agent_instance = agent_cls(engine, model)
+        constructor_kwargs = {**agent_kwargs, **state_kwargs}
+        if not accepts_var_kw:
+            constructor_kwargs = {
+                key: value
+                for key, value in constructor_kwargs.items()
+                if key in init_sig.parameters
+            }
 
-        # Inject the managed-agent UUID into the agent's ToolExecutor so
-        # emitted TOOL_CALL_START/END events carry it; the trace subscriber
-        # below filters by ``event.data["agent"] == agent_id`` and would
-        # otherwise drop every tool call (the class-level agent_id like
-        # "monitor_operative" doesn't match the runtime UUID).
-        inner_executor = getattr(agent_instance, "_executor", None)
-        if inner_executor is not None and hasattr(inner_executor, "_agent_id"):
-            inner_executor._agent_id = agent["id"]
+        try:
+            agent_instance = agent_cls(engine, model, **constructor_kwargs)
+        except TypeError as exc:
+            raise FatalError(
+                f"Failed to initialize agent type '{agent_type}': {exc}"
+            ) from exc
+
+        needs_security = bool(
+            getattr(agent_cls, "accepts_tools", False)
+            or getattr(agent_cls, "requires_security_context", False)
+        )
+        if needs_security:
+            capability_policy = (
+                getattr(self._system, "capability_policy", None)
+                if self._system is not None
+                else None
+            )
+            boundary_guard = (
+                getattr(self._system, "boundary_guard", None)
+                if self._system is not None
+                else None
+            )
+            _bind_agent_security(
+                agent_instance,
+                capability_policy,
+                agent["id"],
+                boundary_guard,
+                agent_type=agent_type,
+            )
 
         logger.info(
             "Agent %s: tool wiring — %d tools resolved (%s), agent class %s",
@@ -450,7 +578,7 @@ class AgentExecutor:
 
         today = datetime.date.today().strftime("%A, %B %d, %Y")
         instruction = config.get("instruction", "")
-        memory = (agent.get("summary_memory") or "").strip()
+        memory = (agent.get("summary_memory") or "").strip() if can_read_memory else ""
         last_run_at = agent.get("last_run_at")
 
         tick_note = ""
@@ -474,19 +602,18 @@ class AgentExecutor:
             input_text = f"Current date: {today}\n\n{base}"
         pending = self._manager.get_pending_messages(agent["id"])
         if pending:
-            user_msgs = "\n".join(f"User: {m['content']}" for m in pending)
-            input_text = f"{input_text}\n\nNew instructions:\n{user_msgs}"
-            for m in pending:
-                self._manager.mark_message_delivered(m["id"])
-            logger.info(
-                "Agent %s: delivering %d pending message(s)",
+            quarantined = self._manager.quarantine_pending_messages(agent["id"])
+            logger.warning(
+                "Agent %s: quarantined %d legacy pending message(s) without "
+                "authenticated principal provenance",
                 agent["name"],
-                len(pending),
+                quarantined,
             )
             self._set_activity(
                 agent["id"],
-                f"Delivering {len(pending)} message(s)...",
+                f"Quarantined {quarantined} unauthenticated message(s)",
             )
+            pending = []
         else:
             logger.info(
                 "Agent %s: no pending messages, running with instruction only",
@@ -504,6 +631,7 @@ class AgentExecutor:
             and getattr(self._system, "memory_backend", None)
             and getattr(self._system, "config", None)
             and self._system.config.agent.context_from_memory
+            and can_read_memory
         ):
             try:
                 from openjarvis.tools.storage.context import (
@@ -553,18 +681,14 @@ class AgentExecutor:
         _t0 = time.time()
         result = agent_instance.run(input_text, context=agent_ctx)
 
-        # Retry once if the model returned empty content (common with
-        # Qwen3.5 thinking mode consuming all tokens).
+        # An empty result is ambiguous: the first run may already have invoked
+        # tools. Replaying the whole turn could duplicate side effects, so
+        # require explicit reconciliation instead.
         if not (result.content or "").strip():
-            self._set_activity(
-                agent["id"],
-                "Retrying (empty response)...",
+            raise FatalError(
+                "Managed agent returned an empty result; automatic replay is "
+                "disabled because the first run may have produced side effects"
             )
-            logger.warning(
-                "Agent %s: empty content, retrying once",
-                agent["name"],
-            )
-            result = agent_instance.run(input_text, context=agent_ctx)
 
         _elapsed = time.time() - _t0
         logger.info(

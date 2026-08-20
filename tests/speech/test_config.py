@@ -12,6 +12,11 @@ def test_speech_config_defaults():
     assert cfg.compute_type == "float16"
 
 
+def test_speech_config_accepts_disabled_backend():
+    cfg = SpeechConfig(backend="disabled")
+    assert cfg.backend == "disabled"
+
+
 def test_jarvis_config_has_speech():
     cfg = JarvisConfig()
     assert hasattr(cfg, "speech")

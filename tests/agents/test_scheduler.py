@@ -53,8 +53,14 @@ class TestSchedulerBasic:
             agent_type="monitor_operative",
             config={"schedule_type": "cron", "schedule_value": "0 9 * * *"},
         )
-        scheduler.register_agent(agent["id"])
-        assert agent["id"] in scheduler.registered_agents
+        try:
+            import croniter  # noqa: F401
+        except ImportError:
+            with pytest.raises(RuntimeError, match="requires.*croniter"):
+                scheduler.register_agent(agent["id"])
+        else:
+            scheduler.register_agent(agent["id"])
+            assert agent["id"] in scheduler.registered_agents
 
     def test_deregister_agent(self, manager):
         from openjarvis.agents.scheduler import AgentScheduler
@@ -91,12 +97,13 @@ class TestSchedulerBasic:
 
         executor = MagicMock()
         scheduler = AgentScheduler(manager=manager, executor=executor)
-        scheduler.start()
-        assert scheduler.is_running
+        with pytest.raises(RuntimeError, match="durable multi-process"):
+            scheduler.start()
+        assert not scheduler.is_running
         scheduler.stop()
         assert not scheduler.is_running
 
-    def test_tick_fires_executor(self, manager):
+    def test_automatic_tick_execution_is_disabled(self, manager):
         from openjarvis.agents.scheduler import AgentScheduler
 
         executor = MagicMock()
@@ -107,15 +114,13 @@ class TestSchedulerBasic:
         agent = manager.create_agent(
             name="test",
             agent_type="monitor_operative",
-            config={"schedule_type": "interval", "schedule_value": 0},
+            config={"schedule_type": "interval", "schedule_value": 0.1},
         )
         scheduler.register_agent(agent["id"])
-        scheduler.start()
-        time.sleep(0.5)
-        scheduler.stop()
+        with pytest.raises(RuntimeError, match="durable multi-process"):
+            scheduler.start()
 
-        assert executor.execute_tick.call_count >= 1
-        executor.execute_tick.assert_called_with(agent["id"])
+        executor.execute_tick.assert_not_called()
 
     def test_skips_paused_agents(self, manager):
         from openjarvis.agents.scheduler import AgentScheduler
@@ -128,12 +133,28 @@ class TestSchedulerBasic:
         agent = manager.create_agent(
             name="test",
             agent_type="monitor_operative",
-            config={"schedule_type": "interval", "schedule_value": 0},
+            config={"schedule_type": "interval", "schedule_value": 0.01},
         )
         manager.pause_agent(agent["id"])
         scheduler.register_agent(agent["id"])
-        scheduler.start()
-        time.sleep(0.3)
-        scheduler.stop()
+        time.sleep(0.02)
+        scheduler._check_due_agents()
 
         executor.execute_tick.assert_not_called()
+
+    @pytest.mark.parametrize("schedule_value", [0, -1, "nan", "inf"])
+    def test_register_rejects_invalid_interval(self, manager, schedule_value):
+        from openjarvis.agents.scheduler import AgentScheduler
+
+        scheduler = AgentScheduler(manager=manager, executor=MagicMock())
+        agent = manager.create_agent(
+            name="test",
+            agent_type="monitor_operative",
+            config={
+                "schedule_type": "interval",
+                "schedule_value": schedule_value,
+            },
+        )
+
+        with pytest.raises(ValueError, match="positive number"):
+            scheduler.register_agent(agent["id"])

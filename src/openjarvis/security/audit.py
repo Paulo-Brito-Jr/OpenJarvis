@@ -10,12 +10,21 @@ from typing import List, Optional, Tuple, Union
 
 from openjarvis.core.config import DEFAULT_CONFIG_DIR
 from openjarvis.core.events import Event, EventBus, EventType
+from openjarvis.security.taint import redact_sensitive_text
 from openjarvis.security.types import (
     ScanFinding,
     SecurityEvent,
     SecurityEventType,
     ThreatLevel,
 )
+
+
+def _redacted_match(value: str) -> str:
+    """Represent a finding without persisting the sensitive bytes."""
+    if not value:
+        return ""
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"[REDACTED sha256:{digest}]"
 
 
 class AuditLogger:
@@ -84,25 +93,29 @@ class AuditLogger:
 
     def log(self, event: SecurityEvent) -> None:
         """Insert a security event into the audit log with Merkle hash chain."""
+        safe_preview = redact_sensitive_text(event.content_preview)[:256]
+        safe_action = redact_sensitive_text(event.action_taken)[:128]
         findings_json = json.dumps(
             [
                 {
                     "pattern_name": f.pattern_name,
-                    "matched_text": f.matched_text,
+                    "matched_text": _redacted_match(f.matched_text),
                     "threat_level": f.threat_level.value,
                     "start": f.start,
                     "end": f.end,
-                    "description": f.description,
+                    "description": redact_sensitive_text(f.description)[:256],
                 }
                 for f in event.findings
-            ]
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
         )
 
         # Compute hash chain
         prev_hash = self.tail_hash()
         hash_input = (
             f"{prev_hash}|{event.timestamp}|{event.event_type.value}"
-            f"|{findings_json}|{event.content_preview}|{event.action_taken}"
+            f"|{findings_json}|{safe_preview}|{safe_action}"
         )
         row_hash = hashlib.sha256(hash_input.encode()).hexdigest()
 
@@ -117,8 +130,8 @@ class AuditLogger:
                 event.timestamp,
                 event.event_type.value,
                 findings_json,
-                event.content_preview,
-                event.action_taken,
+                safe_preview,
+                safe_action,
                 row_hash,
                 prev_hash,
             ),

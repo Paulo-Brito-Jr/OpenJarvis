@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from typing import Optional
 
@@ -742,7 +743,12 @@ def daemon():
         cfg = agent_data.get("config", {})
         if cfg.get("schedule_type") in ("cron", "interval"):
             scheduler.register_agent(agent_data["id"])
-    scheduler.start()
+    try:
+        scheduler.start()
+    except RuntimeError as exc:
+        click.echo(f"Scheduler disabled: {exc}", err=True)
+        system.close()
+        raise SystemExit(1) from exc
     n = len(scheduler.registered_agents)
     click.echo(f"Scheduler running ({n} agents). Ctrl+C to stop.")
     stop = threading.Event()
@@ -813,15 +819,7 @@ def errors():
 @agent.command("ask")
 @click.argument("agent_id")
 @click.argument("message")
-@click.option(
-    "--yes/--no-yes",
-    "auto_approve",
-    default=True,
-    help="Auto-approve tool execution that would otherwise need confirmation. "
-    "Default: on (suits non-interactive CLI use). Pass --no-yes to require a "
-    "TTY prompt for tools whose ToolSpec sets requires_confirmation=True.",
-)
-def ask(agent_id, message, auto_approve):
+def ask(agent_id, message):
     """Ask an agent a question (immediate response)."""
     manager = _get_manager()
     agent_id = _resolve_agent_id(manager, agent_id)
@@ -832,16 +830,19 @@ def ask(agent_id, message, auto_approve):
     if executor is None:
         click.echo("Executor not available", err=True)
         raise SystemExit(1)
-    # Wire a confirmation callback so the agent's own ToolExecutor can actually
-    # run tools whose ToolSpec sets requires_confirmation=True (e.g. shell_exec,
-    # git_*). `executor` is the AgentExecutor; the callback is read in
-    # _invoke_agent and propagated to the constructed agent via agent_kwargs.
-    if auto_approve:
-        executor._confirm_callback = lambda _prompt: True
+    # Sensitive tools may only be confirmed by a human on a real TTY. In
+    # non-interactive contexts the callback stays absent, so ToolExecutor denies
+    # the request instead of silently approving it.
+    if sys.stdin.isatty():
+
+        def _confirm_tool_execution(prompt: str) -> bool:
+            return click.confirm(f"\n{prompt}", default=False)
+
+        executor._interactive = True
+        executor._confirm_callback = _confirm_tool_execution
     else:
-        executor._confirm_callback = lambda prompt: click.confirm(
-            f"\n{prompt}", default=False
-        )
+        executor._interactive = False
+        executor._confirm_callback = None
     # Run the tick with a live trace rather than blocking in silence — the
     # message we just queued is consumed as this tick's input, so the user
     # sees the agent's searches/tool calls instead of an apparent hang.

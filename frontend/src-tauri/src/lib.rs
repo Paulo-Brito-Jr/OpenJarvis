@@ -8,6 +8,13 @@ use tokio::sync::Mutex;
 
 const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
+const OPENJARVIS_API_KEY_NAME: &str = "OPENJARVIS_API_KEY";
+const OPENJARVIS_API_PRINCIPAL: &str = "api:l99-desktop";
+const SKYNET_L99_READ_TOKEN_NAMES: &[&str] = &[
+    "SKYNET_JARVIS_CASA_READ_TOKEN",
+    "SKYNET_JARVIS_AGENDA_READ_TOKEN",
+    "SKYNET_JARVIS_FROTA_READ_TOKEN",
+];
 const DESKTOP_UV_SYNC_COMMAND: &str =
     "uv sync --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
 
@@ -437,6 +444,7 @@ impl Default for SetupStatus {
 }
 
 type SharedStatus = Arc<Mutex<SetupStatus>>;
+type SharedBootLock = Arc<Mutex<()>>;
 
 // ---------------------------------------------------------------------------
 // Health-check helpers
@@ -917,6 +925,14 @@ fn check_jarvis_port_available() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
+    // Fail before model/dependency work when the local server cannot be
+    // authenticated. A post-migration retry can then start promptly.
+    if let Err(error) = required_local_api_key() {
+        let mut s = status.lock().await;
+        s.error = Some(error);
+        return;
+    }
+
     // Decide the inference source (default Ollama) before launching anything.
     let cfg = read_inference_config();
     let plan = boot_plan(&cfg, total_ram_gb());
@@ -1426,9 +1442,15 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // additions aren't accidentally stripped.
     prepare_subprocess_for_appimage(&mut cmd);
 
-    // Inject cloud API keys from secure desktop storage.
+    // Inject API keys from secure desktop storage. A Keychain read failure for
+    // the local server key must not silently launch an unauthenticated server.
     for (key, value) in read_cloud_keys() {
         cmd.env(&key, &value);
+    }
+    if let Err(error) = inject_local_api_key(&mut cmd) {
+        let mut s = status.lock().await;
+        s.error = Some(error);
+        return;
     }
     let jarvis_child = cmd.spawn();
 
@@ -1549,6 +1571,21 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // `pull_model` command invoked from the UI).
 }
 
+/// Serialize auto-boot and explicit retries. The retry waits for the active
+/// attempt and only starts a new one when no healthy server was established.
+async fn boot_backend_serialized(
+    backend: SharedBackend,
+    status: SharedStatus,
+    boot_lock: SharedBootLock,
+) {
+    let _guard = boot_lock.lock().await;
+    if status.lock().await.server_ready {
+        return;
+    }
+    *status.lock().await = SetupStatus::default();
+    boot_backend(backend, status).await;
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -1571,11 +1608,22 @@ fn get_api_base() -> String {
 async fn start_backend(
     backend: tauri::State<'_, SharedBackend>,
     status: tauri::State<'_, SharedStatus>,
+    boot_lock: tauri::State<'_, SharedBootLock>,
 ) -> Result<(), String> {
     let b = backend.inner().clone();
     let s = status.inner().clone();
-    tauri::async_runtime::spawn(boot_backend(b, s));
-    Ok(())
+    let lock = boot_lock.inner().clone();
+    boot_backend_serialized(b, s.clone(), lock).await;
+
+    let final_status = s.lock().await;
+    if final_status.server_ready {
+        Ok(())
+    } else {
+        Err(final_status
+            .error
+            .clone()
+            .unwrap_or_else(|| "Backend startup ended before becoming ready".into()))
+    }
 }
 
 #[tauri::command]
@@ -1794,6 +1842,14 @@ async fn run_jarvis_command(args: Vec<String>) -> Result<String, String> {
         };
     }
 
+    // Keep server authentication material inside the native process boundary.
+    // The Keychain value is inherited by `jarvis serve`, but is never returned
+    // to JavaScript or written to the command line/logs.
+    for (key, value) in read_cloud_keys() {
+        cmd.env(&key, &value);
+    }
+    inject_local_api_key(&mut cmd)?;
+
     // `jarvis serve` is a long-running server that never exits. The old code
     // used `.output()`, which waits for the process to exit and so hung this
     // command forever — the "Start" button never resolved (#531). Spawn it
@@ -1863,6 +1919,157 @@ async fn fetch_savings(api_url: String) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("Invalid response: {}", e))
 }
 
+fn authenticated_local_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::RequestBuilder, String> {
+    let api_key = required_local_api_key()?;
+    Ok(request.bearer_auth(api_key))
+}
+
+fn local_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("Failed to create local HTTP client: {}", error))
+}
+
+fn local_speech_endpoint(api_url: &str, path: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(api_url.trim())
+        .map_err(|_| "Speech API URL is invalid".to_string())?;
+    let host = url.host_str().unwrap_or_default();
+    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    if url.scheme() != "http"
+        || !is_loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err("Speech API URL must be an HTTP loopback base URL".into());
+    }
+    url.set_path(path);
+    Ok(url)
+}
+
+fn validate_wav_upload(audio_data: &[u8], filename: &str) -> Result<(), String> {
+    const MAX_AUDIO_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_DURATION_SECONDS: u64 = 15 * 60;
+
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || !filename.to_ascii_lowercase().ends_with(".wav")
+    {
+        return Err("Transcription filename must be a WAV basename".into());
+    }
+    if audio_data.is_empty() || audio_data.len() > MAX_AUDIO_BYTES {
+        return Err("WAV audio is empty or exceeds the 16 MiB upload limit".into());
+    }
+    if audio_data.len() < 44
+        || audio_data.get(0..4) != Some(&b"RIFF"[..])
+        || audio_data.get(8..12) != Some(&b"WAVE"[..])
+    {
+        return Err("Audio payload is not a RIFF/WAVE file".into());
+    }
+
+    let read_u16 = |offset: usize| -> Result<u16, String> {
+        let bytes: [u8; 2] = audio_data
+            .get(offset..offset + 2)
+            .ok_or_else(|| "WAV metadata is truncated".to_string())?
+            .try_into()
+            .map_err(|_| "WAV metadata is truncated".to_string())?;
+        Ok(u16::from_le_bytes(bytes))
+    };
+    let read_u32 = |offset: usize| -> Result<u32, String> {
+        let bytes: [u8; 4] = audio_data
+            .get(offset..offset + 4)
+            .ok_or_else(|| "WAV metadata is truncated".to_string())?
+            .try_into()
+            .map_err(|_| "WAV metadata is truncated".to_string())?;
+        Ok(u32::from_le_bytes(bytes))
+    };
+
+    if read_u32(4)? as usize + 8 != audio_data.len() {
+        return Err("WAV container length is invalid".into());
+    }
+
+    let mut offset = 12usize;
+    let mut pcm_format: Option<(u16, u32, u16)> = None;
+    let mut data_size: Option<u32> = None;
+    while offset + 8 <= audio_data.len() {
+        let chunk_size = read_u32(offset + 4)? as usize;
+        let chunk_data_offset = offset + 8;
+        let chunk_end = chunk_data_offset
+            .checked_add(chunk_size)
+            .ok_or_else(|| "WAV chunk length overflow".to_string())?;
+        if chunk_end > audio_data.len() {
+            return Err("WAV chunk exceeds the container length".into());
+        }
+
+        match audio_data.get(offset..offset + 4) {
+            Some(chunk_name) if chunk_name == b"fmt " => {
+                if chunk_size < 16 {
+                    return Err("WAV format chunk is incomplete".into());
+                }
+                let audio_format = read_u16(chunk_data_offset)?;
+                let channel_count = read_u16(chunk_data_offset + 2)?;
+                let sample_rate = read_u32(chunk_data_offset + 4)?;
+                let byte_rate = read_u32(chunk_data_offset + 8)?;
+                let block_align = read_u16(chunk_data_offset + 12)?;
+                let bits_per_sample = read_u16(chunk_data_offset + 14)?;
+                let expected_block_align = channel_count.saturating_mul(2);
+                if audio_format != 1
+                    || channel_count == 0
+                    || channel_count > 32
+                    || sample_rate == 0
+                    || sample_rate > 384_000
+                    || bits_per_sample != 16
+                    || block_align != expected_block_align
+                    || byte_rate != sample_rate.saturating_mul(u32::from(expected_block_align))
+                {
+                    return Err("WAV audio must contain 16-bit PCM samples".into());
+                }
+                if pcm_format.is_some() {
+                    return Err("WAV audio contains duplicate format chunks".into());
+                }
+                pcm_format = Some((channel_count, sample_rate, block_align));
+            }
+            Some(chunk_name) if chunk_name == b"data" => {
+                if chunk_size == 0 {
+                    return Err("WAV audio data is empty".into());
+                }
+                if data_size.is_some() {
+                    return Err("WAV audio contains duplicate data chunks".into());
+                }
+                data_size = Some(chunk_size as u32);
+            }
+            _ => {}
+        }
+
+        offset = chunk_end
+            .checked_add(chunk_size % 2)
+            .ok_or_else(|| "WAV chunk length overflow".to_string())?;
+    }
+
+    if offset != audio_data.len() {
+        return Err("WAV container has trailing or unpadded data".into());
+    }
+    let (_, sample_rate, block_align) = pcm_format
+        .ok_or_else(|| "WAV audio is missing the PCM format chunk".to_string())?;
+    let data_size =
+        data_size.ok_or_else(|| "WAV audio is missing the data chunk".to_string())?;
+    if data_size % u32::from(block_align) != 0 {
+        return Err("WAV PCM data is not aligned to complete frames".into());
+    }
+    let frame_count = u64::from(data_size / u32::from(block_align));
+    if frame_count > u64::from(sample_rate) * MAX_DURATION_SECONDS {
+        return Err("WAV audio exceeds the 15 minute duration limit".into());
+    }
+
+    Ok(())
+}
+
 /// Transcribe audio via the speech API endpoint.
 #[tauri::command]
 async fn transcribe_audio(
@@ -1870,18 +2077,19 @@ async fn transcribe_audio(
     audio_data: Vec<u8>,
     filename: String,
 ) -> Result<serde_json::Value, String> {
-    let url = format!("{}/v1/speech/transcribe", api_url);
-    let client = reqwest::Client::new();
+    validate_wav_upload(&audio_data, &filename)?;
+    let url = local_speech_endpoint(&api_url, "/v1/speech/transcribe")?;
+    let client = local_http_client()?;
 
     let part = reqwest::multipart::Part::bytes(audio_data)
         .file_name(filename)
-        .mime_str("audio/webm")
+        .mime_str("audio/wav")
         .map_err(|e| format!("Failed to create multipart: {}", e))?;
 
     let form = reqwest::multipart::Form::new().part("file", part);
 
-    let resp = client
-        .post(&url)
+    let request = authenticated_local_request(client.post(url))?;
+    let resp = request
         .multipart(form)
         .send()
         .await
@@ -1943,7 +2151,9 @@ async fn submit_savings(
 // ---------------------------------------------------------------------------
 
 const SECURE_KEY_SERVICE: &str = "OpenJarvis Cloud Keys";
+const SHADOW_READ_TOKEN_SERVICE: &str = "OpenJarvis L99 Shadow Keys";
 const MANAGED_CLOUD_KEY_NAMES: &[&str] = &[
+    OPENJARVIS_API_KEY_NAME,
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
@@ -1962,16 +2172,24 @@ fn legacy_cloud_keys_path() -> std::path::PathBuf {
 }
 
 fn validate_cloud_key_name(key_name: &str) -> Result<(), String> {
-    let valid = !key_name.is_empty()
+    let valid_api_key = !key_name.is_empty()
         && key_name.len() <= 128
         && key_name.ends_with("_API_KEY")
         && key_name
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
-    if valid {
+    if valid_api_key {
         Ok(())
     } else {
-        Err(format!("Invalid API key name: {}", key_name))
+        Err(format!("Invalid secure key name: {}", key_name))
+    }
+}
+
+fn validate_shadow_read_token_name(key_name: &str) -> Result<(), String> {
+    if SKYNET_L99_READ_TOKEN_NAMES.contains(&key_name) {
+        Ok(())
+    } else {
+        Err(format!("Invalid L99 shadow read token name: {}", key_name))
     }
 }
 
@@ -2045,6 +2263,63 @@ fn secure_store_set(key_name: &str, key_value: &str) -> Result<(), String> {
         .map_err(|err| format!("Failed to save {} in secure key storage: {}", key_name, err))
 }
 
+fn shadow_secure_store_get(key_name: &str) -> Result<Option<String>, String> {
+    validate_shadow_read_token_name(key_name)?;
+    let entry = keyring::Entry::new(SHADOW_READ_TOKEN_SERVICE, key_name)
+        .map_err(|err| format!("Failed to open L99 shadow storage for {}: {}", key_name, err))?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(format!(
+            "Failed to read {} from L99 shadow storage: {}",
+            key_name, err
+        )),
+    }
+}
+
+fn shadow_secure_store_set(key_name: &str, key_value: &str) -> Result<(), String> {
+    validate_shadow_read_token_name(key_name)?;
+    let entry = keyring::Entry::new(SHADOW_READ_TOKEN_SERVICE, key_name)
+        .map_err(|err| format!("Failed to open L99 shadow storage for {}: {}", key_name, err))?;
+    if key_value.is_empty() {
+        return match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(format!(
+                "Failed to remove {} from L99 shadow storage: {}",
+                key_name, err
+            )),
+        };
+    }
+    entry
+        .set_password(key_value)
+        .map_err(|err| format!("Failed to save {} in L99 shadow storage: {}", key_name, err))
+}
+
+fn configured_local_api_key() -> Result<Option<String>, String> {
+    secure_store_get(OPENJARVIS_API_KEY_NAME)
+        .map(|value| value.filter(|api_key| !api_key.trim().is_empty()))
+}
+
+fn required_local_api_key() -> Result<String, String> {
+    configured_local_api_key()?.ok_or_else(|| {
+        format!(
+            "{} is missing from secure key storage",
+            OPENJARVIS_API_KEY_NAME
+        )
+    })
+}
+
+fn inject_local_api_key(command: &mut tokio::process::Command) -> Result<(), String> {
+    command.env(OPENJARVIS_API_KEY_NAME, required_local_api_key()?);
+    command.env("OPENJARVIS_API_PRINCIPAL", OPENJARVIS_API_PRINCIPAL);
+    command.env(
+        "OPENJARVIS_API_PRINCIPAL_ALLOWLIST",
+        OPENJARVIS_API_PRINCIPAL,
+    );
+    Ok(())
+}
+
 fn read_legacy_cloud_keys() -> Vec<(String, String)> {
     let path = legacy_cloud_keys_path();
     let mut keys = Vec::new();
@@ -2094,6 +2369,7 @@ fn read_cloud_keys() -> Vec<(String, String)> {
     migrate_legacy_cloud_keys();
     managed_cloud_key_names()
         .into_iter()
+        .filter(|key| key != OPENJARVIS_API_KEY_NAME)
         .filter_map(|key| match secure_store_get(&key) {
             Ok(Some(value)) if !value.is_empty() => Some((key, value)),
             _ => None,
@@ -2121,11 +2397,44 @@ async fn save_cloud_key(key_name: String, key_value: String) -> Result<(), Strin
     let key_value = key_value.trim().to_string();
     secure_store_set(&key_name, &key_value)?;
 
-    // Tell the running server to hot-reload its cloud engine so the user
-    // doesn't need to restart the app after entering an API key.
-    reload_cloud_keys(vec![(key_name, key_value)]).await;
+    // Only provider API keys belong in the cloud-reload endpoint. The local
+    // bearer key is inherited by the next normal desktop server process.
+    if key_name != OPENJARVIS_API_KEY_NAME {
+        reload_cloud_keys(vec![(key_name, key_value)]).await;
+    }
 
     Ok(())
+}
+
+/// Save one of the three exact read-only shadow bindings.
+///
+/// These credentials use a distinct Keychain service and are never returned
+/// by `read_cloud_keys`, injected into normal desktop autostart, or hot-reloaded.
+#[tauri::command]
+async fn save_shadow_read_token(key_name: String, key_value: String) -> Result<(), String> {
+    shadow_secure_store_set(&key_name, key_value.trim())
+}
+
+/// Report shadow binding presence without exposing credential values.
+#[tauri::command]
+fn get_shadow_read_token_status() -> Result<serde_json::Value, String> {
+    let status: Vec<serde_json::Value> = SKYNET_L99_READ_TOKEN_NAMES
+        .iter()
+        .map(|key| {
+            let set = matches!(shadow_secure_store_get(key), Ok(Some(value)) if !value.is_empty());
+            serde_json::json!({ "key": key, "set": set })
+        })
+        .collect();
+    Ok(serde_json::json!(status))
+}
+
+/// Load the local server API key into ephemeral WebView memory at startup.
+///
+/// The frontend needs the value to attach a Bearer header to streaming fetches;
+/// it must never persist or log the returned credential.
+#[tauri::command]
+fn get_local_api_key() -> Result<Option<String>, String> {
+    configured_local_api_key()
 }
 
 /// Get which cloud providers have keys configured (without exposing values).
@@ -2323,15 +2632,22 @@ fn normalize_host(raw: &str) -> String {
 /// Check speech backend health.
 #[tauri::command]
 async fn speech_health(api_url: String) -> Result<serde_json::Value, String> {
-    let url = format!("{}/v1/speech/health", api_url);
-    let resp = reqwest::get(&url)
+    let url = local_speech_endpoint(&api_url, "/v1/speech/health")?;
+    let client = local_http_client()?;
+    let request = authenticated_local_request(client.get(url))?;
+    let resp = request
+        .send()
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
-    let body: serde_json::Value = resp
-        .json()
+    let status = resp.status();
+    let body = resp
+        .text()
         .await
         .map_err(|e| format!("Invalid response: {}", e))?;
-    Ok(body)
+    if !status.is_success() {
+        return Err(format!("Speech health failed: {}", status.as_u16()));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("Invalid response: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -2729,13 +3045,16 @@ async fn hide_overlay() -> Result<(), String> {
 pub fn run() {
     let backend: SharedBackend = Arc::new(Mutex::new(BackendManager::default()));
     let status: SharedStatus = Arc::new(Mutex::new(SetupStatus::default()));
+    let boot_lock: SharedBootLock = Arc::new(Mutex::new(()));
 
     let boot_backend_ref = backend.clone();
     let boot_status_ref = status.clone();
+    let boot_lock_ref = boot_lock.clone();
 
     tauri::Builder::default()
         .manage(backend.clone())
         .manage(status.clone())
+        .manage(boot_lock.clone())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -2814,7 +3133,11 @@ pub fn run() {
             }
 
             // Auto-start backend services on launch
-            tauri::async_runtime::spawn(boot_backend(boot_backend_ref, boot_status_ref));
+            tauri::async_runtime::spawn(boot_backend_serialized(
+                boot_backend_ref,
+                boot_status_ref,
+                boot_lock_ref,
+            ));
 
             Ok(())
         })
@@ -2842,7 +3165,10 @@ pub fn run() {
             pull_ollama_model,
             delete_ollama_model,
             save_cloud_key,
+            save_shadow_read_token,
+            get_local_api_key,
             get_cloud_key_status,
+            get_shadow_read_token_status,
             get_inference_source,
             set_inference_source,
             toggle_overlay,
@@ -2871,9 +3197,12 @@ mod tests {
         boot_plan, default_local_model, format_extension_import_failure,
         format_missing_rust_toolchain, format_port_unavailable, format_uv_sync_failure,
         format_uv_sync_spawn_error, matching_installed_model, model_names_match, normalize_host,
-        parse_inference_config, parse_ollama_model_names, preferred_installed_model,
-        should_persist_resolved_model, startup_installed_model, upsert_engine_host,
-        uv_sync_stderr_tail, InferenceConfig, SourceKind, DESKTOP_UV_SYNC_COMMAND,
+        local_speech_endpoint, parse_inference_config, parse_ollama_model_names,
+        preferred_installed_model, should_persist_resolved_model, startup_installed_model,
+        upsert_engine_host, uv_sync_stderr_tail, validate_cloud_key_name,
+        validate_shadow_read_token_name, validate_wav_upload, InferenceConfig, SourceKind,
+        DESKTOP_UV_SYNC_COMMAND, MANAGED_CLOUD_KEY_NAMES, OPENJARVIS_API_KEY_NAME,
+        SHADOW_READ_TOKEN_SERVICE, SKYNET_L99_READ_TOKEN_NAMES,
     };
     use std::path::Path;
 
@@ -3214,6 +3543,93 @@ mod tests {
         let out = upsert_engine_host(existing, "lmstudio", "http://new:2").unwrap();
         let doc: toml_edit::DocumentMut = out.parse().unwrap();
         assert_eq!(doc["engine"]["lmstudio"]["host"].as_str(), Some("http://new:2"));
+    }
+
+    fn pcm16_wav_bytes(sample_rate: u32, frames: u32) -> Vec<u8> {
+        let data_size = frames * 2;
+        let mut bytes = Vec::with_capacity(44 + data_size as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.resize(44 + data_size as usize, 0);
+        bytes
+    }
+
+    #[test]
+    fn wav_upload_validation_accepts_pcm16_riff() {
+        let bytes = pcm16_wav_bytes(16_000, 16_000);
+        assert_eq!(validate_wav_upload(&bytes, "recording.wav"), Ok(()));
+    }
+
+    #[test]
+    fn wav_upload_validation_rejects_renamed_compressed_audio() {
+        let result = validate_wav_upload(b"webm bytes", "recording.wav");
+        assert!(result.unwrap_err().contains("RIFF/WAVE"));
+    }
+
+    #[test]
+    fn wav_upload_validation_rejects_unsafe_filename_and_long_audio() {
+        let normal = pcm16_wav_bytes(16_000, 1);
+        assert!(validate_wav_upload(&normal, "../recording.wav").is_err());
+
+        let long = pcm16_wav_bytes(1, 901);
+        assert!(validate_wav_upload(&long, "recording.wav")
+            .unwrap_err()
+            .contains("15 minute"));
+    }
+
+    #[test]
+    fn local_server_api_key_is_managed_in_secure_storage() {
+        assert!(MANAGED_CLOUD_KEY_NAMES.contains(&OPENJARVIS_API_KEY_NAME));
+    }
+
+    #[test]
+    fn l99_secure_storage_accepts_only_the_three_read_tokens() {
+        for key_name in SKYNET_L99_READ_TOKEN_NAMES {
+            assert!(!MANAGED_CLOUD_KEY_NAMES.contains(key_name));
+            assert!(validate_cloud_key_name(key_name).is_err());
+            assert!(validate_shadow_read_token_name(key_name).is_ok());
+        }
+
+        for denied in [
+            "SKYNET_JARVIS_CASA_ACTION_TOKEN",
+            "SKYNET_JARVIS_REMINDER_PLAN_TOKEN",
+            "ARBITRARY_TOKEN",
+            "lowercase_TOKEN",
+        ] {
+            assert!(validate_cloud_key_name(denied).is_err(), "{denied}");
+            assert!(validate_shadow_read_token_name(denied).is_err(), "{denied}");
+        }
+        assert_ne!(SHADOW_READ_TOKEN_SERVICE, super::SECURE_KEY_SERVICE);
+    }
+
+    #[test]
+    fn speech_endpoint_accepts_only_loopback_http_bases() {
+        assert_eq!(
+            local_speech_endpoint("http://127.0.0.1:8000", "/v1/speech/health")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8000/v1/speech/health"
+        );
+        assert!(local_speech_endpoint(
+            "https://attacker.example",
+            "/v1/speech/health"
+        )
+        .is_err());
+        assert!(local_speech_endpoint(
+            "http://localhost:8000/redirect",
+            "/v1/speech/health"
+        )
+        .is_err());
     }
 
     // -----------------------------------------------------------------

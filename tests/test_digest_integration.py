@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from openjarvis.agents.digest_store import DigestStore
 from openjarvis.core.types import ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 
 
 def test_full_digest_pipeline(tmp_path):
@@ -49,7 +50,11 @@ def test_full_digest_pipeline(tmp_path):
     # Write fake audio
     (tmp_path / "digest.mp3").write_bytes(b"fake-mp3-audio")
 
-    db_path = str(tmp_path / "digest.db")
+    db_path = str((tmp_path / "digest.db").resolve())
+    agent_id = "digest-integration-test"
+    policy = CapabilityPolicy()
+    policy.grant(agent_id, "tool:invoke", db_path)
+    policy.grant(agent_id, "file:write", db_path)
 
     agent = MorningDigestAgent(
         mock_engine,
@@ -57,6 +62,8 @@ def test_full_digest_pipeline(tmp_path):
         tools=[],
         persona="neutral",
         digest_store_path=db_path,
+        capability_policy=policy,
+        agent_id=agent_id,
     )
 
     with patch.object(

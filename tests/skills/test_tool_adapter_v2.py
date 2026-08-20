@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openjarvis.core.types import ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.skills.executor import SkillExecutor
 from openjarvis.skills.tool_adapter import SkillTool
 from openjarvis.skills.types import SkillManifest, SkillStep
@@ -24,7 +25,13 @@ class EchoTool(BaseTool):
 
 def _make_executor(*extra_tools):
     tools = [EchoTool(), *extra_tools]
-    tool_executor = ToolExecutor(tools)
+    policy = CapabilityPolicy()
+    policy.grant("skill-adapter-test-agent", "tool:invoke")
+    tool_executor = ToolExecutor(
+        tools,
+        capability_policy=policy,
+        agent_id="skill-adapter-test-agent",
+    )
     return SkillExecutor(tool_executor)
 
 

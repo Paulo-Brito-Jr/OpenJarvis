@@ -23,7 +23,16 @@ function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+      const parsed = JSON.parse(raw) as Partial<Settings>;
+      return {
+        apiUrl: typeof parsed.apiUrl === 'string'
+          ? parsed.apiUrl
+          : DEFAULT_SETTINGS.apiUrl,
+        refreshInterval: typeof parsed.refreshInterval === 'number'
+          ? parsed.refreshInterval
+          : DEFAULT_SETTINGS.refreshInterval,
+        theme: parsed.theme === 'light' ? 'light' : 'dark',
+      };
     }
   } catch {
     // ignore corrupt data
@@ -32,7 +41,11 @@ function loadSettings(): Settings {
 }
 
 function saveSettings(settings: Settings): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    apiUrl: settings.apiUrl,
+    refreshInterval: settings.refreshInterval,
+    theme: settings.theme,
+  }));
 }
 
 // ---------------------------------------------------------------------------

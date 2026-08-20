@@ -17,6 +17,10 @@ import re
 from typing import Any, List, Optional
 
 from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
+from openjarvis.core.cancellation import (
+    cancellation_scope,
+    current_cancellation_token,
+)
 from openjarvis.core.events import EventBus
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role, ToolCall, ToolResult
@@ -283,7 +287,9 @@ class OrchestratorAgent(ToolUsingAgent):
             # Execute each tool (with loop guard check) and append results
             if self._parallel_tools and len(tool_calls) > 1:
                 # Parallel execution
-                def _exec_tool(tc: ToolCall) -> tuple:
+                parallel_cancellation_token = current_cancellation_token()
+
+                def _exec_tool_in_context(tc: ToolCall) -> tuple:
                     if self._loop_guard:
                         verdict = self._loop_guard.check_call(
                             tc.name,
@@ -297,9 +303,19 @@ class OrchestratorAgent(ToolUsingAgent):
                             )
                     return tc, self._executor.execute(tc)
 
+                def _exec_tool(tc: ToolCall) -> tuple:
+                    # Propagate only the cooperative cancellation token.  A
+                    # full copy_context() could also copy authorization
+                    # receipts or unrelated request-local security state.
+                    if parallel_cancellation_token is None:
+                        return _exec_tool_in_context(tc)
+                    with cancellation_scope(parallel_cancellation_token):
+                        return _exec_tool_in_context(tc)
+
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=len(tool_calls),
                 ) as pool:
+                    # ThreadPoolExecutor does not inherit ContextVars.
                     futures = {pool.submit(_exec_tool, tc): tc for tc in tool_calls}
                     results_map: dict[int, tuple] = {}
                     for future in concurrent.futures.as_completed(futures):

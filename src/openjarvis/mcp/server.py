@@ -45,17 +45,31 @@ class MCPServer:
     tools:
         List of ``BaseTool`` instances to expose.  If ``None``, auto-discovers
         all registered tools from ``ToolRegistry``.
+    capability_policy:
+        Explicit policy for every ``tools/call`` request. Missing policy denies.
+    agent_id:
+        Runtime principal evaluated by ``capability_policy``. Empty denies.
     """
 
     SERVER_NAME = "openjarvis"
     SERVER_VERSION = "0.1.0"
     PROTOCOL_VERSION = "2025-11-25"
 
-    def __init__(self, tools: Optional[List[BaseTool]] = None) -> None:
+    def __init__(
+        self,
+        tools: Optional[List[BaseTool]] = None,
+        *,
+        capability_policy: Optional[Any] = None,
+        agent_id: str = "",
+    ) -> None:
         if tools is None:
             tools = self._auto_discover_tools()
         self._tools: Dict[str, BaseTool] = {t.spec.name: t for t in tools}
-        self._executor = ToolExecutor(tools)
+        self._executor = ToolExecutor(
+            tools,
+            capability_policy=capability_policy,
+            agent_id=agent_id,
+        )
 
     @staticmethod
     def _auto_discover_tools() -> List[BaseTool]:

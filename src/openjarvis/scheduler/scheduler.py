@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -33,6 +35,9 @@ class ScheduledTask:
     agent: str = "simple"
     tools: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    operator_id: str = ""
+    capabilities: List[str] = field(default_factory=list)
+    consent: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a plain dict for store persistence."""
@@ -48,6 +53,9 @@ class ScheduledTask:
             "agent": self.agent,
             "tools": self.tools,
             "metadata": self.metadata,
+            "operator_id": self.operator_id,
+            "capabilities": self.capabilities,
+            "consent": self.consent,
         }
 
     @classmethod
@@ -65,6 +73,9 @@ class ScheduledTask:
             agent=d.get("agent", "simple"),
             tools=d.get("tools", ""),
             metadata=d.get("metadata", {}),
+            operator_id=d.get("operator_id", ""),
+            capabilities=d.get("capabilities", []),
+            consent=d.get("consent", {}),
         )
 
 
@@ -95,14 +106,103 @@ class TaskScheduler:
         *,
         poll_interval: int = 60,
         bus: Any = None,
+        capability_policy: Any = None,
+        default_operator_id: str = "",
+        default_capabilities: Optional[List[str]] = None,
     ) -> None:
+        if (
+            isinstance(poll_interval, bool)
+            or not isinstance(poll_interval, (int, float))
+            or not math.isfinite(float(poll_interval))
+            or poll_interval <= 0
+        ):
+            raise ValueError("Scheduler poll interval must be positive")
         self._store = store
         self._system = system
-        self._poll_interval = poll_interval
+        self._poll_interval = float(poll_interval)
         self._bus = bus
+        self._capability_policy = capability_policy
+        self._default_operator_id = default_operator_id.strip()
+        self._default_capabilities = list(default_capabilities or [])
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._worker_id = uuid.uuid4().hex
+
+    def bind_system(self, system: Any) -> None:
+        """Bind the execution system after the containing system is built."""
+        self._system = system
+
+    def _resolve_operator(self, operator_id: str | None) -> str:
+        resolved = (operator_id or self._default_operator_id).strip()
+        if not resolved:
+            raise PermissionError("Scheduled operation requires an operator identity")
+        return resolved
+
+    def _check_capability(
+        self,
+        operator_id: str,
+        capability: str,
+        resource: str,
+    ) -> None:
+        if self._capability_policy is None:
+            raise PermissionError("Scheduler capability policy is unavailable")
+        try:
+            allowed = self._capability_policy.check(
+                operator_id,
+                capability,
+                resource,
+            )
+        except Exception as exc:
+            raise PermissionError("Scheduler authorization failed") from exc
+        if not allowed:
+            raise PermissionError(f"Scheduler capability denied: {capability}")
+
+    @staticmethod
+    def _validate_consent(
+        schedule_type: str,
+        consent: Dict[str, Any],
+    ) -> None:
+        if not isinstance(consent, dict):
+            raise PermissionError("Scheduler consent record is invalid")
+        granted_at = consent.get("granted_at")
+        if not isinstance(granted_at, str) or not granted_at:
+            raise PermissionError("Scheduler consent grant timestamp is missing")
+        try:
+            granted = datetime.fromisoformat(granted_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PermissionError(
+                "Scheduler consent grant timestamp is invalid"
+            ) from exc
+        if granted.tzinfo is None:
+            granted = granted.replace(tzinfo=timezone.utc)
+        if granted > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise PermissionError("Scheduler consent grant timestamp is in the future")
+        if schedule_type == "once":
+            if consent.get("scope") != "once" or consent.get("used_at"):
+                raise PermissionError("One-time scheduler consent is missing")
+            return
+        if (
+            consent.get("scope") != "recurring"
+            or consent.get("allow_replay") is not True
+        ):
+            raise PermissionError("Recurring schedules require explicit replay consent")
+        expires_at = consent.get("expires_at")
+        if not isinstance(expires_at, str) or not expires_at:
+            raise PermissionError("Recurring scheduler consent must expire")
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PermissionError(
+                "Recurring scheduler consent expiry is invalid"
+            ) from exc
+        now = datetime.now(timezone.utc)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry <= now or expiry > now + timedelta(days=31):
+            raise PermissionError(
+                "Recurring scheduler consent must expire within 31 days"
+            )
 
     # -- Public API ----------------------------------------------------------
 
@@ -115,7 +215,7 @@ class TaskScheduler:
             target=self._poll_loop, daemon=True, name="jarvis-scheduler"
         )
         self._thread.start()
-        logger.info("Scheduler started (poll_interval=%ds)", self._poll_interval)
+        logger.info("Scheduler started (poll_interval=%ss)", self._poll_interval)
 
     def stop(self) -> None:
         """Signal the background thread to stop and wait for it."""
@@ -133,57 +233,207 @@ class TaskScheduler:
         **kwargs: Any,
     ) -> ScheduledTask:
         """Create and persist a new scheduled task."""
+        operator_id = self._resolve_operator(kwargs.get("operator_id"))
+        capabilities = list(
+            dict.fromkeys(
+                kwargs.get("capabilities")
+                or self._default_capabilities
+                or ["schedule:create"]
+            )
+        )
+        if not all(
+            isinstance(capability, str)
+            and re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z][A-Za-z0-9_.-]*",
+                capability,
+            )
+            for capability in capabilities
+        ):
+            raise PermissionError("Scheduled task capabilities are invalid")
+        if "schedule:create" not in capabilities:
+            capabilities.append("schedule:create")
+        self._check_capability(
+            operator_id,
+            "schedule:create",
+            "schedule:new",
+        )
+        if schedule_type not in {"cron", "interval", "once"}:
+            raise ValueError("Unsupported schedule type")
+        schedule_value = self._normalize_schedule_value(
+            schedule_type,
+            schedule_value,
+        )
+        if not prompt.strip() or len(prompt) > 20_000:
+            raise ValueError("Scheduled prompt must contain 1 to 20000 characters")
+        consent = dict(kwargs.get("consent") or {})
+        self._validate_consent(schedule_type, consent)
+        task_id = kwargs.get("task_id")
+        if task_id is None:
+            task_id = uuid.uuid4().hex[:16]
+        if not isinstance(task_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9:_-]{1,128}", task_id
+        ):
+            raise ValueError("Scheduled task ID is invalid")
+        raw_tools = kwargs.get("tools", "")
+        if isinstance(raw_tools, str):
+            tool_values = raw_tools.split(",") if raw_tools else []
+        elif isinstance(raw_tools, list):
+            tool_values = raw_tools
+        else:
+            raise ValueError("Scheduled tools must be a list or comma-separated string")
+        normalized_tools: List[str] = []
+        for raw_tool in tool_values:
+            if not isinstance(raw_tool, str):
+                raise ValueError("Scheduled tool names are invalid")
+            tool_name = raw_tool.strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", tool_name):
+                raise ValueError("Scheduled tool names are invalid")
+            if tool_name not in normalized_tools:
+                normalized_tools.append(tool_name)
         task = ScheduledTask(
-            id=uuid.uuid4().hex[:16],
+            id=task_id,
             prompt=prompt,
             schedule_type=schedule_type,
             schedule_value=schedule_value,
             agent=kwargs.get("agent", "simple"),
-            tools=kwargs.get("tools", ""),
+            tools=",".join(normalized_tools),
             context_mode=kwargs.get("context_mode", "isolated"),
             metadata=kwargs.get("metadata", {}),
+            operator_id=operator_id,
+            capabilities=capabilities,
+            consent=consent,
         )
         task.next_run = self._compute_next_run(task)
         with self._lock:
-            self._store.save_task(task.to_dict())
+            created = self._store.create_task(task.to_dict())
+            if not created:
+                existing = self._store.get_task(task.id)
+                if existing is None:
+                    raise RuntimeError(
+                        "Scheduled task ID collision could not be reconciled"
+                    )
+                if existing.get("operator_id") != operator_id:
+                    raise PermissionError(
+                        "Scheduled task ID is owned by another operator"
+                    )
+                raise ValueError("Scheduled task ID already exists")
         return task
 
-    def list_tasks(self, *, status: Optional[str] = None) -> List[ScheduledTask]:
+    def list_tasks(
+        self,
+        *,
+        status: Optional[str] = None,
+        operator_id: str | None = None,
+    ) -> List[ScheduledTask]:
         """Return tasks, optionally filtered by *status*."""
+        resolved_operator = self._resolve_operator(operator_id)
+        self._check_capability(
+            resolved_operator,
+            "schedule:create",
+            "schedule:list",
+        )
         with self._lock:
             rows = self._store.list_tasks(status=status)
-        return [ScheduledTask.from_dict(r) for r in rows]
+        return [
+            ScheduledTask.from_dict(row)
+            for row in rows
+            if row.get("operator_id") == resolved_operator
+        ]
 
-    def pause_task(self, task_id: str) -> None:
+    def pause_task(self, task_id: str, *, operator_id: str | None = None) -> None:
         """Pause an active task."""
+        resolved_operator = self._resolve_operator(operator_id)
         with self._lock:
             d = self._store.get_task(task_id)
             if d is None:
                 raise KeyError(f"Task not found: {task_id}")
-            d["status"] = "paused"
-            self._store.update_task(d)
+            if d.get("operator_id") != resolved_operator:
+                raise PermissionError("Scheduled task is owned by another operator")
+            if d.get("status") == "running":
+                raise RuntimeError(
+                    "Scheduled task is currently running and cannot be paused"
+                )
+            if d.get("status") != "active":
+                raise ValueError("Only an active scheduled task can be paused")
+            self._check_capability(
+                resolved_operator,
+                "schedule:create",
+                f"schedule:{task_id}",
+            )
+            if not self._store.pause_active_task(task_id, resolved_operator):
+                raise RuntimeError(
+                    "Scheduled task state changed before it could be paused"
+                )
 
-    def resume_task(self, task_id: str) -> None:
+    def resume_task(self, task_id: str, *, operator_id: str | None = None) -> None:
         """Resume a paused task."""
+        resolved_operator = self._resolve_operator(operator_id)
         with self._lock:
             d = self._store.get_task(task_id)
             if d is None:
                 raise KeyError(f"Task not found: {task_id}")
+            if d.get("operator_id") != resolved_operator:
+                raise PermissionError("Scheduled task is owned by another operator")
+            if d.get("status") == "running":
+                raise RuntimeError(
+                    "Scheduled task is currently running and cannot be resumed"
+                )
+            if d.get("status") != "paused":
+                raise ValueError("Only a paused scheduled task can be resumed")
+            self._check_capability(
+                resolved_operator,
+                "schedule:create",
+                f"schedule:{task_id}",
+            )
+            self._validate_consent(
+                d.get("schedule_type", ""),
+                d.get("consent", {}),
+            )
+            d["schedule_value"] = self._normalize_schedule_value(
+                d.get("schedule_type", ""),
+                d.get("schedule_value", ""),
+            )
             d["status"] = "active"
             # Recompute next_run from now
             task = ScheduledTask.from_dict(d)
             task.next_run = self._compute_next_run(task)
-            self._store.update_task(task.to_dict())
+            if not self._store.resume_paused_task(
+                task_id,
+                resolved_operator,
+                schedule_value=task.schedule_value,
+                next_run=task.next_run,
+            ):
+                raise RuntimeError(
+                    "Scheduled task state changed before it could be resumed"
+                )
 
-    def cancel_task(self, task_id: str) -> None:
+    def cancel_task(self, task_id: str, *, operator_id: str | None = None) -> None:
         """Cancel a task (sets status to cancelled)."""
+        resolved_operator = self._resolve_operator(operator_id)
         with self._lock:
             d = self._store.get_task(task_id)
             if d is None:
                 raise KeyError(f"Task not found: {task_id}")
-            d["status"] = "cancelled"
-            d["next_run"] = None
-            self._store.update_task(d)
+            if d.get("operator_id") != resolved_operator:
+                raise PermissionError("Scheduled task is owned by another operator")
+            if d.get("status") == "running":
+                raise RuntimeError(
+                    "Scheduled task is currently running and cannot be cancelled"
+                )
+            if d.get("status") == "cancelled":
+                return
+            self._check_capability(
+                resolved_operator,
+                "schedule:create",
+                f"schedule:{task_id}",
+            )
+            if not self._store.cancel_unclaimed_task(
+                task_id,
+                resolved_operator,
+            ):
+                raise RuntimeError(
+                    "Scheduled task state changed before it could be cancelled"
+                )
 
     # -- Background loop -----------------------------------------------------
 
@@ -192,31 +442,90 @@ class TaskScheduler:
         while not self._stop_event.is_set():
             try:
                 now = _now_iso()
-                with self._lock:
-                    due = self._store.get_due_tasks(now)
-                for task_dict in due:
-                    task = ScheduledTask.from_dict(task_dict)
-                    self._execute_task(task)
+                while not self._stop_event.is_set():
+                    claim_token = f"{self._worker_id}:{uuid.uuid4().hex}"
+                    with self._lock:
+                        task_dict = self._store.claim_due_task(now, claim_token)
+                    if task_dict is None:
+                        break
+                    self._execute_task(
+                        ScheduledTask.from_dict(task_dict),
+                        claim_token=claim_token,
+                    )
             except Exception:
                 logger.exception("Scheduler poll error")
             self._stop_event.wait(timeout=self._poll_interval)
 
-    def _execute_task(self, task: ScheduledTask) -> None:
+    def _execute_task(
+        self,
+        task: ScheduledTask,
+        *,
+        claim_token: Optional[str] = None,
+    ) -> None:
         """Execute a single due task and log the result."""
         started_at = _now_iso()
+        if claim_token is None:
+            claim_token = f"{self._worker_id}:{uuid.uuid4().hex}"
+            with self._lock:
+                claimed = self._store.claim_task(
+                    task.id,
+                    claim_token,
+                    started_at,
+                )
+            if claimed is None:
+                logger.warning(
+                    "Scheduler task %s was not claimable; execution skipped",
+                    task.id,
+                )
+                return
+            task = ScheduledTask.from_dict(claimed)
+        else:
+            with self._lock:
+                claimed = self._store.get_task(task.id)
+            if (
+                claimed is None
+                or claimed.get("status") != "running"
+                or claimed.get("claim_token") != claim_token
+            ):
+                logger.warning(
+                    "Scheduler task %s claim ownership is invalid; execution skipped",
+                    task.id,
+                )
+                return
+            task = ScheduledTask.from_dict(claimed)
 
         # Publish start event
         if self._bus is not None:
             self._bus.publish(
                 SCHEDULER_TASK_START,
-                {"task_id": task.id, "prompt": task.prompt},
+                {"task_id": task.id, "operator_id": task.operator_id},
             )
 
         success = False
+        authorization_failed = False
         result_text = ""
         error_text = ""
 
         try:
+            self._validate_consent(task.schedule_type, task.consent)
+            if "schedule:create" not in task.capabilities or not all(
+                isinstance(capability, str)
+                and re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_.-]*:"
+                    r"[A-Za-z][A-Za-z0-9_.-]*",
+                    capability,
+                )
+                for capability in task.capabilities
+            ):
+                raise PermissionError("Scheduled task capability snapshot is invalid")
+            # The scheduler-management grant is checked against the schedule
+            # resource. Other snapshot capabilities are enforced against the
+            # real tool/provider resource by QueryOrchestrator's scoped policy.
+            self._check_capability(
+                task.operator_id,
+                "schedule:create",
+                f"schedule:{task.id}",
+            )
             if self._system is not None:
                 raw_tools = (
                     task.tools
@@ -226,24 +535,40 @@ class TaskScheduler:
                 tools_list = (
                     [t.strip() for t in raw_tools if t.strip()] if task.tools else []
                 )
+                if not all(
+                    re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}",
+                        tool_name,
+                    )
+                    for tool_name in tools_list
+                ):
+                    raise PermissionError("Scheduled task tool snapshot is invalid")
                 ask_kwargs: Dict[str, Any] = {
                     "agent": task.agent,
-                    "tools": tools_list if tools_list else None,
+                    # An explicit empty list means no tools. Never expand an
+                    # empty schedule snapshot to the system's full tool set.
+                    "tools": tools_list,
+                    "capability_scope": list(task.capabilities),
                 }
                 meta = task.metadata or {}
-                if meta.get("operator_id"):
+                if task.operator_id:
                     ask_kwargs["system_prompt"] = meta.get("system_prompt", "")
-                    ask_kwargs["operator_id"] = meta["operator_id"]
-                result_text = self._system.ask(
+                    ask_kwargs["operator_id"] = task.operator_id
+                self._system.ask(
                     task.prompt,
                     **ask_kwargs,
                 )
+                result_text = "completed"
             else:
-                result_text = f"[dry-run] Would execute: {task.prompt}"
+                raise RuntimeError("Scheduler execution system is unavailable")
             success = True
+        except PermissionError as exc:
+            authorization_failed = True
+            error_text = type(exc).__name__
+            logger.error("Task %s authorization failed", task.id)
         except Exception as exc:
-            error_text = str(exc)
-            logger.error("Task %s failed: %s", task.id, exc)
+            error_text = type(exc).__name__
+            logger.error("Task %s failed: %s", task.id, type(exc).__name__)
 
         finished_at = _now_iso()
 
@@ -262,11 +587,33 @@ class TaskScheduler:
             d = self._store.get_task(task.id)
             if d is not None:
                 d["last_run"] = finished_at
+                if d.get("schedule_type") == "once":
+                    consent = dict(d.get("consent") or {})
+                    consent["used_at"] = finished_at
+                    d["consent"] = consent
                 next_run = self._compute_next_run(ScheduledTask.from_dict(d))
                 d["next_run"] = next_run
+                if authorization_failed:
+                    d["status"] = "paused"
+                    d["next_run"] = None
+                elif next_run is not None:
+                    d["status"] = "active"
                 if next_run is None:
-                    d["status"] = "completed"
-                self._store.update_task(d)
+                    d["status"] = "completed" if success else "paused"
+                finished = self._store.finish_claim(
+                    task.id,
+                    claim_token,
+                    status=d["status"],
+                    next_run=d["next_run"],
+                    last_run=finished_at,
+                    consent=d.get("consent", {}),
+                )
+                if not finished:
+                    logger.error(
+                        "Scheduler task %s lost its durable claim; "
+                        "manual reconciliation required",
+                        task.id,
+                    )
 
         # Publish end event
         if self._bus is not None:
@@ -275,8 +622,6 @@ class TaskScheduler:
                 {
                     "task_id": task.id,
                     "success": success,
-                    "result": result_text,
-                    "error": error_text,
                 },
             )
 
@@ -291,11 +636,15 @@ class TaskScheduler:
             # If already run, no more runs
             if task.last_run is not None:
                 return None
-            # Otherwise the schedule_value is the target ISO datetime
-            return task.schedule_value
+            # Otherwise the schedule_value is the target ISO datetime.
+            return self._normalize_schedule_value("once", task.schedule_value)
 
         if task.schedule_type == "interval":
-            seconds = float(task.schedule_value)
+            normalized = self._normalize_schedule_value(
+                "interval",
+                task.schedule_value,
+            )
+            seconds = float(normalized)
             next_time = now + timedelta(seconds=seconds)
             return next_time.isoformat()
 
@@ -303,6 +652,84 @@ class TaskScheduler:
             return self._compute_next_cron(task.schedule_value, now)
 
         return None
+
+    @classmethod
+    def _normalize_schedule_value(
+        cls,
+        schedule_type: str,
+        schedule_value: Any,
+    ) -> str:
+        """Validate and canonicalize schedule input before persistence/use."""
+        if not isinstance(schedule_value, str):
+            raise ValueError("Scheduled value must be a string")
+        value = schedule_value.strip()
+        if not value or len(value) > 512:
+            raise ValueError("Scheduled value is invalid")
+
+        if schedule_type == "interval":
+            try:
+                seconds = float(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "Scheduled interval must be a positive number"
+                ) from exc
+            if not math.isfinite(seconds) or seconds <= 0:
+                raise ValueError("Scheduled interval must be a positive number")
+            return value
+
+        if schedule_type == "once":
+            try:
+                target = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(
+                    "One-time schedule must be an ISO 8601 datetime"
+                ) from exc
+            if target.tzinfo is None or target.utcoffset() is None:
+                raise ValueError("One-time schedule must include an explicit timezone")
+            return target.astimezone(timezone.utc).isoformat()
+
+        if schedule_type == "cron":
+            cls._validate_cron_expression(value)
+            return value
+
+        raise ValueError("Unsupported schedule type")
+
+    @staticmethod
+    def _validate_cron_expression(cron_expr: str) -> None:
+        """Accept a valid five-field cron, failing closed without croniter."""
+        parts = cron_expr.split()
+        if len(parts) != 5:
+            raise ValueError("Cron schedule must contain exactly five fields")
+
+        try:
+            from croniter import croniter  # type: ignore[import-untyped]
+        except ImportError:
+            minute, hour, day, month, weekday = parts
+            if day != "*" or month != "*" or weekday != "*":
+                raise ValueError(
+                    "This cron expression requires the optional croniter backend"
+                )
+            for field, lower, upper, label in (
+                (minute, 0, 59, "minute"),
+                (hour, 0, 23, "hour"),
+            ):
+                if field == "*":
+                    continue
+                if not field.isascii() or not field.isdecimal():
+                    raise ValueError(
+                        "This cron expression requires the optional croniter backend"
+                    )
+                parsed = int(field)
+                if not lower <= parsed <= upper:
+                    raise ValueError(f"Cron {label} is out of range")
+            return
+
+        try:
+            valid = croniter.is_valid(cron_expr)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Cron schedule is invalid") from exc
+        if not valid:
+            raise ValueError("Cron schedule is invalid")
 
     @staticmethod
     def _compute_next_cron(cron_expr: str, now: datetime) -> Optional[str]:
@@ -314,34 +741,33 @@ class TaskScheduler:
         try:
             from croniter import croniter  # type: ignore[import-untyped]
 
-            it = croniter(cron_expr, now)
-            return it.get_next(datetime).isoformat()
+            try:
+                it = croniter(cron_expr, now)
+                return it.get_next(datetime).isoformat()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("Cron schedule is invalid") from exc
         except ImportError:
             pass
 
-        # Basic fallback: parse "minute hour * * *" style expressions
+        # Basic fail-closed fallback: only "minute hour * * *" where minute
+        # and hour are either "*" or one in-range integer.
+        TaskScheduler._validate_cron_expression(cron_expr)
         parts = cron_expr.strip().split()
-        if len(parts) < 5:
-            logger.warning(
-                "Cannot parse cron without croniter: %s",
-                cron_expr,
-            )
-            return (now + timedelta(hours=1)).isoformat()
-
         minute_part, hour_part = parts[0], parts[1]
+        target_minute = None if minute_part == "*" else int(minute_part)
+        target_hour = None if hour_part == "*" else int(hour_part)
 
-        try:
-            target_minute = int(minute_part) if minute_part != "*" else now.minute
-            target_hour = int(hour_part) if hour_part != "*" else now.hour
-        except ValueError:
-            return (now + timedelta(hours=1)).isoformat()
-
-        candidate = now.replace(
-            hour=target_hour, minute=target_minute, second=0, microsecond=0
-        )
-        if candidate <= now:
-            candidate += timedelta(days=1)
-        return candidate.isoformat()
+        # Search minute-by-minute. The restricted fallback always has a match
+        # within 24 hours, and starting at the next minute matches croniter's
+        # strictly-after-now semantics.
+        candidate = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        for _ in range(24 * 60 + 1):
+            if (target_minute is None or candidate.minute == target_minute) and (
+                target_hour is None or candidate.hour == target_hour
+            ):
+                return candidate.isoformat()
+            candidate += timedelta(minutes=1)
+        raise ValueError("Cron schedule has no reachable execution time")
 
 
 __all__ = [

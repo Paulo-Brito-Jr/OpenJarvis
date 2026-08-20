@@ -15,10 +15,22 @@ import json
 
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import StepType, ToolCall, ToolResult
+from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.skills.executor import SkillExecutor
 from openjarvis.skills.tool_adapter import SkillTool
 from openjarvis.skills.types import SkillManifest
 from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
+
+
+def _permitted_tool_executor(tools, *, bus=None) -> ToolExecutor:
+    policy = CapabilityPolicy()
+    policy.grant("skill-trace-test-agent", "tool:invoke")
+    return ToolExecutor(
+        tools,
+        bus=bus,
+        capability_policy=policy,
+        agent_id="skill-trace-test-agent",
+    )
 
 
 class TestSkillTraceTaggingEndToEnd:
@@ -44,11 +56,11 @@ class TestSkillTraceTaggingEndToEnd:
             markdown_content="Just instructions.",
             metadata={"openjarvis": {"source": "hermes"}},
         )
-        skill_executor = SkillExecutor(ToolExecutor([], bus=bus))
+        skill_executor = SkillExecutor(_permitted_tool_executor([], bus=bus))
         skill_tool = SkillTool(manifest, skill_executor)
 
         # Build a ToolExecutor that knows about the SkillTool, with the bus
-        tool_executor = ToolExecutor([skill_tool], bus=bus)
+        tool_executor = _permitted_tool_executor([skill_tool], bus=bus)
         # Invoke through the executor (this is what the agent would do)
         tool_executor.execute(
             ToolCall(id="t1", name="skill_research-skill", arguments="{}")
@@ -72,9 +84,9 @@ class TestSkillTraceTaggingEndToEnd:
             markdown_content="Body",
             metadata={"openjarvis": {"source": "openclaw"}},
         )
-        skill_executor = SkillExecutor(ToolExecutor([], bus=bus))
+        skill_executor = SkillExecutor(_permitted_tool_executor([], bus=bus))
         skill_tool = SkillTool(manifest, skill_executor)
-        tool_executor = ToolExecutor([skill_tool], bus=bus)
+        tool_executor = _permitted_tool_executor([skill_tool], bus=bus)
 
         # Stub agent that just calls the skill once
         class _StubAgent:
@@ -158,7 +170,7 @@ class TestEventMetadataIsJsonSafe:
 
         bus.subscribe(EventType.TOOL_CALL_END, _on_tool_end)
 
-        tool_executor = ToolExecutor([_TaintingTool()], bus=bus)
+        tool_executor = _permitted_tool_executor([_TaintingTool()], bus=bus)
         tool_executor.execute(ToolCall(id="t1", name="tainting", arguments="{}"))
 
         # The published metadata must be JSON serializable end-to-end
@@ -197,10 +209,10 @@ class TestEventMetadataIsJsonSafe:
             markdown_content="Body",
             metadata={"openjarvis": {"source": "hermes"}},
         )
-        skill_executor = SkillExecutor(ToolExecutor([], bus=bus))
+        skill_executor = SkillExecutor(_permitted_tool_executor([], bus=bus))
         skill_tool = SkillTool(manifest, skill_executor)
 
-        tool_executor = ToolExecutor([skill_tool], bus=bus)
+        tool_executor = _permitted_tool_executor([skill_tool], bus=bus)
         tool_executor.execute(ToolCall(id="t1", name="skill_my-skill", arguments="{}"))
 
         # Skill keys must survive the filter

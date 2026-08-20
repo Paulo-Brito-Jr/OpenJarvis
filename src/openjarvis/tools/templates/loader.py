@@ -181,13 +181,32 @@ class ToolTemplate(BaseTool):
 
     @property
     def spec(self) -> ToolSpec:
+        action_type = self._action.get("type", "python")
         return ToolSpec(
             name=self._name,
             description=self._description,
             parameters=self._parameters,
             category="template",
-            metadata={"template": True},
+            requires_confirmation=action_type in {"python", "shell"},
+            required_capabilities=["code:execute"],
+            metadata={
+                "template": True,
+                "action_type": action_type,
+            },
         )
+
+    def authorization_resource(self, params: Dict[str, Any]) -> str:
+        del params
+        action_type = self._action.get("type", "python")
+        if action_type == "shell":
+            return str(self._action.get("command", "")).strip() or (
+                f"template:{self._name}"
+            )
+        if action_type == "python":
+            return str(self._action.get("expression", "")).strip() or (
+                f"template:{self._name}"
+            )
+        return f"template:{self._name}:{action_type}"
 
     def execute(self, **params: Any) -> ToolResult:
         action_type = self._action.get("type", "python")

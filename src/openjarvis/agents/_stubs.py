@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from openjarvis.core.cancellation import CancellationToken, raise_if_cancelled
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolResult
@@ -27,6 +28,7 @@ class AgentContext:
     tools: List[str] = field(default_factory=list)
     memory_results: List[Any] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    cancellation_token: CancellationToken = field(default_factory=CancellationToken)
 
 
 @dataclass(slots=True)
@@ -57,6 +59,7 @@ class BaseAgent(ABC):
 
     agent_id: str
     accepts_tools: bool = False
+    requires_security_context: bool = False
 
     def __init__(
         self,
@@ -185,6 +188,11 @@ class BaseAgent(ABC):
         Publishes INFERENCE_START/END events on the bus when the engine
         does not publish its own (i.e. non-instrumented engines).
         """
+        # ``engine.generate`` may be the long-running boundary during which a
+        # streaming client disconnects.  Check on both sides so a late model
+        # response can never flow into a subsequent tool call.
+        raise_if_cancelled()
+
         if self._bus and not getattr(self._engine, "_publishes_events", False):
             engine_id = getattr(self._engine, "engine_id", "")
             self._bus.publish(
@@ -199,6 +207,8 @@ class BaseAgent(ABC):
             max_tokens=self._max_tokens,
             **extra_kwargs,
         )
+
+        raise_if_cancelled()
 
         if self._bus and not getattr(self._engine, "_publishes_events", False):
             usage = result.get("usage", {})
@@ -307,6 +317,7 @@ class ToolUsingAgent(BaseAgent):
     """
 
     accepts_tools: bool = True
+    requires_security_context: bool = True
 
     def __init__(
         self,
@@ -321,6 +332,7 @@ class ToolUsingAgent(BaseAgent):
         loop_guard_config: Optional[Any] = None,
         capability_policy: Optional[Any] = None,
         agent_id: Optional[str] = None,
+        boundary_guard: Optional[Any] = None,
         interactive: bool = False,
         confirm_callback: Optional[Any] = None,
         skill_few_shot_examples: Optional[List[str]] = None,
@@ -340,12 +352,15 @@ class ToolUsingAgent(BaseAgent):
         # Plan 2B I3: store optimized few-shot examples for agents to inject
         # into their own system prompt templates as appropriate.
         self._skill_few_shot_examples = list(skill_few_shot_examples or [])
-        _aid = agent_id or getattr(self, "agent_id", "")
+        # A class-level display name is not a runtime principal.  Only a
+        # caller-supplied identity may authorize tool execution.
+        _aid = agent_id if isinstance(agent_id, str) else ""
         self._executor = ToolExecutor(
             self._tools,
             bus=bus,
             capability_policy=capability_policy,
             agent_id=_aid,
+            boundary_guard=boundary_guard,
             interactive=interactive,
             confirm_callback=confirm_callback,
         )
@@ -372,6 +387,44 @@ class ToolUsingAgent(BaseAgent):
                 self._loop_guard = LoopGuard(loop_guard_config, bus=bus)
         except ImportError:
             pass
+
+    def bind_security(
+        self,
+        capability_policy: Optional[Any],
+        agent_id: Optional[str] = None,
+        boundary_guard: Optional[Any] = None,
+    ) -> None:
+        """Bind capability policy and stable identity after construction.
+
+        Several concrete agents keep backwards-compatible constructor
+        signatures and cannot safely accept new security kwargs.  Post-binding
+        makes propagation explicit and prevents permissive constructor
+        fallbacks from silently dropping policy or tools.
+        """
+        resolved_agent_id = agent_id if isinstance(agent_id, str) else ""
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            if self._tools:
+                raise RuntimeError(
+                    "Tool-using agent has tools but no ToolExecutor to secure"
+                )
+            return
+        executor.bind_security(capability_policy, resolved_agent_id)
+        # A rebind is a complete security-context replacement.  Explicitly
+        # clear an old guard when the new context omits one; otherwise a
+        # previous principal's DLP boundary can be reused accidentally.
+        executor.bind_boundary_guard(boundary_guard)
+
+    def bind_boundary_guard(self, boundary_guard: Optional[Any]) -> None:
+        """Bind outbound scanning independently for legacy call sites."""
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            if self._tools:
+                raise RuntimeError(
+                    "Tool-using agent has tools but no ToolExecutor to secure"
+                )
+            return
+        executor.bind_boundary_guard(boundary_guard)
 
 
 __all__ = ["AgentContext", "AgentResult", "BaseAgent", "ToolUsingAgent"]

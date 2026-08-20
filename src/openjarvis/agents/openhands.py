@@ -1,7 +1,8 @@
-"""OpenHandsAgent -- wraps the real openhands-sdk for AI-driven development.
+"""Security-disabled OpenHands SDK adapter.
 
-Requires the ``openhands-sdk`` package (``uv sync --extra openhands``).
-For the native CodeAct-style agent, see :mod:`openjarvis.agents.native_openhands`.
+The external SDK remains unavailable until it exposes a verified isolated
+sandbox and OpenJarvis capability bridge. Construction never reads or retains
+provider credentials.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ class OpenHandsAgent(BaseAgent):
     """
 
     agent_id = "openhands"
+    accepts_tools = False
+    requires_security_context = True
     _default_temperature = 0.7
     _default_max_tokens = 1024
 
@@ -47,7 +50,23 @@ class OpenHandsAgent(BaseAgent):
             max_tokens=max_tokens,
         )
         self._workspace = workspace or os.getcwd()
-        self._api_key = api_key or os.environ.get("LLM_API_KEY", "")
+        del api_key
+        self._api_key = ""
+        self._capability_policy = None
+        self._security_agent_id = ""
+
+    def bind_security(
+        self,
+        capability_policy: Optional[Any],
+        agent_id: Optional[str] = None,
+        boundary_guard: Optional[Any] = None,
+    ) -> None:
+        self._capability_policy = capability_policy
+        self._security_agent_id = agent_id if isinstance(agent_id, str) else ""
+        self._boundary_guard = boundary_guard
+
+    def bind_boundary_guard(self, boundary_guard: Optional[Any]) -> None:
+        self._boundary_guard = boundary_guard
 
     def run(
         self,
@@ -55,32 +74,21 @@ class OpenHandsAgent(BaseAgent):
         context: Optional[AgentContext] = None,
         **kwargs: Any,
     ) -> AgentResult:
-        try:
-            from openhands.sdk import (  # type: ignore[import-untyped]
-                LLM,
-                Agent,
-                Conversation,
-            )
-        except ImportError:
-            raise ImportError(
-                "OpenHandsAgent requires the openhands-sdk package. "
-                "Install it with: uv sync --extra openhands"
-            ) from None
-
         self._emit_turn_start(input)
-
-        llm = LLM(model=self._model, api_key=self._api_key)
-        agent = Agent(llm=llm)
-        conversation = Conversation(agent=agent, workspace=self._workspace)
-        conversation.send_message(input)
-        conversation.run()
-
-        # Extract result from conversation
-        messages = conversation.get_messages()
-        content = messages[-1].content if messages else ""
-
-        self._emit_turn_end(turns=1)
-        return AgentResult(content=content, turns=1)
+        self._emit_turn_end(turns=0, error=True)
+        return AgentResult(
+            content=(
+                "OpenHands adapter disabled: the external SDK does not expose "
+                "a verifiable OpenJarvis capability and isolated-sandbox "
+                "boundary."
+            ),
+            turns=0,
+            metadata={
+                "error": True,
+                "security_disabled": True,
+                "reason": "unverified_external_sandbox",
+            },
+        )
 
 
 __all__ = ["OpenHandsAgent"]

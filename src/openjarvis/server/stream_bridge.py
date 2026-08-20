@@ -13,8 +13,10 @@ import uuid
 from typing import AsyncGenerator
 
 from fastapi.responses import StreamingResponse
+from starlette.types import Send
 
 from openjarvis.agents._stubs import AgentContext, BaseAgent
+from openjarvis.core.cancellation import CancellationToken, cancellation_scope
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.engine._base import looks_like_context_length_error
 from openjarvis.server.models import (
@@ -82,6 +84,7 @@ class AgentStreamBridge:
         self._chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._queue: asyncio.Queue = asyncio.Queue()
         self._callbacks: dict[EventType, object] = {}
+        self._cancellation_token = CancellationToken()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -114,7 +117,7 @@ class AgentStreamBridge:
 
     def _run_agent(self) -> object:
         """Execute the agent synchronously (called via asyncio.to_thread)."""
-        ctx = AgentContext()
+        ctx = AgentContext(cancellation_token=self._cancellation_token)
         # Build conversation context from prior messages
         if len(self._request.messages) > 1:
             from openjarvis.core.types import Message, Role
@@ -139,13 +142,18 @@ class AgentStreamBridge:
         if self._model:
             self._agent._model = self._model
         try:
-            return self._agent.run(input_text, context=ctx)
+            with cancellation_scope(ctx.cancellation_token):
+                return self._agent.run(input_text, context=ctx)
         finally:
             self._agent._model = original_model
 
     # ------------------------------------------------------------------
     # Public streaming interface
     # ------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Signal that the response consumer has gone away."""
+        self._cancellation_token.cancel()
 
     async def stream(self) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE-formatted strings."""
@@ -156,7 +164,13 @@ class AgentStreamBridge:
         agent_task = asyncio.ensure_future(asyncio.to_thread(self._run_agent))
 
         def _on_done(fut):
-            loop.call_soon_threadsafe(self._queue.put_nowait, _DONE)
+            # Retrieve an exception even if the client has already gone away;
+            # this prevents an abandoned worker from producing an unhandled
+            # task warning.  ``result()`` below can still retrieve it later.
+            if not fut.cancelled():
+                fut.exception()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(self._queue.put_nowait, _DONE)
 
         agent_task.add_done_callback(_on_done)
 
@@ -205,9 +219,9 @@ class AgentStreamBridge:
                         "Please try a shorter message."
                     )
                 elif "400" in error_str:
-                    error_content = f"The model returned an error: {error_str}"
+                    error_content = "The model rejected the agent request."
                 else:
-                    error_content = f"Sorry, an error occurred: {error_str}"
+                    error_content = "Sorry, agent execution failed."
                 error_chunk = ChatCompletionChunk(
                     id=self._chunk_id,
                     model=self._model,
@@ -240,65 +254,14 @@ class AgentStreamBridge:
                     {"results": tool_results_data},
                 )
 
-            # Stream content using real LLM token streaming via
-            # engine.stream_full() when the engine is available.
+            # The agent has already completed its model/tool loop. Starting a
+            # second inference here would discard tool results, double cost,
+            # and potentially stream an answer different from the audited
+            # AgentResult. Emit that exact result in bounded chunks instead.
             content = agent_result.content or ""
-            engine = getattr(self._agent, "_engine", None)
-            used_real_streaming = False
-
-            if engine is not None and hasattr(engine, "stream_full") and content:
-                # Re-stream using the engine for real token delivery.
-                # Build the same messages the agent used for its final turn.
-                try:
-                    from openjarvis.core.types import Message as MsgType
-                    from openjarvis.core.types import Role as RoleType
-
-                    replay_messages = []
-                    for m in self._request.messages:
-                        role = (
-                            RoleType(m.role)
-                            if m.role in {r.value for r in RoleType}
-                            else RoleType.USER
-                        )
-                        replay_messages.append(
-                            MsgType(
-                                role=role,
-                                content=m.content or "",
-                                name=m.name,
-                                tool_call_id=m.tool_call_id,
-                            )
-                        )
-
-                    async for sc in engine.stream_full(
-                        replay_messages,
-                        model=self._model,
-                    ):
-                        if sc.content:
-                            chunk = ChatCompletionChunk(
-                                id=self._chunk_id,
-                                model=self._model,
-                                choices=[
-                                    StreamChoice(
-                                        delta=DeltaMessage(content=sc.content),
-                                    )
-                                ],
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-                    used_real_streaming = True
-                except Exception as stream_exc:
-                    import logging as _logging
-
-                    _logger = _logging.getLogger("openjarvis.server")
-                    _logger.warning(
-                        "Real streaming failed, falling back to word replay: %s",
-                        stream_exc,
-                    )
-
-            # Fallback: word-by-word replay if real streaming was not used
-            if not used_real_streaming and content:
-                words = content.split(" ")
-                for i, word in enumerate(words):
-                    token = word if i == 0 else " " + word
+            if content:
+                for offset in range(0, len(content), 64):
+                    token = content[offset : offset + 64]
                     chunk = ChatCompletionChunk(
                         id=self._chunk_id,
                         model=self._model,
@@ -309,7 +272,7 @@ class AgentStreamBridge:
                         ],
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
-                    await asyncio.sleep(0.012)
+                    await asyncio.sleep(0)
 
             # Final chunk: finish_reason + usage
             prompt_tokens = agent_result.metadata.get("prompt_tokens", 0)
@@ -344,13 +307,42 @@ class AgentStreamBridge:
 
             yield "data: [DONE]\n\n"
 
-        except Exception:
-            # On error, cancel the agent task if still running
+        finally:
+            # Cancelling an asyncio task does not stop ``to_thread`` work.
+            # Signal the cooperative token first; the agent and executor will
+            # refuse every later inference/tool boundary.
+            self.cancel()
             if not agent_task.done():
                 agent_task.cancel()
-            raise
-        finally:
             self._unsubscribe_all()
+
+
+class AgentStreamingResponse(StreamingResponse):
+    """Streaming response that always closes its request-scoped agent.
+
+    ASGI 2.4 reports a disconnected client as ``OSError`` from ``send()``.
+    That error occurs in the response loop while the async generator is
+    suspended at ``yield``; Python does not guarantee that the generator is
+    closed at that point.  Owning cleanup at the response boundary ensures the
+    synchronous worker sees cancellation even when Starlette retains the body
+    iterator after the failed send.
+    """
+
+    def __init__(self, bridge: AgentStreamBridge) -> None:
+        self._bridge = bridge
+        self._agent_stream = bridge.stream()
+        super().__init__(
+            self._agent_stream,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            self._bridge.cancel()
+            await self._agent_stream.aclose()
 
 
 async def create_agent_stream(
@@ -361,11 +353,7 @@ async def create_agent_stream(
 ) -> StreamingResponse:
     """Create an AgentStreamBridge and return a FastAPI StreamingResponse."""
     bridge = AgentStreamBridge(agent, bus, model, request)
-    return StreamingResponse(
-        bridge.stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
+    return AgentStreamingResponse(bridge)
 
 
-__all__ = ["AgentStreamBridge", "create_agent_stream"]
+__all__ = ["AgentStreamBridge", "AgentStreamingResponse", "create_agent_stream"]

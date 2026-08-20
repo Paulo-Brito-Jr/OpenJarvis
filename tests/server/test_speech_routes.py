@@ -1,5 +1,7 @@
 """Tests for speech API endpoints."""
 
+import io
+import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,6 +11,16 @@ fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from openjarvis.speech._stubs import TranscriptionResult  # noqa: E402
+
+
+def _wav_bytes(*, duration_seconds: int = 1, frame_rate: int = 8_000) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(1)
+        wav.setframerate(frame_rate)
+        wav.writeframes(b"\x80" * (duration_seconds * frame_rate))
+    return output.getvalue()
 
 
 @pytest.fixture
@@ -46,7 +58,7 @@ def client(app_with_speech):
 def test_transcribe_endpoint(client, mock_speech_backend):
     response = client.post(
         "/v1/speech/transcribe",
-        files={"file": ("test.wav", b"fake audio data", "audio/wav")},
+        files={"file": ("test.wav", _wav_bytes(), "audio/wav")},
     )
     assert response.status_code == 200
     data = response.json()
@@ -57,6 +69,7 @@ def test_transcribe_endpoint(client, mock_speech_backend):
 
 
 def test_transcribe_endpoint_offloads_backend_work(client, mock_speech_backend):
+    wav_data = _wav_bytes()
     expected = TranscriptionResult(
         text="Offloaded",
         language="en",
@@ -72,13 +85,13 @@ def test_transcribe_endpoint_offloads_backend_work(client, mock_speech_backend):
         mock_to_thread.return_value = expected
         response = client.post(
             "/v1/speech/transcribe",
-            files={"file": ("test.wav", b"fake audio data", "audio/wav")},
+            files={"file": ("test.wav", wav_data, "audio/wav")},
         )
 
     assert response.status_code == 200
     mock_to_thread.assert_awaited_once()
     args, kwargs = mock_to_thread.await_args
-    assert args == (mock_speech_backend.transcribe, b"fake audio data")
+    assert args == (mock_speech_backend.transcribe, wav_data)
     assert kwargs == {"format": "wav", "language": None}
     assert response.json()["text"] == "Offloaded"
 
@@ -88,7 +101,7 @@ def test_transcribe_endpoint_surfaces_backend_error(client, mock_speech_backend)
 
     response = client.post(
         "/v1/speech/transcribe",
-        files={"file": ("test.wav", b"fake audio data", "audio/wav")},
+        files={"file": ("test.wav", _wav_bytes(), "audio/wav")},
     )
 
     assert response.status_code == 500
@@ -98,6 +111,32 @@ def test_transcribe_endpoint_surfaces_backend_error(client, mock_speech_backend)
 def test_transcribe_no_file(client):
     response = client.post("/v1/speech/transcribe")
     assert response.status_code == 400 or response.status_code == 422
+
+
+def test_transcribe_rejects_unbounded_compressed_audio(client):
+    response = client.post(
+        "/v1/speech/transcribe",
+        files={"file": ("test.mp3", b"fake", "audio/mpeg")},
+    )
+    assert response.status_code == 415
+
+
+def test_transcribe_rejects_oversized_duration_before_backend(
+    client,
+    mock_speech_backend,
+):
+    response = client.post(
+        "/v1/speech/transcribe",
+        files={
+            "file": (
+                "long.wav",
+                _wav_bytes(duration_seconds=901, frame_rate=1),
+                "audio/wav",
+            )
+        },
+    )
+    assert response.status_code == 413
+    mock_speech_backend.transcribe.assert_not_called()
 
 
 def test_health_endpoint(client):
