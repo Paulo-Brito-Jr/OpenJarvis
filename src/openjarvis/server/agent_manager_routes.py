@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re as _re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
+from starlette.concurrency import run_in_threadpool
+
 from openjarvis.agents.manager import AgentManager
+from openjarvis.core.cancellation import (
+    AgentCancelledError,
+    CancellationToken,
+    cancellation_scope,
+)
 from openjarvis.server.response_security import (
     project_channel_binding,
     project_managed_agent,
 )
+from openjarvis.server.stream_bridge import CancelableStreamingResponse
 
 try:
     from fastapi import APIRouter, HTTPException, Request
@@ -20,6 +30,9 @@ except ImportError:
     raise ImportError("fastapi and pydantic are required for server routes")
 
 logger = logging.getLogger("openjarvis.server.agent_manager")
+
+_DEEP_RESEARCH_STREAM_TIMEOUT_SECONDS = 600.0
+_DEEP_RESEARCH_TIMEOUT_CONTENT = "Error: Deep research timed out."
 
 
 class CreateAgentRequest(BaseModel):
@@ -862,22 +875,121 @@ async def _stream_managed_agent(
     manager.mark_message_delivered(message_id)
 
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    cancellation_token = CancellationToken()
 
     # For deep_research agents: run the full agent loop, not raw streaming
     if agent_type == "deep_research" and app_state is not None:
         dr_tools = getattr(app_state, "_dr_tools", None)
         if dr_tools:
+            deep_research_lock = threading.Lock()
+            deep_research_state: Dict[str, Any] = {
+                "closed": False,
+                "persisted": False,
+                "content": None,
+                "tool_calls": [],
+                "in_flight": 0,
+                "worker_settled": False,
+                "timed_out": False,
+                "terminal_event": None,
+            }
+
+            def _persist_deep_research(*, mark_closed: bool = False) -> None:
+                """Persist the best completed state once the response closes.
+
+                The worker may finish a tool or final answer concurrently with
+                an ASGI send failure. Keeping the state outside the async
+                generator lets the response-level close hook save whichever
+                completed records exist without starting a second agent turn.
+                """
+                with deep_research_lock:
+                    if mark_closed:
+                        deep_research_state["closed"] = True
+                    if (
+                        not deep_research_state["closed"]
+                        or deep_research_state["persisted"]
+                        or deep_research_state["in_flight"] > 0
+                        or not deep_research_state["worker_settled"]
+                    ):
+                        return
+
+                    content = deep_research_state["content"]
+                    tool_calls = list(deep_research_state["tool_calls"])
+                    if content is None:
+                        if tool_calls:
+                            # A timed-out/cancelled agent may still have
+                            # completed an externally visible tool effect. Keep
+                            # that replay record without storing timeout text as
+                            # though it were the agent's final answer.
+                            content = ""
+                        elif deep_research_state["timed_out"]:
+                            content = _DEEP_RESEARCH_TIMEOUT_CONTENT
+                        else:
+                            return
+
+                    try:
+                        manager.store_agent_response(
+                            agent_id,
+                            content or "",
+                            tool_calls=tool_calls or None,
+                        )
+                    except Exception as persist_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to persist deep-research response: %s",
+                            persist_exc,
+                        )
+                    else:
+                        deep_research_state["persisted"] = True
+
+            def _record_deep_research_terminal(
+                event: Dict[str, Any],
+            ) -> None:
+                with deep_research_lock:
+                    deep_research_state["content"] = event["content"]
+                    deep_research_state["terminal_event"] = dict(event)
+
+            def _deep_research_terminal_snapshot() -> Dict[str, Any] | None:
+                with deep_research_lock:
+                    terminal = deep_research_state["terminal_event"]
+                    return dict(terminal) if terminal is not None else None
+
+            def _claim_deep_research_timeout() -> Dict[str, Any] | None:
+                with deep_research_lock:
+                    terminal = deep_research_state["terminal_event"]
+                    if terminal is not None:
+                        return dict(terminal)
+                    deep_research_state["timed_out"] = True
+                    return None
+
+            def _begin_deep_research_tool() -> None:
+                with deep_research_lock:
+                    deep_research_state["in_flight"] += 1
+
+            def _finish_deep_research_tool() -> None:
+                with deep_research_lock:
+                    deep_research_state["in_flight"] -= 1
+                _persist_deep_research()
+
+            def _settle_deep_research_worker() -> None:
+                with deep_research_lock:
+                    deep_research_state["worker_settled"] = True
+                _persist_deep_research()
 
             async def generate_deep_research():
                 """Run DeepResearchAgent in thread, stream progress + result."""
-                import asyncio
-                import queue
-                import threading
                 import time as _dr_time
 
                 from openjarvis.agents.deep_research import DeepResearchAgent
 
-                progress_q: queue.Queue = queue.Queue()
+                loop = asyncio.get_running_loop()
+                progress_q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+                def _enqueue_progress(event: Dict[str, Any]) -> None:
+                    if cancellation_token.is_cancelled or loop.is_closed():
+                        return
+                    try:
+                        loop.call_soon_threadsafe(progress_q.put_nowait, event)
+                    except RuntimeError:
+                        return
 
                 # Log query start
                 _dr_start = _dr_time.time()
@@ -913,6 +1025,7 @@ async def _stream_managed_agent(
                 original_execute = dr_agent._executor.execute
 
                 def _tracked_execute(tc):
+                    cancellation_token.raise_if_cancelled()
                     tool_name = tc.name
                     full_args = tc.arguments or ""
                     args_str = full_args[:80]
@@ -927,7 +1040,7 @@ async def _stream_managed_agent(
                     except Exception as _tc_exc:
                         logger.warning("Log tool_call failed: %s", _tc_exc)
 
-                    progress_q.put(
+                    _enqueue_progress(
                         {
                             "type": "tool_start",
                             "tool": tool_name,
@@ -936,102 +1049,210 @@ async def _stream_managed_agent(
                         }
                     )
                     _tool_start = _dr_time.monotonic()
-                    result = original_execute(tc)
-                    _tool_latency_ms = (_dr_time.monotonic() - _tool_start) * 1000
-
-                    # Log tool result
+                    _begin_deep_research_tool()
                     try:
-                        _ok = "succeeded" if result.success else "failed"
-                        _clen = len(result.content) if result.content else 0
-                        manager.add_learning_log(
-                            agent_id,
-                            "tool_result",
-                            f"{tool_name} {_ok} ({_clen} chars)",
-                            {
-                                "tool": tool_name,
-                                "success": result.success,
-                                "output_length": _clen,
-                            },
-                        )
-                    except Exception as _tr_exc:
-                        logger.warning("Log tool_result failed: %s", _tr_exc)
+                        cancellation_token.raise_if_cancelled()
+                        result = original_execute(tc)
+                        _tool_latency_ms = (_dr_time.monotonic() - _tool_start) * 1000
 
-                    progress_q.put(
-                        {
-                            "type": "tool_end",
+                        # Log tool result
+                        try:
+                            _ok = "succeeded" if result.success else "failed"
+                            _clen = len(result.content) if result.content else 0
+                            manager.add_learning_log(
+                                agent_id,
+                                "tool_result",
+                                f"{tool_name} {_ok} ({_clen} chars)",
+                                {
+                                    "tool": tool_name,
+                                    "success": result.success,
+                                    "output_length": _clen,
+                                },
+                            )
+                        except Exception as _tr_exc:
+                            logger.warning("Log tool_result failed: %s", _tr_exc)
+
+                        completed_tool_call = {
                             "tool": tool_name,
                             "arguments": full_args,
-                            "success": result.success,
-                            "latency": _tool_latency_ms,
                             "result": result.content or "",
+                            "success": bool(result.success),
+                            "latency": float(_tool_latency_ms),
                         }
-                    )
-                    return result
+                        with deep_research_lock:
+                            deep_research_state["tool_calls"].append(
+                                completed_tool_call
+                            )
+
+                        _enqueue_progress({"type": "tool_end", **completed_tool_call})
+                        return result
+                    finally:
+                        _finish_deep_research_tool()
 
                 dr_agent._executor.execute = _tracked_execute
+
+                def _log_deep_research_cancelled() -> None:
+                    elapsed = _dr_time.time() - _dr_start
+                    try:
+                        manager.add_learning_log(
+                            agent_id,
+                            "query_cancelled",
+                            f"Cancelled after {elapsed:.1f}s",
+                            {
+                                "elapsed_seconds": round(elapsed, 2),
+                                "cancelled": True,
+                            },
+                        )
+                    except Exception as cancel_log_exc:
+                        logger.warning(
+                            "Cancellation log failed: %s",
+                            cancel_log_exc,
+                        )
 
                 def _run_agent():
                     agent_metadata = {}
                     try:
-                        result = dr_agent.run(user_content)
-                        content = result.content or "No results found."
-                        agent_metadata = result.metadata or {}
-                    except Exception as exc:
-                        content = f"Error: {exc}"
+                        try:
+                            with cancellation_scope(cancellation_token):
+                                cancellation_token.raise_if_cancelled()
+                                result = dr_agent.run(user_content)
+                            content = result.content or "No results found."
+                            agent_metadata = result.metadata or {}
+                        except AgentCancelledError:
+                            raise
+                        except Exception as exc:
+                            if cancellation_token.is_cancelled:
+                                cancellation_token.raise_if_cancelled()
+                            content = f"Error: {exc}"
 
-                    elapsed = _dr_time.time() - _dr_start
-
-                    # Log BEFORE queue put (put triggers SSE end)
-                    try:
-                        is_err = content.startswith("Error:")
-                        manager.add_learning_log(
-                            agent_id,
-                            "query_error" if is_err else "query_complete",
-                            f"{'Error' if is_err else 'Response'}: "
-                            f"{len(content)} chars in {elapsed:.1f}s",
-                            {
-                                "response_length": len(content),
-                                "elapsed_seconds": round(elapsed, 2),
-                            },
-                        )
-                    except Exception as _qc_exc:
-                        logger.warning(
-                            "Log failed: %s",
-                            _qc_exc,
-                        )
-
-                    progress_q.put(
-                        {
-                            "type": "error" if content.startswith("Error:") else "done",
+                        elapsed = _dr_time.time() - _dr_start
+                        terminal_event = {
+                            "type": (
+                                "error" if content.startswith("Error:") else "done"
+                            ),
                             "content": content,
                             "metadata": agent_metadata,
                             "elapsed": elapsed,
                         }
-                    )
+                        # Publish terminal state before scheduling its queue
+                        # callback. The deadline consumer can now observe a
+                        # completed result even if call_soon_threadsafe has not
+                        # run yet.
+                        _record_deep_research_terminal(terminal_event)
+                        cancellation_token.raise_if_cancelled()
 
-                thread = threading.Thread(target=_run_agent, daemon=True)
-                thread.start()
+                        # Log BEFORE queue put (put triggers SSE end)
+                        try:
+                            is_err = content.startswith("Error:")
+                            manager.add_learning_log(
+                                agent_id,
+                                "query_error" if is_err else "query_complete",
+                                f"{'Error' if is_err else 'Response'}: "
+                                f"{len(content)} chars in {elapsed:.1f}s",
+                                {
+                                    "response_length": len(content),
+                                    "elapsed_seconds": round(elapsed, 2),
+                                },
+                            )
+                        except Exception as _qc_exc:
+                            logger.warning(
+                                "Log failed: %s",
+                                _qc_exc,
+                            )
 
-                # Collect tool calls from deep-research so we can persist them
-                # alongside the final response (and the UI can re-render them
-                # after a page reload).
-                dr_tool_calls: List[Dict[str, Any]] = []
-                _pending_dr_starts: Dict[str, str] = {}
+                        _enqueue_progress(terminal_event)
+                    except AgentCancelledError:
+                        _log_deep_research_cancelled()
+                    finally:
+                        _settle_deep_research_worker()
+
+                def _run_agent_safely() -> None:
+                    try:
+                        _run_agent()
+                    except Exception as worker_exc:  # noqa: BLE001
+                        # Raw daemon threads have no Future whose exception can
+                        # be retrieved. Consume any unexpected wrapper failure
+                        # here so shutdown never emits an unhandled traceback.
+                        logger.exception(
+                            "Deep-research worker failed during teardown: %s",
+                            worker_exc,
+                        )
+
+                # An executor-backed ``asyncio.to_thread`` worker can keep the
+                # interpreter's default executor alive after its Task is
+                # cancelled. This request-scoped daemon is cooperatively
+                # cancelled by the token and cannot block server shutdown.
+                worker_thread = threading.Thread(
+                    target=_run_agent_safely,
+                    name=f"deep-research-{agent_id}",
+                    daemon=True,
+                )
+                worker_thread.start()
+
+                deadline = loop.time() + _DEEP_RESEARCH_STREAM_TIMEOUT_SECONDS
 
                 # Stream progress events and final content
                 while True:
-                    try:
-                        event = await asyncio.to_thread(progress_q.get, timeout=600)
-                    except Exception:
-                        # Timeout
-                        yield _sse_chunk(chunk_id, model, "Agent timed out.")
-                        break
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        event = None
+                    else:
+                        try:
+                            event = await asyncio.wait_for(
+                                progress_q.get(),
+                                timeout=remaining,
+                            )
+                        except asyncio.TimeoutError:
+                            event = None
+
+                    if event is None:
+                        # The worker publishes terminal state synchronously
+                        # before scheduling its queue callback. This snapshot
+                        # therefore wins even when call_soon_threadsafe is
+                        # still pending at the deadline boundary.
+                        event = _deep_research_terminal_snapshot()
+
+                    if event is None:
+                        try:
+                            event = progress_q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+
+                    if event is None:
+                        # Close the final snapshot→timeout race under the same
+                        # lock used by the worker's terminal publication.
+                        event = _claim_deep_research_timeout()
+
+                    if event is None:
+                        cancellation_token.cancel()
+                        timeout_content = _DEEP_RESEARCH_TIMEOUT_CONTENT
+                        elapsed = _dr_time.time() - _dr_start
+                        try:
+                            manager.add_learning_log(
+                                agent_id,
+                                "query_error",
+                                f"Deep research timed out after {elapsed:.1f}s",
+                                {
+                                    "elapsed_seconds": round(elapsed, 2),
+                                    "timeout": True,
+                                },
+                            )
+                        except Exception as timeout_log_exc:
+                            logger.warning(
+                                "Deep-research timeout log failed: %s",
+                                timeout_log_exc,
+                            )
+                        event = {
+                            "type": "error",
+                            "content": timeout_content,
+                            "metadata": {},
+                            "elapsed": elapsed,
+                        }
 
                     if event["type"] == "tool_start":
                         tool = event["tool"]
                         args = event.get("args", "")
                         full_args = event.get("full_args", "")
-                        _pending_dr_starts[tool] = full_args
                         # Structured event so the UI can render a tool_call
                         # message card (same shape as the non-DR path).
                         _start_payload = json.dumps(
@@ -1058,18 +1279,6 @@ async def _stream_managed_agent(
 
                     elif event["type"] == "tool_end":
                         tool = event["tool"]
-                        dr_tool_calls.append(
-                            {
-                                "tool": tool,
-                                "arguments": event.get(
-                                    "arguments", _pending_dr_starts.get(tool, "")
-                                ),
-                                "result": event.get("result", ""),
-                                "success": bool(event.get("success", False)),
-                                "latency": float(event.get("latency", 0.0)),
-                            }
-                        )
-                        _pending_dr_starts.pop(tool, None)
                         _end_payload = json.dumps(
                             {
                                 "tool": tool,
@@ -1125,23 +1334,20 @@ async def _stream_managed_agent(
                         }
                         yield f"data: {json.dumps(finish_data)}\n\n"
                         yield "data: [DONE]\n\n"
-
-                        # Persist (with the tool calls captured during
-                        # the deep-research turn so they survive reload).
-                        manager.store_agent_response(
-                            agent_id,
-                            content,
-                            tool_calls=dr_tool_calls or None,
-                        )
                         break
 
-            return StreamingResponse(
+            def _close_deep_research() -> None:
+                _persist_deep_research(mark_closed=True)
+
+            return CancelableStreamingResponse(
                 generate_deep_research(),
+                cancel=cancellation_token.cancel,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 },
+                on_close=_close_deep_research,
             )
 
     # Build extra kwargs for stream_full (e.g. tools from config).
@@ -1173,51 +1379,110 @@ async def _stream_managed_agent(
                 "Failed to get MCP tools for streaming: %s", exc, exc_info=True
             )
 
-    # Shared state between the generator and the BackgroundTask that
-    # runs after the SSE response completes (or the client disconnects
-    # mid-stream). Starlette guarantees the BackgroundTask runs in both
-    # cases, so we use it as the single, reliable persistence point.
+    # Shared state between the generator and its idempotent close callback.
+    # Starlette skips BackgroundTask after an ASGI 2.4 send failure, so the
+    # cancelable response invokes the same persistence function while closing.
+    persist_lock = threading.Lock()
     persist_state: Dict[str, Any] = {
         "content": "",
         "tool_calls": [],
-        "persisted": False,
+        "closed": False,
+        "in_flight": 0,
+        "stored": False,
+        "logged": False,
+        "persisting": False,
     }
 
-    def _persist_final() -> None:
-        if persist_state["persisted"]:
-            return
-        persist_state["persisted"] = True
-        if persist_state["content"]:
-            try:
-                manager.store_agent_response(
-                    agent_id,
-                    persist_state["content"],
-                    tool_calls=persist_state["tool_calls"] or None,
-                )
-            except Exception as store_exc:
-                logger.error(
-                    "Failed to store agent response: %s",
-                    store_exc,
-                    exc_info=True,
-                )
-        try:
+    def _set_persist_content(content: str) -> None:
+        with persist_lock:
+            persist_state["content"] = content
+
+    def _record_persisted_tool_call(tool_call: Dict[str, Any]) -> None:
+        with persist_lock:
+            persist_state["tool_calls"].append(tool_call)
+
+    def _begin_in_flight_tool() -> None:
+        with persist_lock:
+            persist_state["in_flight"] += 1
+
+    def _persist_final(*, mark_closed: bool = False) -> None:
+        with persist_lock:
+            if mark_closed:
+                persist_state["closed"] = True
+            if (
+                not persist_state["closed"]
+                or persist_state["in_flight"] > 0
+                or persist_state["persisting"]
+            ):
+                return
+
             content = persist_state["content"] or ""
-            manager.add_learning_log(
-                agent_id,
-                "query_complete",
-                f"Response: {len(content)} chars, "
-                f"{len(persist_state['tool_calls'])} tool calls",
-                {
-                    "response_length": len(content),
-                    "tool_calls": len(persist_state["tool_calls"]),
-                },
-            )
-        except Exception as _qc_exc:
-            logger.warning("Log query_complete failed: %s", _qc_exc)
+            tool_calls = list(persist_state["tool_calls"])
+            if not content and not tool_calls:
+                return
+            if persist_state["stored"] and persist_state["logged"]:
+                return
+
+            should_store = not persist_state["stored"]
+            should_log = not persist_state["logged"]
+            persist_state["persisting"] = True
+
+        if should_store:
+            store_succeeded = False
+            for attempt in range(2):
+                try:
+                    manager.store_agent_response(
+                        agent_id,
+                        content,
+                        tool_calls=tool_calls or None,
+                    )
+                except Exception as store_exc:
+                    logger.error(
+                        "Failed to store agent response (attempt %d/2): %s",
+                        attempt + 1,
+                        store_exc,
+                        exc_info=True,
+                    )
+                else:
+                    store_succeeded = True
+                    break
+
+            if not store_succeeded:
+                with persist_lock:
+                    persist_state["persisting"] = False
+                return
+            with persist_lock:
+                persist_state["stored"] = True
+
+        if should_log:
+            try:
+                manager.add_learning_log(
+                    agent_id,
+                    "query_complete",
+                    f"Response: {len(content)} chars, {len(tool_calls)} tool calls",
+                    {
+                        "response_length": len(content),
+                        "tool_calls": len(tool_calls),
+                    },
+                )
+            except Exception as log_exc:
+                logger.warning("Log query_complete failed: %s", log_exc)
+            else:
+                with persist_lock:
+                    persist_state["logged"] = True
+
+        with persist_lock:
+            persist_state["persisting"] = False
+
+    def _finish_in_flight_tool() -> None:
+        with persist_lock:
+            persist_state["in_flight"] -= 1
+        _persist_final()
 
     async def generate():
         """Async generator yielding SSE-formatted chunks with real token streaming."""
 
+        cancellation_token.raise_if_cancelled()
         collected_content = ""
         collected_tool_calls: List[Dict[str, Any]] = []
         messages_for_llm = list(llm_messages)
@@ -1237,49 +1502,68 @@ async def _stream_managed_agent(
             logger.warning("Log query_start failed: %s", _qs_exc)
 
         while turns < max_turns:
+            cancellation_token.raise_if_cancelled()
             turns += 1
             turn_content = ""
             tool_call_fragments: Dict[int, Dict[str, Any]] = {}
             current_finish_reason = None
 
             try:
-                async for chunk in engine.stream_full(
+                cancellation_token.raise_if_cancelled()
+                provider_stream = engine.stream_full(
                     messages_for_llm,
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     **stream_kwargs,
-                ):
-                    # Stream content tokens immediately to the client
-                    if chunk.content:
-                        turn_content += chunk.content
-                        # Mirror partial content so a disconnect during
-                        # generation still saves what we've produced.
-                        persist_state["content"] = collected_content + turn_content
-                        chunk_data = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": chunk.content},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                )
+                try:
+                    async for chunk in provider_stream:
+                        cancellation_token.raise_if_cancelled()
+                        # Stream content tokens immediately to the client
+                        if chunk.content:
+                            turn_content += chunk.content
+                            # Mirror partial content so a disconnect during
+                            # generation still saves what we've produced.
+                            _set_persist_content(collected_content + turn_content)
+                            chunk_data = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk.content},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk_data)}\n\n"
 
-                    # Accumulate tool_call fragments
-                    if chunk.tool_calls:
-                        _merge_tool_call_fragments(
-                            tool_call_fragments,
-                            chunk.tool_calls,
-                        )
+                        # Accumulate tool_call fragments
+                        if chunk.tool_calls:
+                            _merge_tool_call_fragments(
+                                tool_call_fragments,
+                                chunk.tool_calls,
+                            )
 
-                    if chunk.finish_reason:
-                        current_finish_reason = chunk.finish_reason
+                        if chunk.finish_reason:
+                            current_finish_reason = chunk.finish_reason
+                finally:
+                    close_provider = getattr(provider_stream, "aclose", None)
+                    if close_provider is not None:
+                        try:
+                            await close_provider()
+                        except Exception as close_exc:
+                            logger.debug(
+                                "Managed provider stream close failed: %s",
+                                close_exc,
+                                exc_info=True,
+                            )
 
+                cancellation_token.raise_if_cancelled()
+            except AgentCancelledError:
+                raise
             except Exception as exc:
                 logger.error("Managed agent stream error: %s", exc, exc_info=True)
                 error_data = {
@@ -1328,7 +1612,62 @@ async def _stream_managed_agent(
                 # in stream_bridge.py).
                 import time as _time
 
+                def _execute_and_capture_tool(
+                    executor: Any,
+                    tool_call: Any,
+                    tool_name: str,
+                    tool_args: str,
+                    tool_start_ms: float,
+                ) -> Dict[str, Any]:
+                    """Run one dispatched tool and preserve its terminal record.
+
+                    ``asyncio`` cannot stop the underlying ``to_thread`` call
+                    after a disconnect. The worker therefore owns result
+                    capture and decrements ``in_flight`` only after the replay
+                    record is in shared state.
+                    """
+                    try:
+                        with cancellation_scope(cancellation_token):
+                            cancellation_token.raise_if_cancelled()
+                            result = executor.execute(tool_call)
+
+                        tool_record = {
+                            "tool": tool_name,
+                            "arguments": tool_args,
+                            "result": result.content,
+                            "success": bool(result.success),
+                            "latency": ((_time.monotonic() * 1000) - tool_start_ms),
+                        }
+                        _record_persisted_tool_call(tool_record)
+                        # Preserve a result that completed concurrently with
+                        # cancellation, then prevent any later agent turn.
+                        cancellation_token.raise_if_cancelled()
+                        return tool_record
+                    except AgentCancelledError:
+                        raise
+                    except Exception as tool_exc:
+                        if cancellation_token.is_cancelled:
+                            cancellation_token.raise_if_cancelled()
+                        logger.error(
+                            "Tool execution error for %s: %s",
+                            tool_name,
+                            tool_exc,
+                            exc_info=True,
+                        )
+                        tool_record = {
+                            "tool": tool_name,
+                            "arguments": tool_args,
+                            "result": (f"Error executing {tool_name}: {tool_exc}"),
+                            "success": False,
+                            "latency": ((_time.monotonic() * 1000) - tool_start_ms),
+                        }
+                        _record_persisted_tool_call(tool_record)
+                        return tool_record
+                    finally:
+                        _finish_in_flight_tool()
+
                 for tc in sorted_tcs:
+                    cancellation_token.raise_if_cancelled()
                     tool_name = tc["function"]["name"]
                     tool_args = tc["function"]["arguments"]
                     tool_result_content = f"Tool '{tool_name}' not available"
@@ -1348,6 +1687,7 @@ async def _stream_managed_agent(
                     except Exception as _tc_exc:
                         logger.warning("Log tool_call failed: %s", _tc_exc)
                     tool_start_ms = _time.monotonic() * 1000
+                    tool_record: Dict[str, Any] | None = None
 
                     try:
                         from openjarvis.tools._stubs import (
@@ -1392,15 +1732,39 @@ async def _stream_managed_agent(
                                 app_state=app_state,
                                 agent_id=security_principal,
                             )
-                            result = executor.execute(
-                                StubToolCall(
-                                    id=tc["id"],
-                                    name=tool_name,
-                                    arguments=tool_args,
-                                ),
+                            stub_tool_call = StubToolCall(
+                                id=tc["id"],
+                                name=tool_name,
+                                arguments=tool_args,
                             )
-                            tool_result_content = result.content
-                            tool_succeeded = result.success
+                            _begin_in_flight_tool()
+                            try:
+                                tool_worker = asyncio.create_task(
+                                    asyncio.to_thread(
+                                        _execute_and_capture_tool,
+                                        executor,
+                                        stub_tool_call,
+                                        tool_name,
+                                        tool_args,
+                                        tool_start_ms,
+                                    )
+                                )
+                            except Exception:
+                                _finish_in_flight_tool()
+                                raise
+
+                            def _consume_tool_worker(
+                                worker: asyncio.Task,
+                            ) -> None:
+                                if not worker.cancelled():
+                                    worker.exception()
+
+                            tool_worker.add_done_callback(_consume_tool_worker)
+                            tool_record = await asyncio.shield(tool_worker)
+                    except AgentCancelledError:
+                        raise
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as tool_exc:
                         logger.error(
                             "Tool execution error for %s: %s",
@@ -1410,19 +1774,20 @@ async def _stream_managed_agent(
                         )
                         tool_result_content = f"Error executing {tool_name}: {tool_exc}"
 
-                    tool_latency_ms = (_time.monotonic() * 1000) - tool_start_ms
-                    collected_tool_calls.append(
-                        {
+                    if tool_record is None:
+                        tool_record = {
                             "tool": tool_name,
                             "arguments": tool_args,
                             "result": tool_result_content,
                             "success": tool_succeeded,
-                            "latency": tool_latency_ms,
+                            "latency": ((_time.monotonic() * 1000) - tool_start_ms),
                         }
-                    )
-                    # Update the shared persist state so mid-stream
-                    # disconnects still capture already-executed tools.
-                    persist_state["tool_calls"] = list(collected_tool_calls)
+                        _record_persisted_tool_call(tool_record)
+
+                    tool_result_content = str(tool_record["result"])
+                    tool_succeeded = bool(tool_record["success"])
+                    tool_latency_ms = float(tool_record["latency"])
+                    collected_tool_calls.append(tool_record)
                     try:
                         _ok = "succeeded" if tool_succeeded else "failed"
                         _clen = len(tool_result_content) if tool_result_content else 0
@@ -1462,14 +1827,12 @@ async def _stream_managed_agent(
                 collected_content += turn_content
                 # Mirror to shared state so BackgroundTask can persist
                 # even if the client disconnects mid-stream.
-                persist_state["content"] = collected_content
-                persist_state["tool_calls"] = list(collected_tool_calls)
+                _set_persist_content(collected_content)
                 continue
 
             # No tool calls — this is the final response
             collected_content += turn_content
-            persist_state["content"] = collected_content
-            persist_state["tool_calls"] = list(collected_tool_calls)
+            _set_persist_content(collected_content)
             break
 
         # Final chunk with finish_reason
@@ -1488,13 +1851,37 @@ async def _stream_managed_agent(
         yield f"data: {json.dumps(final_data)}\n\n"
         yield "data: [DONE]\n\n"
 
+    async def generate_scoped():
+        """Bind the request token across provider and tool worker boundaries."""
+
+        stream = generate()
+        try:
+            with cancellation_scope(cancellation_token):
+                async for frame in stream:
+                    cancellation_token.raise_if_cancelled()
+                    yield frame
+        finally:
+            cancellation_token.cancel()
+            await stream.aclose()
+
+    async def _close_managed_response() -> None:
+        # Mark closure before the first cancellation checkpoint. ASGI 2.3
+        # disconnect handling runs inside a cancelled task group, so deferring
+        # this state transition to the thread pool can lose the worker's late
+        # tool result even though the I/O itself must stay off the event loop.
+        with persist_lock:
+            persist_state["closed"] = True
+        await run_in_threadpool(_persist_final)
+
     from starlette.background import BackgroundTask
 
-    return StreamingResponse(
-        generate(),
+    return CancelableStreamingResponse(
+        generate_scoped(),
+        cancel=cancellation_token.cancel,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         background=BackgroundTask(_persist_final),
+        on_close=_close_managed_response,
     )
 
 

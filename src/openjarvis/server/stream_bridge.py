@@ -8,11 +8,17 @@ from the queue for consumption by FastAPI's StreamingResponse.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import uuid
+from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
 from typing import AsyncGenerator
 
+from anyio import CancelScope
 from fastapi.responses import StreamingResponse
+from starlette._utils import is_async_callable
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.types import Send
 
 from openjarvis.agents._stubs import AgentContext, BaseAgent
@@ -317,32 +323,88 @@ class AgentStreamBridge:
             self._unsubscribe_all()
 
 
-class AgentStreamingResponse(StreamingResponse):
-    """Streaming response that always closes its request-scoped agent.
+class CancelableStreamingResponse(StreamingResponse):
+    """Streaming response that cancels and closes request-scoped work.
 
     ASGI 2.4 reports a disconnected client as ``OSError`` from ``send()``.
     That error occurs in the response loop while the async generator is
     suspended at ``yield``; Python does not guarantee that the generator is
-    closed at that point.  Owning cleanup at the response boundary ensures the
-    synchronous worker sees cancellation even when Starlette retains the body
-    iterator after the failed send.
+    closed at that point. Owning cleanup at the response boundary ensures
+    workers see cancellation even when Starlette retains the body iterator
+    after the failed send.
     """
+
+    def __init__(
+        self,
+        content: AsyncIterable[str | bytes | memoryview],
+        *,
+        cancel: Callable[[], Awaitable[None] | None],
+        status_code: int = 200,
+        headers: Mapping[str, str] | None = None,
+        media_type: str | None = None,
+        background: BackgroundTask | None = None,
+        on_close: Callable[[], Awaitable[None] | None] | None = None,
+    ) -> None:
+        self._cancel_callback = cancel
+        self._close_callback = on_close
+        self._cancelable_stream = content
+        self._stream_closed = False
+        super().__init__(
+            content,
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+            background=background,
+        )
+
+    async def _cancel_and_close(self) -> None:
+        if self._stream_closed:
+            return
+        self._stream_closed = True
+        # ASGI 2.3 disconnects cancel Starlette's response task group. Without
+        # shielding, that surrounding cancel scope can abort ``aclose`` or the
+        # first thread-pool checkpoint before request-scoped cleanup runs.
+        with CancelScope(shield=True):
+            try:
+                # Cancellation tokens are deliberately signalled immediately
+                # on the event-loop thread so no new provider/tool dispatch can
+                # slip in while cleanup is waiting for a thread-pool slot.
+                cancel_result = self._cancel_callback()
+                if inspect.isawaitable(cancel_result):
+                    await cancel_result
+            finally:
+                try:
+                    close = getattr(self._cancelable_stream, "aclose", None)
+                    if close is not None:
+                        await close()
+                finally:
+                    if self._close_callback is not None:
+                        if is_async_callable(self._close_callback):
+                            close_result = await self._close_callback()
+                        else:
+                            close_result = await run_in_threadpool(self._close_callback)
+                        if inspect.isawaitable(close_result):
+                            await close_result
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self._cancel_and_close()
+
+
+class AgentStreamingResponse(CancelableStreamingResponse):
+    """Cancelable response for the standard request-scoped agent bridge."""
 
     def __init__(self, bridge: AgentStreamBridge) -> None:
         self._bridge = bridge
         self._agent_stream = bridge.stream()
         super().__init__(
             self._agent_stream,
+            cancel=bridge.cancel,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
-
-    async def stream_response(self, send: Send) -> None:
-        try:
-            await super().stream_response(send)
-        finally:
-            self._bridge.cancel()
-            await self._agent_stream.aclose()
 
 
 async def create_agent_stream(
@@ -356,4 +418,9 @@ async def create_agent_stream(
     return AgentStreamingResponse(bridge)
 
 
-__all__ = ["AgentStreamBridge", "AgentStreamingResponse", "create_agent_stream"]
+__all__ = [
+    "AgentStreamBridge",
+    "AgentStreamingResponse",
+    "CancelableStreamingResponse",
+    "create_agent_stream",
+]

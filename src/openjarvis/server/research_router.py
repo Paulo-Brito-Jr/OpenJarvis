@@ -30,6 +30,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from openjarvis.agents.research_loop import (
     DEFAULT_PLANNER_MODEL,
@@ -38,10 +39,16 @@ from openjarvis.agents.research_loop import (
 from openjarvis.connectors.embeddings import OllamaEmbedder
 from openjarvis.connectors.hybrid_search import HybridSearch
 from openjarvis.connectors.store import KnowledgeStore
+from openjarvis.core.cancellation import (
+    AgentCancelledError,
+    CancellationToken,
+    cancellation_scope,
+)
 from openjarvis.core.config import DEFAULT_CONFIG_DIR, JarvisConfig, load_config
 from openjarvis.core.types import TelemetryRecord
 from openjarvis.engine._base import InferenceEngine
 from openjarvis.engine._discovery import get_engine
+from openjarvis.server.stream_bridge import CancelableStreamingResponse
 from openjarvis.telemetry.store import TelemetryStore
 
 logger = logging.getLogger(__name__)
@@ -380,6 +387,10 @@ async def _stream_research(
     *,
     capability_policy: Any,
     agent_id: str,
+    cancellation_token: CancellationToken | None = None,
+    register_close_callback: (
+        Callable[[Callable[[], Dict[str, float]]], None] | None
+    ) = None,
     active_engine: InferenceEngine | None = None,
     active_engine_key: str = "",
     active_model: str = "",
@@ -392,6 +403,8 @@ async def _stream_research(
     ``{"type": "done", "usage": {...}}``. The client can rely on always
     seeing a ``done`` frame, even when the agent never started.
     """
+    cancellation_token = cancellation_token or CancellationToken()
+    cancellation_token.raise_if_cancelled()
     # Phase 1: setup. Failures here (planner engine down, DB locked, etc.)
     # yield error + done and return — nothing has been emitted yet so the
     # client gets a clean two-frame stream instead of a dangling connection.
@@ -401,9 +414,16 @@ async def _stream_research(
 
         def on_event(event: Dict[str, Any]) -> None:
             # Called from the agent's worker thread; bounce onto the event loop.
-            loop.call_soon_threadsafe(queue.put_nowait, event)
+            if cancellation_token.is_cancelled or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+            except RuntimeError:
+                return
 
+        cancellation_token.raise_if_cancelled()
         config = load_config()
+        cancellation_token.raise_if_cancelled()
         engine_key, engine, model = _build_planner_engine(
             config,
             active_engine=active_engine,
@@ -411,11 +431,13 @@ async def _stream_research(
             active_model=active_model,
             request_model=request_model,
         )
+        cancellation_token.raise_if_cancelled()
 
         # Each request gets its own thin set of connectors. Constructing them
         # is cheap (SQLite open + HTTP keepalive) and avoids state leaks
         # between concurrent requests.
         store = KnowledgeStore()
+        cancellation_token.raise_if_cancelled()
         embedder = OllamaEmbedder()
         if not embedder.is_available():
             logger.warning(
@@ -423,6 +445,7 @@ async def _stream_research(
             )
             embedder = None
 
+        cancellation_token.raise_if_cancelled()
         agent = ResearchAgent(
             engine=engine,
             search=HybridSearch(store, embedder),
@@ -432,6 +455,9 @@ async def _stream_research(
             capability_policy=capability_policy,
             agent_id=agent_id,
         )
+        cancellation_token.raise_if_cancelled()
+    except AgentCancelledError:
+        return
     except Exception as exc:  # noqa: BLE001
         logger.exception(
             "research setup failed before agent could run: %s",
@@ -451,25 +477,58 @@ async def _stream_research(
         # loop so the SSE consumer sees the same queue ordering as agent
         # events. The frontend mirrors these into the System panel so Power
         # (W) and Energy (kJ) update live during the run.
-        loop.call_soon_threadsafe(
-            queue.put_nowait,
-            {
-                "type": "system_metrics",
-                "power_w": round(power_w, 2),
-                "energy_j": round(energy_j, 2),
-                "duration_s": round(duration_s, 2),
-            },
-        )
+        if cancellation_token.is_cancelled or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {
+                    "type": "system_metrics",
+                    "power_w": round(power_w, 2),
+                    "energy_j": round(energy_j, 2),
+                    "duration_s": round(duration_s, 2),
+                },
+            )
+        except RuntimeError:
+            return
 
     sampler = _LiveGPUSampler(on_sample=_emit_live_sample)
+    sampler_stop_lock = threading.Lock()
+    sampler_totals: Optional[Dict[str, float]] = None
+
+    def _start_sampler() -> None:
+        with sampler_stop_lock:
+            if sampler_totals is None:
+                sampler.start()
+
+    def _stop_sampler() -> Dict[str, float]:
+        nonlocal sampler_totals
+        with sampler_stop_lock:
+            if sampler_totals is None:
+                try:
+                    sampler_totals = sampler.stop()
+                except Exception:  # noqa: BLE001
+                    sampler_totals = {
+                        "energy_j": 0.0,
+                        "mean_power_w": 0.0,
+                        "peak_power_w": 0.0,
+                        "duration_s": 0.0,
+                    }
+            return dict(sampler_totals)
+
+    if register_close_callback is not None:
+        register_close_callback(_stop_sampler)
 
     def _run() -> None:
         t0 = time.time()
-        sampler.start()
         try:
-            result = agent.run(query)
+            _start_sampler()
+            with cancellation_scope(cancellation_token):
+                cancellation_token.raise_if_cancelled()
+                result = agent.run(query)
+                cancellation_token.raise_if_cancelled()
             usage_dict = dict(result.usage)
-            totals = sampler.stop()
+            totals = _stop_sampler()
             # Persist token usage *and* GPU energy/power so /v1/telemetry/energy
             # rolls research into the same Power/Energy numbers as chat —
             # this is what the launch-video System panel reads.
@@ -490,22 +549,52 @@ async def _stream_research(
                 queue.put_nowait,
                 {"type": "_usage", "usage": usage_dict},
             )
+        except AgentCancelledError:
+            logger.info("research request cancelled by response consumer")
+            totals = _stop_sampler()
+            usage_dict = agent.last_usage
+            if any(usage_dict.values()):
+                try:
+                    _record_research_telemetry(
+                        engine_key=engine_key,
+                        model=model,
+                        usage=usage_dict,
+                        latency_seconds=time.time() - t0,
+                        energy_joules=totals["energy_j"],
+                        mean_power_watts=totals["mean_power_w"],
+                        peak_power_watts=totals["peak_power_w"],
+                        energy_method="polling" if sampler.available else "",
+                    )
+                except Exception as telemetry_exc:  # noqa: BLE001
+                    logger.warning(
+                        "research cancellation telemetry failed: %s",
+                        telemetry_exc,
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.exception("research agent crashed: %s", type(exc).__name__)
             # Stop the sampler on failure too so we don't leak the polling thread
             # past the request lifetime.
-            try:
-                sampler.stop()
-            except Exception:  # noqa: BLE001
-                pass
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"type": "error", "message": "Research execution failed."},
-            )
+            _stop_sampler()
+            if not cancellation_token.is_cancelled and not loop.is_closed():
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    {"type": "error", "message": "Research execution failed."},
+                )
         finally:
-            loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+            if not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+                except RuntimeError:
+                    pass
 
+    cancellation_token.raise_if_cancelled()
     task = asyncio.create_task(asyncio.to_thread(_run))
+
+    def _consume_worker_result(worker: asyncio.Task) -> None:
+        if not worker.cancelled():
+            worker.exception()
+
+    task.add_done_callback(_consume_worker_result)
 
     final_answer: Optional[str] = None
     final_usage: Dict[str, int] = {}
@@ -560,15 +649,19 @@ async def _stream_research(
         )
         yield _sse({"type": "done", "usage": final_usage, "sources": final_sources})
     finally:
-        # The worker may still be cleaning up (rarely) — make sure we don't
-        # leak a dangling task. Swallow any straggler exception so a worker
-        # failure during teardown doesn't escape the generator after we've
-        # already emitted the terminal done frame.
+        # ``to_thread`` cannot forcibly stop an in-flight provider call. Signal
+        # cooperative cancellation, then retire the asyncio task immediately;
+        # the worker observes the token before any later search/provider turn.
+        cancellation_token.cancel()
+        await run_in_threadpool(_stop_sampler)
         if not task.done():
-            try:
-                await task
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("research: worker task ended with %s", exc)
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("research: worker task ended with %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -625,16 +718,37 @@ async def research(req: ResearchRequest, request: Request) -> StreamingResponse:
     active_engine_key = str(getattr(app_state, "engine_name", "") or "")
     if active_engine is not None and not active_engine_key:
         active_engine_key = str(getattr(active_engine, "engine_id", "") or "")
-    return StreamingResponse(
+    cancellation_token = CancellationToken()
+    close_callback_lock = threading.Lock()
+    close_callback: Callable[[], Dict[str, float]] | None = None
+
+    def _register_close_callback(
+        callback: Callable[[], Dict[str, float]],
+    ) -> None:
+        nonlocal close_callback
+        with close_callback_lock:
+            close_callback = callback
+
+    def _close_research() -> None:
+        with close_callback_lock:
+            callback = close_callback
+        if callback is not None:
+            callback()
+
+    return CancelableStreamingResponse(
         _stream_research(
             req.query,
             capability_policy=policy,
             agent_id=principal,
+            cancellation_token=cancellation_token,
+            register_close_callback=_register_close_callback,
             active_engine=active_engine,
             active_engine_key=active_engine_key,
             active_model=active_model,
             request_model="",
         ),
+        cancel=cancellation_token.cancel,
+        on_close=_close_research,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
