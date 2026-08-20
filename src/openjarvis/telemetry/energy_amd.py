@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import platform
 import time
 from contextlib import contextmanager
 from typing import Generator, List, Tuple
@@ -15,12 +16,21 @@ from openjarvis.telemetry.energy_monitor import (
 
 logger = logging.getLogger(__name__)
 
-try:
-    import amdsmi
-
-    _AMDSMI_AVAILABLE = True
-except ImportError:
+if platform.system() == "Darwin":
+    # ``zeus[apple]`` currently brings in amdsmi on every platform.  Its
+    # native loader emits output and raises when ROCm is absent, so do not
+    # import that optional backend on macOS.
     _AMDSMI_AVAILABLE = False
+else:
+    try:
+        import amdsmi
+
+        _AMDSMI_AVAILABLE = True
+    except Exception as exc:
+        # A missing native library can surface as OSError or KeyError instead
+        # of ImportError.  Keep every other energy backend available.
+        logger.debug("AMD SMI import failed: %s", exc)
+        _AMDSMI_AVAILABLE = False
 
 
 class AmdEnergyMonitor(EnergyMonitor):
