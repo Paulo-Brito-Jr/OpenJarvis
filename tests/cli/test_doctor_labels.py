@@ -64,3 +64,18 @@ class TestDoctorOptionalLabels:
         ]
         assert len(nvidia_checks) == 1
         assert "Not installed (openjarvis[gpu-metrics])" == nvidia_checks[0]["message"]
+
+    def test_amd_dependency_is_not_imported_on_macos(self) -> None:
+        """The transitive amdsmi package must not invoke ROCm loaders on macOS."""
+        blocker = _selective_import_blocker("amdsmi")
+        with (
+            mock.patch("platform.system", return_value="Darwin"),
+            mock.patch("builtins.__import__", side_effect=blocker),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(cli, ["doctor", "--json"])
+
+        data = json.loads(result.output)
+        amd_checks = [c for c in data if c["name"] == "Optional: AMD energy monitoring"]
+        assert len(amd_checks) == 1
+        assert "Unavailable on macOS" == amd_checks[0]["message"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import subprocess
 import sys
@@ -209,6 +210,15 @@ def _check_optional_deps() -> List[CheckResult]:
         ("zeus", "openjarvis[energy-apple]", "Apple Silicon energy monitoring"),
     ]
     for pkg, install_hint, description in optional_packages:
+        if pkg == "amdsmi" and platform.system() == "Darwin":
+            results.append(
+                CheckResult(
+                    f"Optional: {description}",
+                    "warn",
+                    "Unavailable on macOS",
+                )
+            )
+            continue
         try:
             __import__(pkg)
             results.append(CheckResult(f"Optional: {description}", "ok", "Installed"))
