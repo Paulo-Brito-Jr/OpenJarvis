@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib
 import sys
 import time
 import types
@@ -65,6 +67,26 @@ class TestAvailable:
         assert_available_false_when_lib_missing(
             mod, mod.AmdEnergyMonitor, "_AMDSMI_AVAILABLE"
         )
+
+    def test_native_loader_failure_is_treated_as_unavailable(self):
+        import openjarvis.telemetry.energy_amd as mod
+
+        real_import = builtins.__import__
+
+        def fail_amdsmi_import(name, *args, **kwargs):
+            if name == "amdsmi":
+                raise KeyError("libamd_smi.so")
+            return real_import(name, *args, **kwargs)
+
+        try:
+            with (
+                patch("platform.system", return_value="Linux"),
+                patch("builtins.__import__", side_effect=fail_amdsmi_import),
+            ):
+                reloaded = importlib.reload(mod)
+                assert reloaded._AMDSMI_AVAILABLE is False
+        finally:
+            importlib.reload(mod)
 
 
 # ---------------------------------------------------------------------------

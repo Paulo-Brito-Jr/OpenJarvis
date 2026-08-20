@@ -1,4 +1,4 @@
-"""Apple Silicon energy monitor — via zeus-ml[apple] or CPU-time estimation."""
+"""Apple Silicon energy monitor — via zeus[apple] or CPU-time estimation."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from openjarvis.telemetry.energy_monitor import (
 logger = logging.getLogger(__name__)
 
 try:
-    from zeus.device.soc.apple import AppleSiliconMonitor
+    from zeus.device.soc.apple import AppleSilicon
 
     _ZEUS_APPLE_AVAILABLE = True
 except ImportError:
@@ -66,10 +66,15 @@ def _detect_chip() -> tuple[str, float]:
     return brand or "Apple Silicon", 20.0
 
 
+def _millijoules_to_joules(value: int | float | None) -> float:
+    """Convert an optional Zeus Apple Silicon reading to joules."""
+    return float(value or 0.0) / 1000.0
+
+
 class AppleEnergyMonitor(EnergyMonitor):
     """Apple Silicon energy monitor.
 
-    Prefers ``zeus-ml[apple]`` ``AppleSiliconMonitor`` when available.
+    Prefers the ``zeus[apple]`` ``AppleSilicon`` adapter when available.
     Falls back to a CPU-time-based estimation using the chip's known TDP,
     which gives order-of-magnitude correct energy readings without root.
     """
@@ -82,7 +87,7 @@ class AppleEnergyMonitor(EnergyMonitor):
 
         if _ZEUS_APPLE_AVAILABLE and platform.system() == "Darwin":
             try:
-                self._monitor = AppleSiliconMonitor()
+                self._monitor = AppleSilicon()
                 self._zeus_ok = True
             except Exception as exc:
                 logger.debug(
@@ -128,10 +133,12 @@ class AppleEnergyMonitor(EnergyMonitor):
         measurement = self._monitor.end_window(window_name)
         wall = time.monotonic() - t_start
 
-        cpu_j = getattr(measurement, "cpu_energy", 0.0)
-        gpu_j = getattr(measurement, "gpu_energy", 0.0)
-        dram_j = getattr(measurement, "dram_energy", 0.0)
-        ane_j = getattr(measurement, "ane_energy", 0.0)
+        cpu_j = _millijoules_to_joules(getattr(measurement, "cpu_total_mj", None))
+        gpu_j = _millijoules_to_joules(
+            getattr(measurement, "gpu_mj", None)
+        ) + _millijoules_to_joules(getattr(measurement, "gpu_sram_mj", None))
+        dram_j = _millijoules_to_joules(getattr(measurement, "dram_mj", None))
+        ane_j = _millijoules_to_joules(getattr(measurement, "ane_mj", None))
 
         result.cpu_energy_joules = float(cpu_j)
         result.gpu_energy_joules = float(gpu_j)
